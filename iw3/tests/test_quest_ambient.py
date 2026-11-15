@@ -16,9 +16,9 @@ def pixels(payload: bytes | None) -> torch.Tensor:
     assert payload is not None
     length = payload[0]
     assert payload[1 : 1 + length] == b"iw3_ambient"
-    assert struct.unpack("!HHB", payload[1 + length : 6 + length]) == (160, 90, 1)
+    assert struct.unpack("!HHB", payload[1 + length : 6 + length]) == (320, 180, 1)
     raw = bytearray(zlib.decompress(payload[6 + length :]))
-    return torch.frombuffer(raw, dtype=torch.uint8).reshape(90, 160, 4)
+    return torch.frombuffer(raw, dtype=torch.uint8).reshape(180, 320, 4)
 
 
 def solid(red: float, green: float, blue: float) -> torch.Tensor:
@@ -32,7 +32,7 @@ def test_rgba_keeps_each_edge_on_its_source_side() -> None:
     frame[:, :, :30] = torch.tensor([0, 0, 1]).view(3, 1, 1)
     frame[:, :, -30:] = torch.tensor([1, 1, 0]).view(3, 1, 1)
     rgb = pixels(background().update(frame, 1, tick=0))[:, :, :3].float()
-    top, bottom, left, right = rgb[12, 80], rgb[77, 80], rgb[45, 20], rgb[45, 140]
+    top, bottom, left, right = rgb[24, 160], rgb[154, 160], rgb[90, 40], rgb[90, 280]
     assert top[0] > top[1] + 40 and top[0] > top[2] + 40
     assert bottom[1] > bottom[0] + 40 and bottom[1] > bottom[2] + 40
     assert left[2] > left[0] + 40 and left[2] > left[1] + 40
@@ -44,7 +44,8 @@ def test_alpha_fades_to_zero_at_every_outer_edge() -> None:
     alpha = rgba[:, :, 3]
     assert torch.count_nonzero(alpha[0]) == torch.count_nonzero(alpha[-1]) == 0
     assert torch.count_nonzero(alpha[:, 0]) == torch.count_nonzero(alpha[:, -1]) == 0
-    assert 0 < alpha[45, 10] < alpha[45, 30] <= alpha[45, 80] == 255
+    assert 0 < alpha[90, 10] < alpha[90, 30] < alpha[90, 70] <= 255
+    assert alpha[90, 160] == 0
     assert torch.isfinite(rgba.float()).all()
 
 
@@ -52,7 +53,7 @@ def test_alpha_fades_to_zero_at_every_outer_edge() -> None:
 def test_brightness_scales_rgb_without_changing_alpha(brightness: float, expected: int) -> None:
     rgba = pixels(background().update(torch.ones(3, 90, 160), brightness, tick=0))
     assert torch.all(rgba[:, :, :3] == expected)
-    assert rgba[45, 80, 3] == 255
+    assert rgba[90, 160, 3] == 0 and rgba[90, 60, 3] > 0
 
 
 def test_ten_hz_limit_does_not_feed_skipped_frames_into_smoothing() -> None:
@@ -60,9 +61,9 @@ def test_ten_hz_limit_does_not_feed_skipped_frames_into_smoothing() -> None:
     pixels(ambient.update(solid(1, 0, 0), 1, tick=0))
     assert ambient.update(solid(0, 1, 0), 1, tick=0.099) is None
     rgba = pixels(ambient.update(solid(0, 0, 1), 1, tick=0.1))
-    assert rgba[45, 80, 1] == 0
-    assert abs(int(rgba[45, 80, 0]) - 171) <= 1
-    assert abs(int(rgba[45, 80, 2]) - 84) <= 1
+    assert rgba[90, 160, 1] == 0
+    assert abs(int(rgba[90, 160, 0]) - 171) <= 1
+    assert abs(int(rgba[90, 160, 2]) - 84) <= 1
     assert ambient.update(solid(0, 0, 1), 1, tick=0.199) is None
     assert ambient.update(solid(0, 0, 1), 1, tick=0.2) is not None
 
@@ -71,11 +72,11 @@ def test_smoothing_uses_elapsed_time_and_reset_forgets_old_color() -> None:
     ambient = background()
     pixels(ambient.update(solid(1, 0, 0), 1, tick=10))
     rgba = pixels(ambient.update(solid(0, 0, 1), 1, tick=10.25))
-    assert abs(int(rgba[45, 80, 0]) - 94) <= 1
-    assert abs(int(rgba[45, 80, 2]) - 161) <= 1
+    assert abs(int(rgba[90, 160, 0]) - 94) <= 1
+    assert abs(int(rgba[90, 160, 2]) - 161) <= 1
     ambient.reset()
     rgba = pixels(ambient.update(solid(0, 0, 1), 1, tick=10.251))
-    assert tuple(rgba[45, 80, :3].tolist()) == (0, 0, 255)
+    assert tuple(rgba[90, 160, :3].tolist()) == (0, 0, 255)
 
 
 def test_ten_hz_schedule_is_not_rejected_by_float_rounding() -> None:
@@ -97,8 +98,8 @@ def test_capture_padding_is_excluded_only_when_content_rect_is_given() -> None:
     with_rect = background().update(frame, 1, (60, 40, 260, 140), tick=0)
     cropped = background().update(frame[:, 40:140, 60:260], 1, tick=0)
     assert with_rect == cropped
-    assert pixels(with_rect)[45, 80, 2] == 255
-    assert pixels(background().update(frame, 1, tick=0))[45, 80, 2] == 0
+    assert pixels(with_rect)[90, 160, 2] == 255
+    assert pixels(background().update(frame, 1, tick=0))[90, 160, 2] == 0
 
 
 @pytest.mark.parametrize(

@@ -46,6 +46,8 @@ class QuestServer:
         ambient_enabled: bool = False,
         ambient_brightness: float = 0.25,
         ambient_spread: float = 2.0,
+        ambient_fill_borders: bool = True,
+        ambient_feather: float = 0.03,
     ) -> None:
         address = ipaddress.IPv4Address(host)
         private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
@@ -61,7 +63,9 @@ class QuestServer:
             raise ValueError("Quest ports must be between 0 and 65535")
         if type(screen_curvature) not in (int, float) or not 0 <= screen_curvature <= 120:
             raise ValueError("Quest screen curvature must be a finite number between 0 and 120 degrees")
-        self._validate_ambient(ambient_enabled, ambient_brightness, ambient_spread)
+        self._validate_ambient(
+            ambient_enabled, ambient_brightness, ambient_spread, ambient_fill_borders, ambient_feather
+        )
         self.host, self.port, self.discovery_port = host, port, discovery_port
         self.width, self.height, self.fps, self.bitrate = width, height, fps, bitrate
         self.audio = audio
@@ -72,6 +76,8 @@ class QuestServer:
         self._ambient_enabled = ambient_enabled
         self._ambient_brightness = float(ambient_brightness)
         self._ambient_spread = float(ambient_spread)
+        self._ambient_fill_borders = ambient_fill_borders
+        self._ambient_feather = float(ambient_feather)
         self._ambient_background: AmbientBackground | None = None
         self._ambient_generation = 0
         self._ambient_pending: tuple[bytes, int] | None = None
@@ -290,13 +296,24 @@ class QuestServer:
         self.configure_audio(False, self.audio_source, self.audio_gain)
 
     @staticmethod
-    def _validate_ambient(enabled: bool, brightness: float, spread: float) -> None:
+    def _validate_ambient(enabled: bool, brightness: float, spread: float, fill_borders: bool, feather: float) -> None:
         if type(enabled) is not bool:
             raise ValueError("Quest ambient enabled must be a boolean")
         if type(brightness) not in (int, float) or not 0 <= brightness <= 1:
             raise ValueError("Quest ambient brightness must be a finite number between 0 and 1")
         if type(spread) not in (int, float) or not 1.2 <= spread <= 4:
             raise ValueError("Quest ambient spread must be a finite number between 1.2 and 4")
+        if type(fill_borders) is not bool:
+            raise ValueError("Quest ambient fill borders must be a boolean")
+        if type(feather) not in (int, float) or not 0 <= feather <= 0.1:
+            raise ValueError("Quest ambient feather must be a finite number between 0 and 0.1")
+
+    def _ambient_scale(self) -> tuple[float, float]:
+        angle = math.radians(self._screen_curvature)
+        horizontal = self._ambient_spread
+        if self._cylinder_supported is True and angle > 0.001:
+            horizontal = min(math.radians(170), angle * horizontal) / angle
+        return horizontal, self._ambient_spread
 
     def _reset_ambient(self) -> None:
         # 只丢弃历史；持server锁时不构造含Torch运算的生成器。
@@ -305,19 +322,25 @@ class QuestServer:
         self._ambient_pending = None
         self._ambient_visible = False
 
-    def configure_ambient(self, enabled: bool, brightness: float, spread: float) -> None:
-        self._validate_ambient(enabled, brightness, spread)
+    def configure_ambient(
+        self, enabled: bool, brightness: float, spread: float, fill_borders: bool = True, feather: float = 0.03
+    ) -> None:
+        self._validate_ambient(enabled, brightness, spread, fill_borders, feather)
         with self._layer_lock:
             with self._condition:
-                if (enabled, brightness, spread) == (
+                if (enabled, brightness, spread, fill_borders, feather) == (
                     self._ambient_enabled,
                     self._ambient_brightness,
                     self._ambient_spread,
+                    self._ambient_fill_borders,
+                    self._ambient_feather,
                 ):
                     return
                 self._ambient_enabled = enabled
                 self._ambient_brightness = float(brightness)
                 self._ambient_spread = float(spread)
+                self._ambient_fill_borders = fill_borders
+                self._ambient_feather = float(feather)
                 self._reset_ambient()
                 connection = self._connection
                 self._condition.notify_all()
@@ -327,23 +350,33 @@ class QuestServer:
                 except OSError:
                     self._disconnect(connection)
 
-    def set_ambient_frame(self, frame: torch.Tensor, content_rect: tuple[int, int, int, int] | None = None) -> None:
-        with self._condition:
-            if (
-                self._shutdown.is_set()
-                or not self._video_enabled
-                or not self._ambient_enabled
-                or self._suspended
-                or self._connection is None
-            ):
-                return
-            generation = self._ambient_generation
-            background = self._ambient_background
-            brightness = self._ambient_brightness
-        # 实测RGB float CHW[3,H,W]→压缩RGBA[90,160,4]；提色与压缩由媒体owner在锁外完成。
+    def set_ambient_frame(
+        self,
+        frame: torch.Tensor,
+        content_rect: tuple[int, int, int, int] | None = None,
+        sbs: torch.Tensor | None = None,
+    ) -> None:
+        with self._layer_lock:
+            with self._condition:
+                if (
+                    self._shutdown.is_set()
+                    or not self._video_enabled
+                    or not self._ambient_enabled
+                    or self._suspended
+                    or self._connection is None
+                ):
+                    return
+                generation = self._ambient_generation
+                background = self._ambient_background
+                brightness = self._ambient_brightness
+                scale = self._ambient_scale()
+                fill_borders, feather = self._ambient_fill_borders, self._ambient_feather
+        # 单目RGB取色+最终SBS遮罩→同包RGBA；提色与压缩由媒体owner在锁外完成。
         if background is None:
             background = AmbientBackground()
-        payload = background.update(frame, brightness, content_rect)
+        payload = background.update(
+            frame, brightness, content_rect, sbs=sbs, scale=scale, fill_borders=fill_borders, feather=feather
+        )
         if payload is None:
             return
         with self._condition:
@@ -375,8 +408,9 @@ class QuestServer:
         with self._layer_lock:
             if degrees == self._screen_curvature:
                 return
-            self._screen_curvature = float(degrees)
             with self._condition:
+                self._screen_curvature = float(degrees)
+                self._reset_ambient()
                 connection = self._connection
             if connection is not None:
                 self._control(connection, "reset")
@@ -538,28 +572,14 @@ class QuestServer:
             ]
         }
         if self._ambient_visible:
-            ambient_position = [a + b for a, b in zip(position, _rotate(rotation, [0.0, 0.0, -0.05]))]
-            ambient: dict[str, Any] = {
-                "tipo": "quad",
-                "pos": ambient_position,
-                "rot": list(rotation),
-                "tam": [value * self._ambient_spread for value in size],
-            }
-            if self._cylinder_supported is True:
-                base_angle = max(angle, math.pi / 2)
-                radius = size[0] / base_angle
-                ambient_angle = min(math.radians(170), base_angle * self._ambient_spread)
-                offset = _rotate(rotation, [0.0, 0.0, radius])
-                ambient = {
-                    "tipo": "cilindro",
-                    "pos": [a + b for a, b in zip(ambient_position, offset)],
-                    "rot": list(rotation),
-                    "raio": radius,
-                    "angulo": ambient_angle,
-                    "aspecto": radius * ambient_angle / (size[1] * self._ambient_spread),
-                }
-            layers["camadas"].insert(
-                0,
+            sx, sy = self._ambient_scale()
+            ambient = {**geometry}
+            if geometry["tipo"] == "cilindro":
+                ambient["angulo"] = angle * sx
+                ambient["aspecto"] = size[0] * sx / (size[1] * sy)
+            else:
+                ambient["tam"] = [size[0] * sx, size[1] * sy]
+            layers["camadas"].append(
                 {
                     **ambient,
                     "tex": AmbientBackground.TEXTURE_ID,
@@ -794,6 +814,8 @@ class QuestServer:
                         with self._condition:
                             if connection is not self._connection:
                                 return
+                            if hello["cilindro"] != self._cylinder_supported:
+                                self._reset_ambient()
                         if hello["cilindro"] != self._cylinder_supported:
                             self._cylinder_supported = hello["cilindro"]
                             self._control(connection, "reset")

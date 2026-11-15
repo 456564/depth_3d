@@ -74,21 +74,21 @@ def test_reject_invalid_ambient_configuration(changes: dict[str, Any]) -> None:
         server.configure_ambient(*settings.values())
 
 
-def test_video_precedes_texture_and_first_background_layer(server: Any) -> None:
+def test_video_precedes_texture_and_feather_layer(server: Any) -> None:
     with connect(server) as client:
         assert len(initial_messages(client)["camadas"]) == 2
         payload, layers = publish(server, client)
         name_length = payload[0]
         assert payload[1 : 1 + name_length] == b"iw3_ambient"
-        assert struct.unpack("!HHB", payload[1 + name_length : 6 + name_length]) == (160, 90, 1)
-        assert len(zlib.decompress(payload[6 + name_length :])) == 160 * 90 * 4
-        background, left, right = layers
+        assert struct.unpack("!HHB", payload[1 + name_length : 6 + name_length]) == (320, 180, 1)
+        assert len(zlib.decompress(payload[6 + name_length :])) == 320 * 180 * 4
+        left, right, background = layers
         assert background["tex"] == "iw3_ambient" and background["olho"] == "ambos"
-        assert background["alpha"] is True and background["rect"] == [0, 0, 160, 90]
+        assert background["alpha"] is True and background["rect"] == [0, 0, 320, 180]
         assert left["tex"] == right["tex"] == "video" and not left["alpha"]
         assert background["tipo"] == "quad" and background["tam"] == [7.2, 7.2]
         assert background["rot"] == left["rot"]
-        assert background["pos"] == pytest.approx([0, 0, -3.05])
+        assert background["pos"] == left["pos"] == [0, 0, -3]
         server.check_error()
 
 
@@ -141,7 +141,7 @@ def test_latest_background_replaces_pending_while_video_encodes(server: Any, mon
         release.set()
 
 
-def test_background_precedes_video_and_menu(server: Any) -> None:
+def test_feather_follows_both_eyes_and_precedes_menu(server: Any) -> None:
     class Menu:
         def reset(self) -> None:
             pass
@@ -156,7 +156,7 @@ def test_background_precedes_video_and_menu(server: Any) -> None:
     with connect(server) as client:
         initial_messages(client)
         _, layers = publish(server, client)
-        assert [layer.get("tex") for layer in layers] == ["iw3_ambient", "video", "video", "test_menu", None]
+        assert [layer.get("tex") for layer in layers] == ["video", "video", "iw3_ambient", "test_menu", None]
 
 
 def test_ambient_tracks_canonical_pose_size_and_cylinder_limit(server: Any) -> None:
@@ -165,22 +165,29 @@ def test_ambient_tracks_canonical_pose_size_and_cylinder_limit(server: Any) -> N
         publish(server, client)
         send_json(client, 0x84, {"cilindro": True})
         layers = read_layers(client)
-        assert layers[0]["tipo"] == "cilindro" and not server.actual_cylinder
-        assert layers[0]["angulo"] <= math.radians(170)
+        assert len(layers) == 2 and not server.actual_cylinder
+        _, layers = publish(server, client)
+        assert layers[-1]["tipo"] == "quad"
         server.set_screen_curvature(120)
         layers = read_layers(client)
+        assert len(layers) == 2
         assert server.actual_cylinder and main_video(layers)["angulo"] == pytest.approx(math.radians(120))
+        publish(server, client)
         canonical: dict[str, Any] = {"pos": [1, 2, -4], "rot": [0, 0, 0, 1], "tam": [5, 2.5]}
         server._send_layers(server._connection, canonical)
-        background, left, _ = read_layers(client)
+        left, _, background = read_layers(client)
         assert background["rot"] == left["rot"] == canonical["rot"]
-        assert background["pos"][:2] == canonical["pos"][:2]
-        assert background["pos"][2] - background["raio"] == pytest.approx(-4.05)
+        assert background["pos"] == left["pos"]
+        assert background["raio"] == left["raio"]
+        assert background["angulo"] == pytest.approx(math.radians(170))
+        assert background["pos"][2] - background["raio"] == pytest.approx(-4)
         assert background["raio"] * background["angulo"] / background["aspecto"] == pytest.approx(5)
         send_json(client, 0x84, {"cilindro": False})
-        background, left, _ = read_layers(client)
+        assert len(read_layers(client)) == 2
+        _, layers = publish(server, client)
+        left, _, background = layers
         assert background["tipo"] == left["tipo"] == "quad"
-        assert background["tam"] == [10, 5] and background["pos"] == [1, 2, -4.05]
+        assert background["tam"] == [10, 5] and background["pos"] == [1, 2, -4]
 
 
 def test_background_does_not_change_pc_mapping_or_grab_target(server: Any) -> None:
@@ -337,7 +344,7 @@ def test_stopped_disconnected_disabled_and_paused_sources_skip_pixel_work(
     server.set_ambient_frame(frame)
 
 
-@pytest.mark.parametrize("action", ["disable", "reconfigure", "pause", "disconnect", "stop"])
+@pytest.mark.parametrize("action", ["disable", "reconfigure", "pause", "disconnect", "stop", "curvature", "capability"])
 def test_inflight_pixel_work_cannot_revive_old_background(
     server: Any, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
@@ -372,6 +379,12 @@ def test_inflight_pixel_work_cannot_revive_old_background(
                 server.pause_media()
             elif action == "disconnect":
                 server._disconnect(server._connection)
+            elif action == "curvature":
+                server.set_screen_curvature(120)
+                assert len(read_layers(client)) == 2
+            elif action == "capability":
+                send_json(client, 0x84, {"cilindro": True})
+                assert len(read_layers(client)) == 2
             else:
                 server.stop()
             release.set()
@@ -411,8 +424,8 @@ def test_cuda_synthetic_color_survives_hevc_and_ambient_upload() -> None:
             with torch.cuda.stream(producer):
                 mono = torch.zeros(3, 180, 320, device="cuda")
                 mono[0] = 1
-                server.set_ambient_frame(mono)
                 stereo = torch.cat((mono, mono), dim=2)
+                server.set_ambient_frame(mono, sbs=stereo)
                 server.set_frame_data((stereo, 1.0))
                 stereo.zero_()
             kind, encoded = read_message(client)
@@ -426,8 +439,10 @@ def test_cuda_synthetic_color_survives_hevc_and_ambient_upload() -> None:
             kind, texture = read_message(client)
             assert kind == 0x10
             rgba = torch.frombuffer(bytearray(zlib.decompress(texture[6 + texture[0] :])), dtype=torch.uint8)
-            rgba = rgba.reshape(90, 160, 4)
-            assert rgba[45, 80].tolist() == [64, 0, 0, 255]
+            rgba = rgba.reshape(180, 320, 4)
+            assert rgba[90, 160].tolist() == [64, 0, 0, 0]
+            assert rgba[90, 40, :3].tolist() == [64, 0, 0]
+            assert 0 < rgba[90, 40, 3] <= 255
             assert len(read_layers(client)) == 3
             server.check_error()
     finally:

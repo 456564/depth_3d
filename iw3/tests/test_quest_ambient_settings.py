@@ -48,12 +48,12 @@ def test_ambient_live_update_applies_all_current_values_without_media_restart() 
     owner.server = Namespace(configure_ambient=lambda *values: applied.append(values))
     owner.submit("set", {"quest_ambient_brightness": 0.4, "quest_ambient_spread": 3.0})
     owner.apply_live()
-    assert applied == [(True, 0.4, 3.0)]
+    assert applied == [(True, 0.4, 3.0, True, 0.03)]
     assert owner.snapshot()["values"]["quest_ambient_brightness"] == 0.4
     assert not owner.run_stop.is_set()
     owner.submit("set", {"quest_ambient": False})
     owner.apply_live()
-    assert applied[-1] == (False, 0.4, 3.0)
+    assert applied[-1] == (False, 0.4, 3.0, True, 0.03)
 
 
 def test_ambient_menu_controls_and_restart_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -99,12 +99,14 @@ def test_media_reconfiguration_passes_ambient_values() -> None:
         ambient_enabled=True,
         ambient_brightness=0.3,
         ambient_spread=2.2,
+        ambient_fill_borders=False,
+        ambient_feather=0.07,
     )
-    assert applied == [(True, 0.3, 2.2)]
+    assert applied == [(True, 0.3, 2.2, False, 0.07)]
 
 
 @pytest.mark.parametrize("has_content_rect", [True, False])
-def test_capture_roi_reaches_ambient_before_stereo_without_args_lock(monkeypatch, has_content_rect) -> None:
+def test_capture_roi_and_final_sbs_reach_ambient_together_without_args_lock(monkeypatch, has_content_rect) -> None:
     from iw3.desktop import quest_server
 
     args = utils.create_parser().parse_args(["--quest", "--quest-ambient", "--bind-addr", "127.0.0.1"])
@@ -119,6 +121,7 @@ def test_capture_roi_reaches_ambient_before_stereo_without_args_lock(monkeypatch
     lock = threading.Lock()
     args.state = dict(depth_model=depth, convergence_model=None, args_lock=lock, stop_event=None, fps_event=None)
     frame = torch.zeros(3, 1080, 1920)
+    final_sbs = torch.ones(3, 1080, 3840)
     content_rect = (0, 135, 1920, 945)
     calls = []
 
@@ -141,15 +144,16 @@ def test_capture_roi_reaches_ambient_before_stereo_without_args_lock(monkeypatch
             self.count += 1
             return frame if self.count == 1 else None
 
-    def ambient(image, *, content_rect):
+    def ambient(image, *, content_rect, sbs):
         assert image is frame
+        assert sbs is final_sbs
         assert not lock.locked()
         assert content_rect == ((0, 135, 1920, 945) if has_content_rect else None)
         calls.append("ambient")
 
     def stereo(image, *args, **kwargs):
         calls.append("stereo")
-        return image
+        return final_sbs
 
     server = Namespace(
         start=lambda: None,
@@ -168,4 +172,4 @@ def test_capture_roi_reaches_ambient_before_stereo_without_args_lock(monkeypatch
     monkeypatch.setattr(utils.IW3U, "process_image", stereo)
     monkeypatch.setattr(quest_server, "QuestServer", lambda **kw: server)
     utils._iw3_desktop_main_once(args, init_wxapp=False)
-    assert calls == ["ambient", "stereo", "video"]
+    assert calls == ["stereo", "ambient", "video"]

@@ -410,7 +410,7 @@ class QuestMenu:
             return "关" if value else "开"
         if type(value) is bool:
             return "开" if value else "关"
-        if key in {"quest_audio_gain", "quest_ambient_brightness"}:
+        if key in {"quest_audio_gain", "quest_ambient_brightness", "quest_ambient_feather"}:
             return f"{value * 100:g}%"
         if type(value) is float:
             return f"{value:g}"

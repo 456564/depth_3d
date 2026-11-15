@@ -764,9 +764,27 @@ class MainFrame(wx.Frame):
             self.pnl_process, value=200, minValue=120, maxValue=400, name="sld_quest_ambient_spread"
         )
         self.sld_quest_ambient_spread.SetToolTip("范围越大，前方柔光越广；跟随窗口和曲面，不是360房间。")
+        self.chk_quest_ambient_fill_borders = wx.CheckBox(
+            self.pnl_process, label="智能黑边填光", name="chk_quest_ambient_fill_borders"
+        )
+        self.chk_quest_ambient_fill_borders.SetValue(True)
+        self.chk_quest_ambient_fill_borders.SetToolTip(
+            "用视频边缘颜色填充连续黑条，保留比例和完整画面；暗场可能与黑边相似，识别误判时可关。不提高分辨率。"
+        )
+        self.lbl_quest_ambient_feather = wx.StaticText(self.pnl_process, label="边缘渐隐 10.00%")
+        self.lbl_quest_ambient_feather.SetMinSize(self.lbl_quest_ambient_feather.GetBestSize())
+        self.lbl_quest_ambient_feather.SetLabel("边缘渐隐 3%")
+        self.sld_quest_ambient_feather = wx.Slider(
+            self.pnl_process, value=300, minValue=0, maxValue=1000, name="sld_quest_ambient_feather"
+        )
+        self.sld_quest_ambient_feather.SetToolTip(
+            "默认3%，0关闭。越大四周渐隐过渡越宽、更多边缘混入柔光；越小保留更多清晰边缘。中央仍清楚，不提高分辨率；需开启环境光。"
+        )
         self.chk_quest_ambient.Bind(wx.EVT_CHECKBOX, self.on_quest_ambient)
         self.sld_quest_ambient_brightness.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
         self.sld_quest_ambient_spread.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
+        self.chk_quest_ambient_fill_borders.Bind(wx.EVT_CHECKBOX, self.on_quest_ambient)
+        self.sld_quest_ambient_feather.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
 
         layout = wx.GridBagSizer(vgap=5, hgap=4)
         layout.Add(self.btn_start, (0, 0), flag=wx.EXPAND)
@@ -782,6 +800,9 @@ class MainFrame(wx.Frame):
         layout.Add(self.sld_quest_ambient_brightness, (4, 2), (1, 2), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_ambient_spread, (5, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_ambient_spread, (5, 2), (1, 2), flag=wx.EXPAND)
+        layout.Add(self.chk_quest_ambient_fill_borders, (6, 0), (1, 4), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.lbl_quest_ambient_feather, (7, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.sld_quest_ambient_feather, (7, 2), (1, 2), flag=wx.EXPAND)
         self.pnl_process.SetSizer(layout)
 
         # language panel
@@ -995,8 +1016,10 @@ class MainFrame(wx.Frame):
     def on_quest_ambient(self, event):
         brightness = self.sld_quest_ambient_brightness.GetValue()
         spread = self.sld_quest_ambient_spread.GetValue() / 100
+        feather = self.sld_quest_ambient_feather.GetValue() / 10000
         self.chk_quest_ambient.SetLabel(f"环境光背景 · 亮度{brightness}%")
         self.lbl_quest_ambient_spread.SetLabel(f"环境光扩散 {spread:g}×")
+        self.lbl_quest_ambient_feather.SetLabel(f"边缘渐隐 {feather * 100:g}%")
         if self._applying_settings or self.args is None or event is None:
             return
         session = getattr(self.args, "state", {}).get("quest_session")
@@ -1006,6 +1029,12 @@ class MainFrame(wx.Frame):
                 ("quest_ambient", self.chk_quest_ambient, self.chk_quest_ambient.GetValue()),
                 ("quest_ambient_brightness", self.sld_quest_ambient_brightness, brightness / 100),
                 ("quest_ambient_spread", self.sld_quest_ambient_spread, spread),
+                (
+                    "quest_ambient_fill_borders",
+                    self.chk_quest_ambient_fill_borders,
+                    self.chk_quest_ambient_fill_borders.GetValue(),
+                ),
+                ("quest_ambient_feather", self.sld_quest_ambient_feather, feather),
             ):
                 if control is widget:
                     session.submit("set", {key: value})
@@ -1295,6 +1324,8 @@ class MainFrame(wx.Frame):
                 quest_ambient=self.chk_quest_ambient.GetValue(),
                 quest_ambient_brightness=self.sld_quest_ambient_brightness.GetValue() / 100,
                 quest_ambient_spread=self.sld_quest_ambient_spread.GetValue() / 100,
+                quest_ambient_fill_borders=self.chk_quest_ambient_fill_borders.GetValue(),
+                quest_ambient_feather=self.sld_quest_ambient_feather.GetValue() / 10000,
                 stream_fps=int(self.cbo_stream_fps.GetValue()),
                 stream_height=int(self.cbo_stream_height.GetValue()),
             )
@@ -1412,9 +1443,15 @@ class MainFrame(wx.Frame):
                 self.on_quest_screen_curvature(None)
             if "quest_ambient" in values:
                 self.chk_quest_ambient.SetValue(values["quest_ambient"])
-            for key in ("quest_ambient_brightness", "quest_ambient_spread"):
+            if "quest_ambient_fill_borders" in values:
+                self.chk_quest_ambient_fill_borders.SetValue(values["quest_ambient_fill_borders"])
+            for key, scale in (
+                ("quest_ambient_brightness", 100),
+                ("quest_ambient_spread", 100),
+                ("quest_ambient_feather", 10000),
+            ):
                 if key in values:
-                    getattr(self, "sld_" + key).SetValue(round(values[key] * 100))
+                    getattr(self, "sld_" + key).SetValue(round(values[key] * scale))
             self.on_quest_ambient(None)
             for key in ("preserve_screen_border", "ema_normalize", "compile", "quest_control"):
                 if key in values:
@@ -1790,6 +1827,9 @@ class MainFrame(wx.Frame):
             self.sld_quest_ambient_brightness,
             self.lbl_quest_ambient_spread,
             self.sld_quest_ambient_spread,
+            self.chk_quest_ambient_fill_borders,
+            self.lbl_quest_ambient_feather,
+            self.sld_quest_ambient_feather,
         ]:
             control.Show(quest)
         for control in [

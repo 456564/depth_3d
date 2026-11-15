@@ -186,7 +186,11 @@ class QuestSession:
                 self.server.set_screen_curvature(args.quest_screen_curvature)
             if self.server is not None and any(key.startswith("quest_ambient") for key in patch):
                 self.server.configure_ambient(
-                    args.quest_ambient, args.quest_ambient_brightness, args.quest_ambient_spread
+                    args.quest_ambient,
+                    args.quest_ambient_brightness,
+                    args.quest_ambient_spread,
+                    args.quest_ambient_fill_borders,
+                    args.quest_ambient_feather,
                 )
         self.publish(args, patch)
 
@@ -215,6 +219,8 @@ class QuestSession:
             settings.get("ambient_enabled", False),
             settings.get("ambient_brightness", 0.25),
             settings.get("ambient_spread", 2.0),
+            settings.get("ambient_fill_borders", True),
+            settings.get("ambient_feather", 0.03),
         )
         self.server.set_controller_factory(settings.get("controller_factory"))
         return self.server
@@ -239,6 +245,8 @@ class QuestSession:
             ambient_enabled=getattr(args, "quest_ambient", False),
             ambient_brightness=getattr(args, "quest_ambient_brightness", 0.25),
             ambient_spread=getattr(args, "quest_ambient_spread", 2.0),
+            ambient_fill_borders=getattr(args, "quest_ambient_fill_borders", True),
+            ambient_feather=getattr(args, "quest_ambient_feather", 0.03),
         )
         self.server.set_menu(QuestMenu(self.snapshot, self.submit))
         self.server.start()

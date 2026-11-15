@@ -180,6 +180,13 @@ def create_parser():
     )
     parser.add_argument("--quest-ambient-brightness", type=float, default=0.25, help="Ambient brightness (0-1)")
     parser.add_argument("--quest-ambient-spread", type=float, default=2.0, help="Ambient coverage multiplier (1.2-4)")
+    parser.add_argument(
+        "--quest-ambient-no-fill-borders",
+        action="store_false",
+        dest="quest_ambient_fill_borders",
+        help="Keep video black bars instead of filling them with ambient light",
+    )
+    parser.add_argument("--quest-ambient-feather", type=float, default=0.03, help="Video edge feather width (0-0.1)")
     parser.add_argument("--bind-addr", type=str, default=local_address, help="HTTP listen address")
     parser.add_argument("--user", type=str, help="HTTP Basic Authentication username")
     parser.add_argument("--password", type=str, help="HTTP Basic Authentication password")
@@ -254,7 +261,14 @@ def prepare_quest_args(args: Namespace) -> None:
     validate_patch(
         {
             key: getattr(args, key)
-            for key in ("quest_screen_curvature", "quest_ambient", "quest_ambient_brightness", "quest_ambient_spread")
+            for key in (
+                "quest_screen_curvature",
+                "quest_ambient",
+                "quest_ambient_brightness",
+                "quest_ambient_spread",
+                "quest_ambient_fill_borders",
+                "quest_ambient_feather",
+            )
         }
     )
     args.method = {"row_flow": "row_flow_v3", "row_flow_sym": "row_flow_v3_sym"}.get(args.method, args.method)
@@ -522,6 +536,8 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 ambient_enabled=args.quest_ambient,
                 ambient_brightness=args.quest_ambient_brightness,
                 ambient_spread=args.quest_ambient_spread,
+                ambient_fill_borders=args.quest_ambient_fill_borders,
+                ambient_feather=args.quest_ambient_feather,
             )
         elif not args.local_viewer:
             # Web Streaming
@@ -611,12 +627,11 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
             tick = time.perf_counter()
             with args.state["args_lock"]:
                 ambient_enabled = args.quest and args.quest_ambient
-            if ambient_enabled:
-                # 合成前单目RGB[3,H,W]；ROI使用已消费帧坐标，提色不持设置锁。
-                content_rect = (
-                    screenshot_thread.get_content_rect() if hasattr(screenshot_thread, "get_content_rect") else None
-                )
-                server.set_ambient_frame(frame, content_rect=content_rect)
+            content_rect = (
+                screenshot_thread.get_content_rect()
+                if ambient_enabled and hasattr(screenshot_thread, "get_content_rect")
+                else None
+            )
             with args.state["args_lock"]:
                 if args.quest:
                     server.check_error()
@@ -627,6 +642,10 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     prev_divergence = args.divergence
                 sbs = IW3U.process_image(frame, args, depth_model, side_model, autocrop_uncrop=True)
 
+            if ambient_enabled:
+                # 原单目[3,H,W]负责取色，最终FullSBS[3,H2,2W2]负责遮罩，同一包提交且不持设置锁。
+                server.set_ambient_frame(frame, content_rect=content_rect, sbs=sbs)
+            with args.state["args_lock"]:
                 if args.quest:
                     server.set_frame_data((sbs, tick))
                     if session is not None and server.get_fps() > 0:

@@ -46,6 +46,8 @@ def test_schema_covers_quest_fields_with_chinese_help() -> None:
         "quest_ambient",
         "quest_ambient_brightness",
         "quest_ambient_spread",
+        "quest_ambient_fill_borders",
+        "quest_ambient_feather",
     }
     assert all(field.label and len(field.help) >= 25 for field in fields)
     assert {field.page for field in fields} <= set(schema().PAGES)
