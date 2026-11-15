@@ -349,6 +349,12 @@ def test_audio_sends_every_chunk_without_video(module: Any, monkeypatch: pytest.
             initial_messages(client)
             kind, payload = read_message(client)
             assert kind == 0x03 and json.loads(payload) == {"taxa": 48000, "canais": 2}
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._connection is not None, timeout=1)
+            deadline = time.monotonic() + 1
+            while server._audio_discard_pending and time.monotonic() < deadline:
+                threading.Event().wait(0.001)
+            assert not server._audio_discard_pending
             chunks.extend([b"\x01\x00\x02\x00" * 480, b"\x03\x00\x04\x00" * 480, b"\x05\x00\x06\x00" * 480])
             for value in (1, 3, 5):
                 kind, payload = read_message(client)

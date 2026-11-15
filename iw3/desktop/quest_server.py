@@ -86,6 +86,8 @@ class QuestServer:
         self._shutdown = threading.Event()
         self._shutdown.set()
         self._need_idr = False
+        self._suspended = False
+        self._audio_discard_pending = False
         self._connection: socket.socket | None = None
         self._listener: socket.socket | None = None
         self._discovery: socket.socket | None = None
@@ -171,6 +173,8 @@ class QuestServer:
                     release_error = error
             connection, self._connection = self._connection, None
             self._pending = None
+            self._suspended = False
+            self._audio_discard_pending = False
             for request in (self._video_request, self._audio_request):
                 if request is not None:
                     request.cancelled = True
@@ -329,6 +333,7 @@ class QuestServer:
                 self._shutdown.is_set()
                 or not self._video_enabled
                 or not self._ambient_enabled
+                or self._suspended
                 or self._connection is None
             ):
                 return
@@ -420,7 +425,7 @@ class QuestServer:
         with self._condition:
             generation = self._generation
             width, height = self.width, self.height
-            enabled = self._video_enabled
+            enabled = self._video_enabled and not self._suspended
         if frame.shape != (3, height, width) or frame.dtype not in (torch.float16, torch.float32):
             raise ValueError(f"Expected float RGB CHW {(3, height, width)}")
         if frame.device.type not in ("cpu", "cuda") or not math.isfinite(tick) or tick < 0:
@@ -460,6 +465,8 @@ class QuestServer:
                             release_error = error
                     self._connection = None
                     self._pending = None
+                    self._suspended = False
+                    self._audio_discard_pending = False
                     self._reset_ambient()
                     if release_error is not None:
                         self._shutdown.set()
@@ -481,9 +488,14 @@ class QuestServer:
                     raise RuntimeError(f"Quest手柄控制失败：{error}") from error
         return None
 
-    def _send(self, connection: socket.socket, kind: int, payload: bytes) -> None:
+    def _send(self, connection: socket.socket, kind: int, payload: bytes, generation: int | None = None) -> bool:
         with self._write_lock:
+            if generation is not None:
+                with self._condition:
+                    if self._suspended or generation != self._generation or connection is not self._connection:
+                        return False
             connection.sendall(struct.pack("!BI", kind, len(payload)) + payload)
+            return True
 
     def _send_json(self, connection: socket.socket, kind: int, payload: dict[str, Any]) -> None:
         self._send(connection, kind, json.dumps(payload, separators=(",", ":")).encode())
@@ -596,6 +608,7 @@ class QuestServer:
                     or connection is not self._connection
                     or not self._video_enabled
                     or not self._ambient_enabled
+                    or self._suspended
                     or self._shutdown.is_set()
                 ):
                     return
@@ -648,6 +661,8 @@ class QuestServer:
                             return
                         self._connection = connection
                         self._controller = controller
+                        self._suspended = False
+                        self._audio_discard_pending = True
                         self._need_idr = True
                         self._sent.clear()
                         self._condition.notify_all()
@@ -802,6 +817,30 @@ class QuestServer:
                         with self._condition:
                             if connection is not self._connection:
                                 return
+                            state = data.get("estado") if isinstance(data, dict) else None
+                            if state == "oculto" and not self._suspended:
+                                self._suspended = True
+                                self._generation += 1
+                                self._pending = None
+                                self._reset_ambient()
+                                self._sent.clear()
+                            suspended = self._suspended
+                        if suspended:
+                            self._reset_input()
+                            self._control(connection, "reset")
+                            if state not in ("visivel", "focado"):
+                                continue
+                            # shortcut: 只重同步现有接收器；失活的APK解码器/XR需接收端恢复。
+                            self._video_config(connection)
+                            if self._source is not None:
+                                self._send_json(connection, 0x03, {"taxa": self._source.sample_rate, "canais": 2})
+                            self._send_layers(connection)
+                            with self._condition:
+                                self._generation += 1
+                                self._need_idr = True
+                                self._audio_discard_pending = True
+                                self._suspended = False
+                                self._condition.notify_all()
                         pose = self._pose(data)
                         recentered = pose is not None and (
                             not anchored or data.get("recentrou") is True or self._recenter_requested.is_set()
@@ -860,7 +899,12 @@ class QuestServer:
                     lambda: (
                         self._shutdown.is_set()
                         or self._video_request is not None
-                        or (self._video_enabled and self._connection is not None and self._pending is not None)
+                        or (
+                            self._video_enabled
+                            and not self._suspended
+                            and self._connection is not None
+                            and self._pending is not None
+                        )
                     )
                 )
                 if self._shutdown.is_set():
@@ -931,11 +975,16 @@ class QuestServer:
                 last_pts = pts
                 try:
                     # 已编码P帧只在代次被废弃时跳过；新代次始终从IDR重建引用。
+                    sent = False
                     for packet in packets:
-                        self._send(
-                            connection, 0x02, struct.pack("!QB", packet.pts, int(packet.is_keyframe)) + bytes(packet)
-                        )
-                    if packets:
+                        if self._send(
+                            connection,
+                            0x02,
+                            struct.pack("!QB", packet.pts, int(packet.is_keyframe)) + bytes(packet),
+                            generation=generation,
+                        ):
+                            sent = True
+                    if sent:
                         with self._condition:
                             self._sent.append(time.monotonic())
                     self._send_ambient(connection)
@@ -1017,13 +1066,24 @@ class QuestServer:
                     continue
                 try:
                     source.check_error()
-                    chunks = source.get_chunks()
+                    # 先取恢复标记再读：读取期间的新恢复必须留给下一批，旧批由连接/代次拒发。
                     with self._condition:
+                        generation = self._generation
                         connection = self._connection
+                        discard = self._audio_discard_pending
+                        self._audio_discard_pending = False
+                    chunks = source.get_chunks()
+                    if discard:
+                        continue
                     if connection is not None:
                         try:
                             for chunk in chunks:
-                                self._send(connection, 0x04, struct.pack("!Q", time.monotonic_ns() // 1000) + chunk)
+                                self._send(
+                                    connection,
+                                    0x04,
+                                    struct.pack("!Q", time.monotonic_ns() // 1000) + chunk,
+                                    generation=generation,
+                                )
                         except OSError:
                             self._disconnect(connection)
                 except Exception as error:
