@@ -229,7 +229,14 @@ def apply_divergence_nn_LR(
 
     if getattr(model, "symmetric", False):
         left_eye, right_eye = apply_divergence_nn_symmetric(
-            model, c, depth, divergence, convergence, synthetic_view=synthetic_view, enable_amp=enable_amp
+            model,
+            c,
+            depth,
+            divergence,
+            convergence,
+            synthetic_view=synthetic_view,
+            enable_amp=enable_amp,
+            preserve_screen_border=preserve_screen_border,
         )
     else:
         if synthetic_view == "both":
@@ -498,7 +505,9 @@ def apply_divergence_nn_delta_weight(
         return z
 
 
-def apply_divergence_nn_symmetric(model, c, depth, divergence, convergence, synthetic_view, enable_amp):
+def apply_divergence_nn_symmetric(
+    model, c, depth, divergence, convergence, synthetic_view, enable_amp, preserve_screen_border=False
+):
     # BCHW
     assert synthetic_view in {"both", "right", "left"}
     assert model.delta_output
@@ -514,7 +523,14 @@ def apply_divergence_nn_symmetric(model, c, depth, divergence, convergence, synt
 
     x = torch.stack(
         [
-            make_input_tensor(None, depth[i], divergence=divergence, convergence=convergence[i], image_width=W)
+            make_input_tensor(
+                None,
+                depth[i],
+                divergence=divergence,
+                convergence=convergence[i],
+                image_width=W,
+                preserve_screen_border=preserve_screen_border,
+            )
             for i in range(depth.shape[0])
         ]
     )

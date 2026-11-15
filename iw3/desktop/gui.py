@@ -79,7 +79,7 @@ BACKENDS_WITH_CROP = BACKENDS_WITH_TARGET | {"obs"}
 
 
 myEVT_FPS = wx.NewEventType()
-EVT_FPS = wx.PyEventBinder(myEVT_FPS, 0)
+EVT_FPS: wx.PyEventBinder = wx.PyEventBinder(myEVT_FPS, 0)
 
 
 # Spin inclrement value
@@ -363,7 +363,7 @@ class MainFrame(wx.Frame):
 
         self.lbl_view_mode = wx.StaticText(self.grp_network, label=T("View Mode"))
         self.cbo_view_mode = wx.ComboBox(
-            self.grp_network, choices=["Web Streaming", "Local Viewer"], name="cbo_view_mode"
+            self.grp_network, choices=["Web Streaming", "Local Viewer", "Quest / Pop3D"], name="cbo_view_mode"
         )
         self.cbo_view_mode.SetEditable(False)
         self.cbo_view_mode.SetSelection(0)
@@ -412,6 +412,31 @@ class MainFrame(wx.Frame):
         self.chk_gpu_jpeg.SetValue(False)
         if not ENABLE_GPU_JPEG:
             self.chk_gpu_jpeg.Disable()
+        self.lbl_quest_bitrate = wx.StaticText(self.grp_network, label="HEVC (Mbps)")
+        self.cbo_quest_bitrate = EditableComboBox(
+            self.grp_network, choices=["35", "50", "20"], name="cbo_quest_bitrate"
+        )
+        self.cbo_quest_bitrate.SetSelection(0)
+        self.chk_quest_audio = wx.CheckBox(self.grp_network, label="电脑声音 / PC audio", name="chk_quest_audio")
+        self.chk_quest_audio.SetValue(True)
+        self.lbl_quest_audio_source = wx.StaticText(self.grp_network, label="声音采集")
+        self.cbo_quest_audio_source = wx.ComboBox(
+            self.grp_network,
+            choices=["独立采音", "扬声器回环（兼容）"],
+            style=wx.CB_READONLY,
+            name="cbo_quest_audio_source",
+        )
+        self.cbo_quest_audio_source.SetSelection(0)
+        self.cbo_quest_audio_source.SetToolTip(
+            "独立采集除iw3以外的系统声音，不随Windows主音量和系统静音变化；网页自身音量仍生效。"
+            "兼容模式沿用默认扬声器回环。"
+        )
+        self.chk_quest_control = wx.CheckBox(self.grp_network, label="手柄控制电脑", name="chk_quest_control")
+        self.chk_quest_control.SetValue(False)
+        self.chk_quest_control.SetToolTip(
+            "右手指向浏览器画面；扳机左键点击/拖动；摇杆上下拨动一次切一个抖音视频，回中后可再切。"
+            "仅支持 Windows 的 wc_mp/mss 和指定窗口；调屏时暂停电脑操作，松开握柄后先松扳机、摇杆回中。"
+        )
         self.sep_network1 = wx.StaticLine(self.grp_network, style=wx.LI_HORIZONTAL)
 
         self.chk_auth = wx.CheckBox(self.grp_network, label=T("Basic Authentication"), name="chk_auth")
@@ -442,13 +467,19 @@ class MainFrame(wx.Frame):
         layout.Add(self.chk_gpu_jpeg, (8, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.chk_pad_16_9, (9, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.chk_fit_window, (10, 1), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.sep_network1, (11, 0), (0, 3), flag=wx.EXPAND | wx.ALL)
+        layout.Add(self.lbl_quest_bitrate, (11, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.cbo_quest_bitrate, (11, 1), flag=wx.EXPAND)
+        layout.Add(self.chk_quest_audio, (12, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.chk_quest_control, (13, 1), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.lbl_quest_audio_source, (14, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.cbo_quest_audio_source, (14, 1), flag=wx.EXPAND)
+        layout.Add(self.sep_network1, (15, 0), (0, 3), flag=wx.EXPAND | wx.ALL)
 
-        layout.Add(self.chk_auth, (12, 0), (0, 3), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.lbl_auth_username, (13, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.txt_auth_username, (13, 1), flag=wx.EXPAND)
-        layout.Add(self.lbl_auth_password, (14, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.txt_auth_password, (14, 1), flag=wx.EXPAND)
+        layout.Add(self.chk_auth, (16, 0), (0, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.lbl_auth_username, (17, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.txt_auth_username, (17, 1), flag=wx.EXPAND)
+        layout.Add(self.lbl_auth_password, (18, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.txt_auth_password, (18, 1), flag=wx.EXPAND)
 
         sizer_network = wx.StaticBoxSizer(self.grp_network, wx.VERTICAL)
         sizer_network.Add(layout, 1, wx.ALL | wx.EXPAND, 4)
@@ -661,12 +692,27 @@ class MainFrame(wx.Frame):
         self.btn_url.SetToolTip(T("Open in Browser"))
         self.btn_start = wx.Button(self.pnl_process, label=T("Start"))
         self.btn_cancel = wx.Button(self.pnl_process, label=T("Shutdown"))
+        self.lbl_quest_audio_gain = wx.StaticText(self.pnl_process, label="头显音量 100%")
+        self.sld_quest_audio_gain = wx.Slider(
+            self.pnl_process, value=100, minValue=0, maxValue=400, name="sld_quest_audio_gain"
+        )
+        self.sld_quest_audio_gain.SetToolTip("只调整发送给头显的声音，运行中可调；100%为原始音量。")
+        self.sld_quest_audio_gain.Bind(wx.EVT_SLIDER, self.on_quest_audio_gain)
+        self.lbl_quest_screen_help = wx.StaticText(
+            self.pnl_process,
+            label="调屏：指向画面，握住任一手握柄键并移动；同手摇杆上远下近、右大左小。\n"
+            "松开恢复网页操作；Quest居中恢复屏幕位置和大小。",
+        )
+        self.lbl_quest_screen_help.SetToolTip("调屏无需勾选手柄控制电脑；换手前先松开两手握柄键。")
 
         layout = wx.GridBagSizer(vgap=5, hgap=4)
         layout.Add(self.btn_start, (0, 0), flag=wx.EXPAND)
         layout.Add(self.btn_cancel, (0, 1), flag=wx.EXPAND)
         layout.Add(self.txt_url, (0, 2), flag=wx.EXPAND)
         layout.Add(self.btn_url, (0, 3), flag=wx.EXPAND)
+        layout.Add(self.lbl_quest_audio_gain, (1, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.sld_quest_audio_gain, (1, 2), (1, 2), flag=wx.EXPAND)
+        layout.Add(self.lbl_quest_screen_help, (2, 0), (1, 4), flag=wx.EXPAND)
         self.pnl_process.SetSizer(layout)
 
         # language panel
@@ -792,6 +838,7 @@ class MainFrame(wx.Frame):
             self.cbo_foreground_scale,
             self.cbo_stream_fps,
             self.cbo_stream_height,
+            self.cbo_quest_bitrate,
         ]
         return editable_comboboxes
 
@@ -853,6 +900,13 @@ class MainFrame(wx.Frame):
             self.cbo_foreground_scale.SetValue(str(foreground_scale))
             self.cbo_edge_dilation.SetValue(str(edge_dilation))
             self.cbo_edge_dilation_y.SetValue(edge_dilation_y)
+
+    def on_quest_audio_gain(self, event):
+        value = self.sld_quest_audio_gain.GetValue()
+        self.lbl_quest_audio_gain.SetLabel(f"头显音量 {value}%")
+        if self.args is not None:
+            with self.args_lock:
+                self.args.quest_audio_gain = value / 100
 
     def update_args_adjustment(self, event):
         if self.args is None:
@@ -917,7 +971,9 @@ class MainFrame(wx.Frame):
 
     def update_stereo_format(self, *args, **kwargs):
         stereo_format = self.cbo_stereo_format.GetValue()
-        if stereo_format in {"Half SBS", "Half TB"}:
+        if self.cbo_view_mode.GetValue() == "Quest / Pop3D":
+            self.lbl_format_device.SetLabel("Quest / Pop3D: Full SBS")
+        elif stereo_format in {"Half SBS", "Half TB"}:
             self.lbl_format_device.SetLabel("Meta Quest 2/3")
         elif stereo_format in {"Full SBS", "Full TB"}:
             self.lbl_format_device.SetLabel("PICO 4")
@@ -1013,10 +1069,14 @@ class MainFrame(wx.Frame):
         if not validate_number(self.cbo_stream_height.GetValue(), 320, 4320, allow_empty=False):
             self.show_validation_error_message(T("Streaming Resolution"), 320, 4320)
             return None
-        if not validate_number(self.cbo_stream_quality.GetValue(), 1, 100, allow_empty=False):
+        quest = self.cbo_view_mode.GetValue() == "Quest / Pop3D"
+        if quest and not validate_number(self.cbo_quest_bitrate.GetValue(), 5, 100, is_int=True, allow_empty=False):
+            self.show_validation_error_message("HEVC (Mbps)", 5, 100)
+            return None
+        if not quest and not validate_number(self.cbo_stream_quality.GetValue(), 1, 100, allow_empty=False):
             self.show_validation_error_message(T("MJPEG Quality"), 1, 100)
             return None
-        if not validate_number(self.txt_port.GetValue(), 1025, 65535, allow_empty=False):
+        if not quest and not validate_number(self.txt_port.GetValue(), 1025, 65535, allow_empty=False):
             self.show_validation_error_message(T("Port"), 1025, 65535)
             return None
 
@@ -1056,6 +1116,10 @@ class MainFrame(wx.Frame):
         rgbd = self.cbo_stereo_format.GetValue() == "RGB-D"
         half_rgbd = self.cbo_stereo_format.GetValue() == "Half RGB-D"
         anaglyph = self.get_anaglyph_method()
+        if quest:
+            full_sbs = True
+            tb = half_tb = cross_eyed = rgbd = half_rgbd = False
+            anaglyph = None
 
         device_id = int(self.cbo_device.GetClientData(self.cbo_device.GetSelection()))
         device_id = [device_id]
@@ -1096,7 +1160,19 @@ class MainFrame(wx.Frame):
 
         pad_mode = "16:9" if self.chk_pad_16_9.IsChecked() else None
         local_viewer = self.cbo_view_mode.GetValue() == "Local Viewer"
-        if local_viewer:
+        if quest:
+            viewer_kwargs = dict(
+                quest=True,
+                bind_addr=bind_addr,
+                quest_bitrate=int(self.cbo_quest_bitrate.GetValue()),
+                quest_no_audio=not self.chk_quest_audio.GetValue(),
+                quest_audio_source="process" if self.cbo_quest_audio_source.GetSelection() == 0 else "speaker",
+                quest_audio_gain=self.sld_quest_audio_gain.GetValue() / 100,
+                quest_control=self.chk_quest_control.GetValue(),
+                stream_fps=int(self.cbo_stream_fps.GetValue()),
+                stream_height=int(self.cbo_stream_height.GetValue()),
+            )
+        elif local_viewer:
             viewer_kwargs = dict(
                 local_viewer=True,
                 stream_fps=int(self.cbo_stream_fps.GetValue()),
@@ -1151,13 +1227,17 @@ class MainFrame(wx.Frame):
             **viewer_kwargs,
         )
         args = parser.parse_args()
-        set_state_args(
-            args,
-            args_lock=self.args_lock,
-            fps_event=FPSGUI(self),
-            stop_event=self.stop_event,
-            depth_model=self.depth_model,
-        )
+        try:
+            set_state_args(
+                args,
+                args_lock=self.args_lock,
+                fps_event=FPSGUI(self),
+                stop_event=self.stop_event,
+                depth_model=self.depth_model,
+            )
+        except ValueError as error:
+            wx.MessageBox(str(error), T("Error"), wx.OK | wx.ICON_ERROR)
+            return None
         return args
 
     def on_fps(self, event):
@@ -1180,7 +1260,9 @@ class MainFrame(wx.Frame):
         self.stop_event.clear()
         self.btn_start.Disable()
         self.btn_cancel.Enable()
-        self.btn_url.Enable()
+        self.btn_url.Enable(not self.args.quest)
+        if self.args.quest:
+            self.txt_url.SetValue("打开 Quest 的 Pop3D；先退出电脑端 Pop3D")
         self.pnl_preset.Hide()
         self.grp_stereo.Hide()
         self.grp_processor.Hide()
@@ -1292,6 +1374,7 @@ class MainFrame(wx.Frame):
             persistent_manager_register(manager, control, EditableComboBoxPersistentHandler)
         persistent_manager_restore_all(manager, exclude_names)
         persistent_manager_unregister_all(manager)
+        self.on_quest_audio_gain(None)
 
     def on_click_divergence_warning(self, event):
         self.lbl_divergence_warning.Hide()
@@ -1415,10 +1498,9 @@ class MainFrame(wx.Frame):
 
     def update_view_mode(self, *args, **kwargs):
         local_viewer = self.cbo_view_mode.GetValue() == "Local Viewer"
+        quest = self.cbo_view_mode.GetValue() == "Quest / Pop3D"
+        address_options = [self.chk_bind_addr, self.txt_bind_addr, self.btn_detect_ip]
         streaming_options = [
-            self.chk_bind_addr,
-            self.txt_bind_addr,
-            self.btn_detect_ip,
             self.lbl_port,
             self.txt_port,
             self.lbl_stream_quality,
@@ -1436,16 +1518,32 @@ class MainFrame(wx.Frame):
             self.chk_fit_window,
         ]
 
-        if local_viewer:
-            for control in streaming_options:
-                control.Hide()
-            for control in local_viewer_options:
-                control.Show()
-        else:
-            for control in streaming_options:
-                control.Show()
-            for control in local_viewer_options:
-                control.Hide()
+        for control in address_options:
+            control.Show(not local_viewer)
+        for control in streaming_options:
+            control.Show(not local_viewer and not quest)
+        for control in local_viewer_options:
+            control.Show(local_viewer)
+        for control in [
+            self.lbl_quest_bitrate,
+            self.cbo_quest_bitrate,
+            self.chk_quest_audio,
+            self.chk_quest_control,
+            self.lbl_quest_audio_source,
+            self.cbo_quest_audio_source,
+            self.lbl_quest_audio_gain,
+            self.sld_quest_audio_gain,
+            self.lbl_quest_screen_help,
+        ]:
+            control.Show(quest)
+        for control in [
+            self.lbl_stereo_format,
+            self.cbo_stereo_format,
+            self.lbl_anaglyph_method,
+            self.cbo_anaglyph_method,
+        ]:
+            control.Show(not quest)
+        self.update_stereo_format()
 
         if self.IsShown():
             refresh_layouts(self)

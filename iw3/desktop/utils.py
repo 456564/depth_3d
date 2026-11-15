@@ -4,6 +4,7 @@ import socket
 import sys
 import threading
 import time
+from argparse import Namespace
 from collections import deque
 from os import path
 
@@ -16,6 +17,7 @@ from nunif.device import create_device
 from nunif.initializer import gc_collect
 from nunif.models import compile_model
 from nunif.models.data_parallel import DeviceSwitchInference
+from nunif.utils.video import pyav_init_cuda_primary_context
 
 from .. import models  # noqa
 from .. import utils as IW3U
@@ -156,7 +158,14 @@ def debug_jpeg_data(frame, jpeg_data):
 def create_parser():
     local_address = get_local_address()
     parser = IW3U.create_parser(required_true=False)
-    parser.add_argument("--local-viewer", action="store_true", help="Use Local Viewer instead of Web Streaming")
+    viewer = parser.add_mutually_exclusive_group()
+    viewer.add_argument("--local-viewer", action="store_true", help="Use Local Viewer instead of Web Streaming")
+    viewer.add_argument("--quest", action="store_true", help="HEVC LAN streaming to the Pop3D Quest app")
+    parser.add_argument("--quest-bitrate", type=int, default=35, help="Quest HEVC bitrate in Mbps (5-100)")
+    parser.add_argument("--quest-no-audio", action="store_true", help="Disable PC speaker audio in Quest mode")
+    parser.add_argument("--quest-audio-source", choices=["process", "speaker"], default="process")
+    parser.add_argument("--quest-audio-gain", type=float, default=1.0, help="Quest-only audio gain (0-4)")
+    parser.add_argument("--quest-control", action="store_true", help="Control the captured Windows window with Quest")
     parser.add_argument("--port", type=int, default=1303, help="HTTP listen port")
     parser.add_argument("--bind-addr", type=str, default=local_address, help="HTTP listen address")
     parser.add_argument("--user", type=str, help="HTTP Basic Authentication username")
@@ -208,7 +217,39 @@ def create_parser():
     return parser
 
 
+def prepare_quest_args(args: Namespace) -> None:
+    if args.quest_control:
+        if not args.quest or sys.platform != "win32":
+            raise ValueError("Quest PC control requires Quest mode and Windows")
+        if not args.window_name or not args.window_name.strip() or args.screenshot not in {"wc_mp", "mss"}:
+            raise ValueError("Quest PC control requires a window name and wc_mp or mss capture")
+        if (
+            args.pad is not None
+            or args.pad_mode not in {None, "tblr"}
+            or args.ipd_offset != 0
+            or args.rotate_left
+            or args.rotate_right
+        ):
+            raise ValueError("Quest PC control requires no padding, IPD offset or rotation")
+    if not args.quest:
+        return
+    if not math.isfinite(args.quest_audio_gain) or not 0 <= args.quest_audio_gain <= 4:
+        raise ValueError("Quest audio gain must be finite and between 0 and 4")
+    if args.local_viewer or args.gpu[0] < 0:
+        raise ValueError("Quest output requires an NVIDIA GPU and cannot use Local Viewer")
+    if not 5 <= args.quest_bitrate <= 100 or args.stream_fps <= 0:
+        raise ValueError("Quest requires 5-100 Mbps and a positive streaming FPS")
+    args.full_sbs = True
+    # 原生客户端分别取全宽双眼；不沿用网页的半宽或其他排版。
+    for name in ("half_sbs", "tb", "half_tb", "cross_eyed", "rgbd", "half_rgbd", "vr180"):
+        setattr(args, name, False)
+    args.anaglyph = None
+
+
 def set_state_args(args, args_lock=None, stop_event=None, fps_event=None, depth_model=None):
+    prepare_quest_args(args)
+    if args.quest:
+        pyav_init_cuda_primary_context()
     IW3U.set_state_args(args, stop_event=stop_event, depth_model=depth_model)
     args.state["fps_event"] = fps_event
     args.state["args_lock"] = args_lock if args_lock is not None else threading.Lock()
@@ -390,6 +431,10 @@ def iw3_desktop_main(args, init_wxapp=True):
             frame_height = screen_height
             frame_width = screen_width
 
+        if args.quest:
+            frame_height -= frame_height % 2
+            frame_width -= frame_width % 2
+
         if screenshot_thread is not None:
             screenshot_thread.set_frame_size(frame_width, frame_height)
 
@@ -401,7 +446,33 @@ def iw3_desktop_main(args, init_wxapp=True):
         if init_wxapp:
             empty_app = wx.App()  # noqa: F841 this is needed to initialize wx.GetMousePosition()
 
-        if not args.local_viewer:
+        if args.quest:
+            from .quest_server import QuestServer
+
+            if args.quest_control:
+                from .quest_input import QuestController
+                from .quest_windows import WindowsInput
+
+                backend = WindowsInput(
+                    args.window_name,
+                    args.screenshot,
+                    (args.crop_top, args.crop_left, args.crop_right, args.crop_bottom),
+                    frame_mapping=lambda: (
+                        screenshot_thread.get_frame_mapping() if screenshot_thread is not None else None
+                    ),
+                )
+            server = QuestServer(
+                host=args.bind_addr,
+                width=output_frame_width,
+                height=output_frame_height,
+                fps=args.stream_fps,
+                bitrate=args.quest_bitrate,
+                audio=not args.quest_no_audio,
+                audio_source=args.quest_audio_source,
+                audio_gain=args.quest_audio_gain,
+                controller_factory=(lambda: QuestController(backend)) if args.quest_control else None,
+            )
+        elif not args.local_viewer:
             # Web Streaming
             with open(path.join(path.dirname(__file__), "views", "index.html.tpl"), mode="r", encoding="utf-8") as f:
                 index_template = f.read()
@@ -446,6 +517,7 @@ def iw3_desktop_main(args, init_wxapp=True):
                 crop_right=args.crop_right,
                 crop_bottom=args.crop_bottom,
                 draw_cursor_enabled=not args.disable_draw_cursor,
+                **({"window_handle": backend.hwnd, "fit_window": True} if args.quest_control else {}),
             )
 
         if args.compile:
@@ -458,7 +530,11 @@ def iw3_desktop_main(args, init_wxapp=True):
         server.start()
         screenshot_thread.start()
 
-        if not args.local_viewer:
+        if args.quest:
+            print("Open Pop3D on Quest (close the Pop3D PC app first). UDP 52300 / TCP 52301")
+            if args.state["fps_event"] is not None:
+                args.state["fps_event"].set_url(None)
+        elif not args.local_viewer:
             if args.state["fps_event"] is not None:
                 args.state["fps_event"].set_url(f"http://{args.bind_addr}:{args.port}")
             else:
@@ -473,13 +549,18 @@ def iw3_desktop_main(args, init_wxapp=True):
 
         while True:
             with args.state["args_lock"]:
+                if args.quest:
+                    server.check_error()
+                    server.set_audio_gain(args.quest_audio_gain)
                 tick = time.perf_counter()
                 frame = screenshot_thread.get_frame()
                 if frame is None:
                     break
                 sbs = IW3U.process_image(frame, args, depth_model, side_model, autocrop_uncrop=True)
 
-                if not args.local_viewer:
+                if args.quest:
+                    server.set_frame_data((sbs, tick))
+                elif not args.local_viewer:
                     if args.gpu_jpeg:
                         server.set_frame_data(
                             to_jpeg_data(sbs, quality=args.stream_quality, tick=tick, gpu_jpeg=args.gpu_jpeg)
@@ -541,13 +622,17 @@ def iw3_desktop_main(args, init_wxapp=True):
             if args.state["stop_event"] and args.state["stop_event"].is_set():
                 break
     finally:
-        if server is not None:
-            server.stop()
-        if screenshot_thread is not None:
-            screenshot_thread.stop()
-        depth_model.clear_compiled_model()
-        depth_model.reset()
-        gc_collect()
+        try:
+            if server is not None:
+                server.stop()
+        finally:
+            try:
+                if screenshot_thread is not None:
+                    screenshot_thread.stop()
+            finally:
+                depth_model.clear_compiled_model()
+                depth_model.reset()
+                gc_collect()
 
     if args.state["stop_event"] and args.state["stop_event"].is_set():
         args.state["stop_event"].clear()

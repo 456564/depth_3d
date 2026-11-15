@@ -63,6 +63,40 @@ tmp
 /nunif/utils/color_lut
 /tests/data
 
+# Quest process-audio build outputs
+/iw3/desktop/native/quest_process_audio.dll
+/iw3/desktop/native/quest_process_audio.obj
+/iw3/desktop/native/quest_process_audio.lib
+/iw3/desktop/native/quest_process_audio.exp
+
+# Local model weights and media; existing upstream tracked assets are retained.
+*.pth
+*.pt
+*.onnx
+*.rknn
+*.ckpt
+*.safetensors
+*.mkv
+*.mov
+*.avi
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.flac
+
+# Local credentials and settings
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+/.Codex/settings.local.json
+
 # ----- Python.gitignore
 
 .ruff_cache

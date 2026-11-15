@@ -1,3 +1,4 @@
+import ctypes
 import multiprocessing as mp
 import os
 import sys
@@ -10,6 +11,7 @@ from typing import Any
 import numpy as np
 import torch
 import wx
+from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
@@ -28,6 +30,48 @@ from .screenshot_thread_kwcapture import (  # noqa
 
 _x11_connection_pool: dict[int, Any] = {}
 _mss_pool: dict[int, Any] = {}
+
+
+def _window_geometry(hwnd, backend):
+    import win32gui
+    import win32process
+
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return None
+        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+        window_rect = win32gui.GetWindowRect(hwnd)
+        capture_rect = window_rect
+        if backend == "windows_capture":
+
+            class RECT(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_int32) for name in ("left", "top", "right", "bottom")]
+
+            rect = RECT()
+            dwm = ctypes.WinDLL("dwmapi")
+            dwm.DwmGetWindowAttribute.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32)
+            dwm.DwmGetWindowAttribute.restype = ctypes.c_int32
+            if dwm.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) != 0:
+                return None
+            capture_rect = (rect.left, rect.top, rect.right, rect.bottom)
+        return pid, window_rect, capture_rect
+    except (win32gui.error, OSError):
+        return None
+
+
+def _decode_frame_mapping(values):
+    if not values[0]:
+        return None
+    return {
+        "hwnd": values[1],
+        "pid": values[2],
+        "backend": "mss" if values[3] == 1 else "windows_capture",
+        "window_rect": tuple(values[4:8]),
+        "capture_rect": tuple(values[8:12]),
+        "crops": tuple(values[12:16]),
+        "content_rect": tuple(values[16:20]),
+        "buffer_size": tuple(values[20:22]),
+    }
 
 
 def is_linux_x11():
@@ -80,15 +124,17 @@ class CaptureControlMSS:
     def __init__(self):
         self._stop = False
         self.frame_pos = [0, 0]
+        self.frame_geometry = None
 
     def stop(self):
         self._stop = True
 
 
 class WindowsCaptureMSS:
-    def __init__(self, monitor_index=0, window_name=None):
+    def __init__(self, monitor_index=0, window_name=None, window_handle=None):
         self.window_name = window_name
         self.monitor_index = monitor_index
+        self.window_handle = window_handle
 
     def event(self, handler):
         if handler.__name__ == "on_frame_arrived":
@@ -105,7 +151,15 @@ class WindowsCaptureMSS:
         while True:
             with mss.mss(with_cursor=True) as sct:
                 tick = time.perf_counter()
-                if self.window_name is not None:
+                if self.window_handle is not None:
+                    geometry = _window_geometry(self.window_handle, "mss")
+                    if geometry is None:
+                        raise RuntimeError("Capture window is no longer available")
+                    _, (left, top, right, bottom), _ = geometry
+                    control.frame_geometry = geometry
+                    position = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+                    control.frame_pos = [top, left]
+                elif self.window_name is not None:
                     position = get_window_rect_by_title(self.window_name, sct=sct)
                     control.frame_pos = [position["top"], position["left"]]
                 else:
@@ -121,12 +175,25 @@ class WindowsCaptureMSS:
                 time.sleep(wait_time)
 
 
-def draw_cursor(x, pos, size=12, offset=[0, 0]):
+def draw_cursor(x, pos, size=12, offset=[0, 0], mapping=None):
     C, H, W = x.shape
-    r = size // 2
+    left, top, right, bottom = 0, 0, W, H
+    if mapping is not None:
+        cl, ct, cr, cb = mapping["capture_rect"]
+        crop_top, crop_left, crop_right, crop_bottom = mapping["crops"]
+        source_width, source_height = cr - cl - crop_left - crop_right, cb - ct - crop_top - crop_bottom
+        px, py = pos[0] - cl - crop_left, pos[1] - ct - crop_top
+        if not (0 <= px < source_width and 0 <= py < source_height):
+            return
+        left, top, right, bottom = mapping["content_rect"]
+        pos = (left + round(px * (right - left) / source_width), top + round(py * (bottom - top) / source_height))
+        offset = (0, 0)
+    r = min(size // 2, (right - left) // 2, (bottom - top) // 2)
+    if r < 1:
+        return
     rr = r // 2
-    pos_x = min(max(pos[0] - offset[1], r), W - r)
-    pos_y = min(max(pos[1] - offset[0], r), H - r)
+    pos_x = min(max(pos[0] - offset[1], left + r), right - r)
+    pos_y = min(max(pos[1] - offset[0], top + r), bottom - r)
     px = x[:, pos_y - rr : pos_y + rr, pos_x - rr : pos_x + rr].clone()
     color = torch.tensor((0x33 / 255.0, 0x80 / 255.0, 0x80 / 255.0), dtype=px.dtype, device=px.device).view(3, 1, 1)
     x[:, pos_y - r : pos_y + r, pos_x - r : pos_x + r] = color
@@ -372,12 +439,28 @@ def capture_process(
     crop_left=0,
     crop_right=0,
     crop_bottom=0,
+    window_handle=None,
+    fit_window=False,
+    frame_mapping=None,
 ):
     frame_buffer = np.ndarray(frame_size, dtype=np.uint8, buffer=frame_shm.buf)
     frame_count = 0
+    pinned_pid = None
+    if fit_window:
+        if window_handle is None or frame_mapping is None:
+            raise ValueError("Fitted window capture requires a fixed window and shared mapping")
+        shcore = ctypes.WinDLL("shcore")
+        shcore.SetProcessDpiAwareness.argtypes = (ctypes.c_int,)
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_int32
+        shcore.SetProcessDpiAwareness(2)
+        geometry = _window_geometry(window_handle, backend)
+        if geometry is None:
+            raise RuntimeError("Capture window is no longer available")
+        pinned_pid = geometry[0]
 
     if backend == "mss":
-        capture = WindowsCaptureMSS(monitor_index=monitor_index, window_name=window_name)
+        options = {"window_handle": window_handle} if window_handle is not None else {}
+        capture = WindowsCaptureMSS(monitor_index=monitor_index, window_name=window_name, **options)
     elif backend == "windows_capture":
         try:
             from windows_capture import WindowsCapture
@@ -392,6 +475,15 @@ def capture_process(
             # 1 origin
             monitor_index = monitor_index + 1
 
+        if window_handle is not None:
+            import win32gui
+
+            matches = []
+            win32gui.EnumWindows(
+                lambda hwnd, _: matches.append(hwnd) if win32gui.GetWindowText(hwnd) == window_name else None, None
+            )
+            if matches != [window_handle] or win32gui.FindWindow(None, window_name) != window_handle:
+                raise RuntimeError("Capture title no longer identifies the fixed window")
         capture = WindowsCapture(
             cursor_capture=None,
             draw_border=None,
@@ -405,8 +497,20 @@ def capture_process(
         if not frame_event.is_set():
             with frame_lock:
                 source_frame = frame.frame_buffer
+                geometry = None
+                if fit_window:
+                    geometry = (
+                        getattr(capture_control, "frame_geometry", None)
+                        if backend == "mss"
+                        else _window_geometry(window_handle, backend)
+                    )
+                if fit_window:
+                    frame_mapping[0] = 0
                 # Apply cropping for window capture
-                if window_name and (crop_top > 0 or crop_left > 0 or crop_right > 0 or crop_bottom > 0):
+                crop_applied = (window_name or window_handle is not None) and (
+                    crop_top > 0 or crop_left > 0 or crop_right > 0 or crop_bottom > 0
+                )
+                if crop_applied:
                     h, w = source_frame.shape[:2]
                     top = crop_top
                     bottom = h - crop_bottom if crop_bottom > 0 else h
@@ -414,7 +518,47 @@ def capture_process(
                     right = w - crop_right if crop_right > 0 else w
                     source_frame = source_frame[top:bottom, left:right, :]
 
-                if frame_buffer.shape != source_frame.shape:
+                if fit_window:
+                    frame_buffer[:] = 0
+                    if geometry is not None and geometry[0] == pinned_pid:
+                        _, window_rect, capture_rect = geometry
+                        width, height = capture_rect[2] - capture_rect[0], capture_rect[3] - capture_rect[1]
+                        source_height, source_width = source_frame.shape[:2]
+                        if frame.frame_buffer.shape[:2] == (height, width) and source_width > 0 and source_height > 0:
+                            buffer_height, buffer_width = frame_buffer.shape[:2]
+                            scale = min(buffer_width / source_width, buffer_height / source_height)
+                            fitted_width = max(1, min(buffer_width, round(source_width * scale)))
+                            fitted_height = max(1, min(buffer_height, round(source_height * scale)))
+                            left = (buffer_width - fitted_width) // 2
+                            top = (buffer_height - fitted_height) // 2
+                            # RGBX 按四字节原样缩放，避免 Pillow 对 BGRA 的 alpha 预乘。
+                            resized = np.asarray(
+                                Image.fromarray(source_frame, mode="RGBX").resize(
+                                    (fitted_width, fitted_height), Image.Resampling.BOX
+                                )
+                            )
+                            frame_buffer[top : top + fitted_height, left : left + fitted_width] = resized
+                            # 像素与映射同锁发布；尺寸变化中间帧不能沿用旧点击坐标。
+                            if _window_geometry(window_handle, backend) == geometry:
+                                frame_mapping[:] = [
+                                    1,
+                                    window_handle,
+                                    pinned_pid,
+                                    1 if backend == "mss" else 2,
+                                    *window_rect,
+                                    *capture_rect,
+                                    crop_top,
+                                    crop_left,
+                                    crop_right,
+                                    crop_bottom,
+                                    left,
+                                    top,
+                                    left + fitted_width,
+                                    top + fitted_height,
+                                    buffer_width,
+                                    buffer_height,
+                                ]
+                elif frame_buffer.shape != source_frame.shape:
                     if window_name is not None:
                         # NOTE: The size may differ due to resizing, Window effects, etc.
                         # I wanted to use replication padding,
@@ -435,8 +579,8 @@ def capture_process(
                     frame_buffer[:] = source_frame
 
                 if hasattr(capture_control, "frame_pos"):
-                    frame_pos[0] = capture_control.frame_pos[0]
-                    frame_pos[1] = capture_control.frame_pos[1]
+                    frame_pos[0] = capture_control.frame_pos[0] + (crop_top if crop_applied else 0)
+                    frame_pos[1] = capture_control.frame_pos[1] + (crop_left if crop_applied else 0)
 
                 frame_event.set()
 
@@ -445,12 +589,17 @@ def capture_process(
 
     @capture.event
     def on_closed():
-        pass
+        if frame_mapping is not None:
+            with frame_lock:
+                frame_mapping[0] = 0
 
     try:
         # event loop
         capture.start()
     finally:
+        if frame_mapping is not None:
+            with frame_lock:
+                frame_mapping[0] = 0
         frame_event.set()
         time.sleep(0.1)
 
@@ -477,6 +626,8 @@ class ScreenshotProcess(threading.Thread):
         crop_right=0,
         crop_bottom=0,
         draw_cursor_enabled=True,
+        window_handle: int | None = None,
+        fit_window: bool = False,
     ):
         super().__init__(daemon=True)
         self.backend = backend
@@ -484,6 +635,8 @@ class ScreenshotProcess(threading.Thread):
         self.frame_height = frame_height
         self.monitor_index = monitor_index
         self.window_name = window_name
+        self.window_handle = window_handle
+        self.fit_window = fit_window
         self.device = device
         self.crop_top = crop_top
         self.crop_left = crop_left
@@ -491,19 +644,28 @@ class ScreenshotProcess(threading.Thread):
         self.crop_bottom = crop_bottom
         self.draw_cursor_enabled = draw_cursor_enabled
         self.frame = None
+        self.frame_mapping: dict[str, Any] | None = None
+        self.process: Any = None
+        self.process_frame_buffer: Any = None
+        self.process_stop_event: Any = None
         self.frame_set_event = threading.Event()
         self.frame_lock = threading.Lock()
         self.fps_lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.fps_counter = deque(maxlen=120)
+        self.fps_counter: deque[float] = deque(maxlen=120)
 
+        self.cuda_stream: torch.cuda.Stream | None = None
         if device.type == "cuda":
             self.cuda_stream = torch.cuda.Stream(device=device)
-        else:
-            self.cuda_stream = None
 
     def start_process(self):
-        if self.window_name:
+        if self.window_handle is not None:
+            geometry = _window_geometry(self.window_handle, self.backend)
+            if geometry is None:
+                raise RuntimeError("Capture window is no longer available")
+            _, (left, top, right, bottom), _ = geometry
+            screen_size = (right - left, bottom - top)
+        elif self.window_name:
             rect = get_window_rect_by_title(self.window_name)
             if rect is None:
                 raise RuntimeError(f"{self.window_name} not found")
@@ -515,6 +677,7 @@ class ScreenshotProcess(threading.Thread):
         template = np.zeros((self.screen_height, self.screen_width, 4), dtype=np.uint8)
         self.process_frame_buffer = shared_memory.SharedMemory(create=True, size=template.nbytes)
         self.process_frame_pos = mp.Array("i", [0, 0], lock=False)
+        self.process_frame_mapping = mp.Array("q", [0] * 22, lock=False)
         self.process_stop_event = mp.Event()
         self.process_frame_event = mp.Event()
         self.process_frame_lock = mp.Lock()
@@ -534,14 +697,19 @@ class ScreenshotProcess(threading.Thread):
                 self.crop_left,
                 self.crop_right,
                 self.crop_bottom,
+                self.window_handle,
+                self.fit_window,
+                self.process_frame_mapping,
             ),
         )
         self.process.start()
 
     def run(self):
-        self.start_process()
+        with self.frame_lock:
+            self.frame_mapping = None
         frame_buffer = None
         try:
+            self.start_process()
             while True:
                 tick = time.perf_counter()
                 self.process_frame_event.clear()
@@ -554,6 +722,7 @@ class ScreenshotProcess(threading.Thread):
                         (self.screen_height, self.screen_width, 4), dtype=np.uint8, buffer=self.process_frame_buffer.buf
                     )
                     frame = frame.copy()
+                    mapping = _decode_frame_mapping(self.process_frame_mapping)
 
                 frame = torch.from_numpy(frame)
                 if frame_buffer is None:
@@ -567,8 +736,18 @@ class ScreenshotProcess(threading.Thread):
                     with torch.cuda.stream(self.cuda_stream):
                         frame = frame_buffer.to(self.device, non_blocking=True)
                         frame = frame[:, :, 0:3][:, :, (2, 1, 0)].permute(2, 0, 1).contiguous() / 255.0
-                        if self.backend == "mss" and sys.platform != "linux" and self.draw_cursor_enabled:
-                            draw_cursor(frame, wx.GetMousePosition(), offset=self.process_frame_pos)
+                        if (
+                            self.backend == "mss"
+                            and sys.platform != "linux"
+                            and self.draw_cursor_enabled
+                            and (not self.fit_window or mapping is not None)
+                        ):
+                            draw_cursor(
+                                frame,
+                                wx.GetMousePosition(),
+                                offset=self.process_frame_pos,
+                                mapping=mapping if self.fit_window else None,
+                            )
                         if frame.shape[1:] != (self.frame_height, self.frame_width):
                             frame = TF.resize(
                                 frame,
@@ -580,8 +759,18 @@ class ScreenshotProcess(threading.Thread):
                 else:
                     frame = frame_buffer.to(self.device)
                     frame = frame[:, :, 0:3][:, :, (2, 1, 0)].permute(2, 0, 1).contiguous() / 255.0
-                    if self.backend == "mss" and sys.platform != "linux" and self.draw_cursor_enabled:
-                        draw_cursor(frame, wx.GetMousePosition(), offset=self.process_frame_pos)
+                    if (
+                        self.backend == "mss"
+                        and sys.platform != "linux"
+                        and self.draw_cursor_enabled
+                        and (not self.fit_window or mapping is not None)
+                    ):
+                        draw_cursor(
+                            frame,
+                            wx.GetMousePosition(),
+                            offset=self.process_frame_pos,
+                            mapping=mapping if self.fit_window else None,
+                        )
                     if frame.shape[1:] != (self.frame_height, self.frame_width):
                         frame = TF.resize(
                             frame,
@@ -592,6 +781,7 @@ class ScreenshotProcess(threading.Thread):
 
                 with self.frame_lock:
                     self.frame = frame
+                    self.frame_mapping = mapping
                     self.frame_set_event.set()
 
                 process_time = time.perf_counter() - tick
@@ -601,21 +791,34 @@ class ScreenshotProcess(threading.Thread):
                 if self.stop_event.is_set():
                     break
         finally:
-            self.process_stop_event.set()
+            with self.frame_lock:
+                self.frame_mapping = None
             self.stop_event.set()
-            self.process.join(timeout=4)
-            if self.process.is_alive():
-                self.process.terminate()
-                self.process.join()
-            self.process = None
-            self.process_frame_buffer.close()
-            self.process_frame_buffer.unlink()
-            self.process_frame_buffer = None
+            self.frame_set_event.set()
+            try:
+                if self.process_stop_event is not None:
+                    self.process_stop_event.set()
+                if self.process is not None:
+                    if self.process.pid is not None:
+                        self.process.join(timeout=4)
+                        if self.process.is_alive():
+                            self.process.terminate()
+                            self.process.join()
+                    self.process = None
+            finally:
+                if self.process_frame_buffer is not None:
+                    try:
+                        self.process_frame_buffer.close()
+                    finally:
+                        self.process_frame_buffer.unlink()
+                        self.process_frame_buffer = None
 
     def get_frame(self):
         while not self.frame_set_event.wait(1):
             if self.stop_event.is_set():
                 raise RuntimeError("thread is already dead")
+        if self.stop_event.is_set():
+            raise RuntimeError("thread is already dead")
         with self.frame_lock:
             if self.cuda_stream is not None:
                 torch.cuda.current_stream().wait_stream(self.cuda_stream)
@@ -631,6 +834,16 @@ class ScreenshotProcess(threading.Thread):
                 return 1 / mean_processing_time
             else:
                 return 0
+
+    def get_frame_mapping(self) -> dict[str, Any] | None:
+        with self.frame_lock:
+            if self.stop_event.is_set() or (self.process is not None and not self.process.is_alive()):
+                return None
+            if self.process is not None:
+                with self.process_frame_lock:
+                    if _decode_frame_mapping(self.process_frame_mapping) != self.frame_mapping:
+                        return None
+            return dict(self.frame_mapping) if self.frame_mapping is not None else None
 
     def stop(self):
         self.stop_event.set()
