@@ -1,6 +1,7 @@
 import os
 import sys
 
+from .quest_restart import add_resume_argument, apply_resume
 from .utils import (
     create_parser,
     init_win32,
@@ -16,7 +17,13 @@ def cli_main():
         os.system("title iw3.desktop")
 
     parser = create_parser()
+    add_resume_argument(parser)
     args = parser.parse_args()
+    if args.quest_resume:
+        try:
+            apply_resume(args, args.quest_resume, gui=False)
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
     set_state_args(args)
 
     # When using --local-viewer, use platform-aware entry point

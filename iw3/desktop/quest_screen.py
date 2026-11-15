@@ -31,6 +31,12 @@ class QuestScreen:
     def active(self) -> bool:
         return self._hand is not None
 
+    def set_aspect(self, aspect: float) -> None:
+        value = _vector([aspect], 1)
+        if value is None or value[0] <= 0 or not math.isfinite(8 * value[0]):
+            raise ValueError("Screen aspect must be finite and positive")
+        self._aspect = value[0]
+
     def recenter(self, pose: tuple[list[float], list[float]]) -> None:
         position, rotation = pose
         self._rotation = rotation.copy()

@@ -8,6 +8,8 @@ from os import path
 import traceback
 import threading
 import importlib.util
+import copy
+from typing import Any, cast
 import wx
 from wx.lib.delayedresult import startWorker
 import wx.lib.agw.persist as persist
@@ -40,6 +42,8 @@ from nunif.gui import (
 )
 from ..base_depth_model import BaseDepthModel
 from ..locales import LOCALES, load_language_setting, save_language_setting
+from .quest_restart import add_resume_argument, load_resume, restart_process
+from .quest_settings import FIELD_MAP
 from .utils import (
     get_local_address,
     is_private_address,
@@ -94,7 +98,17 @@ ADD_DEBUG_METHOD = bool(os.getenv("DEBUG", False))
 
 class FPSEvent(wx.PyCommandEvent):
     def __init__(
-        self, etype, eid, estimated_fps=None, screenshot_fps=None, streaming_fps=None, screen_size=None, url=None
+        self,
+        etype,
+        eid,
+        estimated_fps=None,
+        screenshot_fps=None,
+        streaming_fps=None,
+        screen_size=None,
+        url=None,
+        session=None,
+        settings=None,
+        restart_path=None,
     ):
         super(FPSEvent, self).__init__(etype, eid)
         self.estimated_fps = estimated_fps
@@ -102,6 +116,9 @@ class FPSEvent(wx.PyCommandEvent):
         self.streaming_fps = streaming_fps
         self.screen_size = screen_size
         self.url = url
+        self.session = session
+        self.settings = settings
+        self.restart_path = restart_path
 
     def GetValue(self):
         return (self.estimated_fps, self.screenshot_fps, self.streaming_fps, self.screen_size, self.url)
@@ -112,15 +129,27 @@ class FPSGUI:
         self.parent = parent
 
     def set_url(self, url):
-        wx.PostEvent(self.parent, FPSEvent(myEVT_FPS, -1, None, None, None, None, url))
+        wx.PostEvent(self.parent, FPSEvent(myEVT_FPS, -1, url=url, session=self))
 
     def update(self, estimated_fps, screenshot_fps, streaming_fps, screen_size):
         wx.PostEvent(
-            self.parent, FPSEvent(myEVT_FPS, -1, estimated_fps, screenshot_fps, streaming_fps, screen_size, None)
+            self.parent,
+            FPSEvent(myEVT_FPS, -1, estimated_fps, screenshot_fps, streaming_fps, screen_size, session=self),
         )
+
+    def settings_applied(self, values: dict[str, Any]) -> None:
+        wx.PostEvent(self.parent, FPSEvent(myEVT_FPS, -1, session=self, settings=copy.deepcopy(values)))
+
+    def restart_requested(self, resume_path: str) -> None:
+        wx.PostEvent(self.parent, FPSEvent(myEVT_FPS, -1, session=self, restart_path=resume_path))
 
 
 class IW3DesktopApp(wx.App):
+    def __init__(self, resume_values: dict[str, Any] | None = None):
+        self.quest_resume_values = resume_values
+        self.quest_restart_path: str | None = None
+        super().__init__()
+
     def OnInit(self):
         main_frame = MainFrame()
         self.instance = wx.SingleInstanceChecker("iw3-desktop-gui.lock", CONFIG_DIR)
@@ -135,6 +164,8 @@ class IW3DesktopApp(wx.App):
         main_frame.Show()
         refresh_layouts(main_frame)
         self.SetTopWindow(main_frame)
+        if self.quest_resume_values is not None:
+            wx.CallAfter(main_frame.resume_quest, self.quest_resume_values)
 
         return True
 
@@ -163,6 +194,10 @@ class MainFrame(wx.Frame):
         self.depth_model_height = None
         self.processing = False
         self.args = None
+        self._fps_event: FPSGUI | None = None
+        self._applying_settings = False
+        self._restart_resume_path: str | None = None
+        self._resume_values: dict[str, Any] | None = None
         self.args_lock = threading.Lock()
         self.initialize_component()
         if is_dark_mode():
@@ -629,20 +664,22 @@ class MainFrame(wx.Frame):
 
         self.lbl_adj_divergence = wx.StaticText(self.grp_adjustment, label=T("3D Strength"))
         self.sld_adj_divergence = wx.SpinCtrlDouble(
-            self.grp_adjustment, value="1.00", min=0.0, max=10.0, inc=DIVERGENCE_INC_DEFAULT
+            self.grp_adjustment, value="1.00", min=0.0, max=100.0, inc=DIVERGENCE_INC_DEFAULT
         )
-        self.sld_adj_divergence.SetDigits(2)
+        self.sld_adj_divergence.SetDigits(3)
         self.lbl_adj_convergence = wx.StaticText(self.grp_adjustment, label=T("Convergence Plane"))
         self.sld_adj_convergence = wx.SpinCtrlDouble(
-            self.grp_adjustment, value="1.0", min=0.0, max=1.0, inc=CONVERGENCE_INC_DEFAULT
+            self.grp_adjustment, value="1.0", min=-100.0, max=100.0, inc=CONVERGENCE_INC_DEFAULT
         )
+        self.sld_adj_convergence.SetDigits(3)
         self.lbl_adj_foreground_scale = wx.StaticText(self.grp_adjustment, label=T("Foreground Scale"))
         self.sld_adj_foreground_scale = wx.SpinCtrlDouble(
             self.grp_adjustment, value="0", min=-3.0, max=3.0, inc=FOREGROUNDSCALE_INC_DEFAULT
         )
+        self.sld_adj_foreground_scale.SetDigits(3)
         self.lbl_adj_edge_dilation = wx.StaticText(self.grp_adjustment, label=T("Edge Fix"))
         self.sld_adj_edge_dilation = wx.SpinCtrl(
-            self.grp_adjustment, value="0", min=0, max=10, name="sld_adj_edge_dilation"
+            self.grp_adjustment, value="0", min=0, max=20, name="sld_adj_edge_dilation"
         )
         self.cbo_adj_edge_dilation_y = EditableComboBox(
             self.grp_adjustment, choices=["", "0", "1", "2"], name="cbo_adj_edge_dilation_y"
@@ -888,7 +925,7 @@ class MainFrame(wx.Frame):
             self.sld_adj_convergence.SetValue(convergence)
             self.sld_adj_foreground_scale.SetValue(foreground_scale)
             self.sld_adj_edge_dilation.SetValue(edge_dilation)
-            self.cbo_adj_edge_dilation_y.SetValue(edge_dilation_y)
+            self.cbo_adj_edge_dilation_y.ChangeValue(edge_dilation_y)
         else:
             divergence = self.sld_adj_divergence.GetValue()
             convergence = self.sld_adj_convergence.GetValue()
@@ -904,12 +941,35 @@ class MainFrame(wx.Frame):
     def on_quest_audio_gain(self, event):
         value = self.sld_quest_audio_gain.GetValue()
         self.lbl_quest_audio_gain.SetLabel(f"头显音量 {value}%")
+        if self._applying_settings:
+            return
         if self.args is not None:
+            session = getattr(self.args, "state", {}).get("quest_session")
+            if session is not None:
+                session.submit("set", {"quest_audio_gain": value / 100})
+                return
             with self.args_lock:
                 self.args.quest_audio_gain = value / 100
 
     def update_args_adjustment(self, event):
-        if self.args is None:
+        if self.args is None or self._applying_settings:
+            return
+        session = self.args.state.get("quest_session")
+        if session is not None:
+            control = event.GetEventObject() if event is not None else None
+            for key in ("divergence", "convergence", "foreground_scale"):
+                if control is getattr(self, "sld_adj_" + key):
+                    session.submit("set", {key: control.GetValue()})
+                    return
+            if control not in (self.sld_adj_edge_dilation, self.cbo_adj_edge_dilation_y):
+                return
+            edge_x = self.sld_adj_edge_dilation.GetValue()
+            edge_y = self.cbo_adj_edge_dilation_y.GetValue()
+            try:
+                edge = [edge_x, int(edge_y)] if edge_y else edge_x
+            except ValueError:
+                return
+            session.submit("set", {"edge_dilation": edge})
             return
         with self.args_lock:
             divergence = self.sld_adj_divergence.GetValue()
@@ -1227,20 +1287,118 @@ class MainFrame(wx.Frame):
             **viewer_kwargs,
         )
         args = parser.parse_args()
+        if self._resume_values is not None:
+            for key, value in self._resume_values.items():
+                setattr(args, key, copy.deepcopy(value))
+            args.quest = True
+            args.local_viewer = False
+            args.full_sbs = True
+        self._fps_event = FPSGUI(self)
         try:
             set_state_args(
                 args,
                 args_lock=self.args_lock,
-                fps_event=FPSGUI(self),
+                fps_event=self._fps_event,
                 stop_event=self.stop_event,
                 depth_model=self.depth_model,
             )
         except ValueError as error:
             wx.MessageBox(str(error), T("Error"), wx.OK | wx.ICON_ERROR)
             return None
+        self._resume_values = None
         return args
 
+    def _apply_quest_settings(self, values: dict[str, Any]) -> None:
+        self._applying_settings = True
+        try:
+            self.cbo_view_mode.ChangeValue("Quest / Pop3D")
+            if "depth_model" in values and self.cbo_depth_model.FindString(values["depth_model"]) < 0:
+                self.chk_small_model_only.SetValue(False)
+                self.update_depth_model_list()
+            if "screenshot" in values:
+                self.cbo_screenshot.ChangeValue(values["screenshot"])
+                self.update_monitor_index()
+                window_name = values.get("window_name", self.cbo_window_name.GetValue())
+                self.update_window_names()
+                self.cbo_window_name.ChangeValue(window_name or "")
+            text_controls = {
+                "divergence": "cbo_divergence",
+                "convergence": "cbo_convergence",
+                "convergence_mode": "cbo_convergence_mode",
+                "foreground_scale": "cbo_foreground_scale",
+                "synthetic_view": "cbo_synthetic_view",
+                "ema_decay": "cbo_ema_decay",
+                "depth_model": "cbo_depth_model",
+                "method": "cbo_method",
+                "stream_height": "cbo_stream_height",
+                "stream_fps": "cbo_stream_fps",
+                "quest_bitrate": "cbo_quest_bitrate",
+                "monitor_index": "cbo_monitor_index",
+                "window_name": "cbo_window_name",
+                "autocrop": "cbo_autocrop",
+            }
+            for key, name in text_controls.items():
+                if key in values:
+                    getattr(self, name).ChangeValue(str(values[key]) if values[key] is not None else "")
+            for key in ("preserve_screen_border", "ema_normalize", "compile", "quest_control"):
+                if key in values:
+                    getattr(self, "chk_" + key).SetValue(values[key])
+            for side in ("top", "bottom", "left", "right"):
+                key = "crop_" + side
+                if key in values:
+                    getattr(self, "txt_" + key).SetValue(values[key])
+            if "resolution" in values:
+                self.cbo_resolution.ChangeValue(
+                    "Default" if values["resolution"] is None else str(values["resolution"])
+                )
+            if "edge_dilation" in values:
+                edge = values["edge_dilation"]
+                self.cbo_edge_dilation.ChangeValue(str(edge[0] if isinstance(edge, list) else edge))
+                self.cbo_edge_dilation_y.ChangeValue(str(edge[1]) if isinstance(edge, list) else "")
+            if "gpu" in values:
+                for index in range(self.cbo_device.GetCount()):
+                    if self.cbo_device.GetClientData(index) == values["gpu"][0]:
+                        self.cbo_device.SetSelection(index)
+                        break
+            if "quest_no_audio" in values:
+                self.chk_quest_audio.SetValue(not values["quest_no_audio"])
+            if "quest_audio_source" in values:
+                self.cbo_quest_audio_source.SetSelection(0 if values["quest_audio_source"] == "process" else 1)
+            if "quest_audio_gain" in values:
+                gain = round(values["quest_audio_gain"] * 100)
+                self.sld_quest_audio_gain.SetValue(gain)
+                self.lbl_quest_audio_gain.SetLabel(f"头显音量 {gain}%")
+            if "pad_mode" in values:
+                self.chk_pad_16_9.SetValue(values["pad_mode"] == "16:9")
+            if values.get("bind_addr") is not None:
+                self.chk_bind_addr.SetValue(True)
+                self.txt_bind_addr.SetValue(values["bind_addr"])
+            self.sync_adj_controls(to=True)
+            self.update_edge_dilation()
+            self.update_ema_normalize()
+            self.update_preserve_screen_border()
+            self.update_view_mode()
+        finally:
+            self._applying_settings = False
+
+    def resume_quest(self, values: dict[str, Any]) -> None:
+        self._resume_values = copy.deepcopy(values)
+        self._apply_quest_settings(values)
+        self.on_click_btn_start(None)
+
+    def _finish_quest_restart(self) -> None:
+        if self._restart_resume_path is not None and not self.processing:
+            cast(IW3DesktopApp, wx.GetApp()).quest_restart_path = self._restart_resume_path
+            self.Close()
+
     def on_fps(self, event):
+        if event.session is not None and event.session is not self._fps_event:
+            return
+        if event.settings is not None:
+            self._apply_quest_settings(event.settings)
+        if event.restart_path is not None:
+            self._restart_resume_path = event.restart_path
+            self._finish_quest_restart()
         estimated_fps, screenshot_fps, streaming_fps, screen_size, url = event.GetValue()
         if estimated_fps is not None and screenshot_fps is not None and streaming_fps is not None:
             self.SetStatusText(
@@ -1256,6 +1414,10 @@ class MainFrame(wx.Frame):
         self.args = self.parse_args()
         if self.args is None:
             return
+        if self.args.quest:
+            # The session owns model lifetime; GUI caching would retain old weights during reload.
+            self.depth_model = None
+            self.depth_model_type = self.depth_model_device_id = self.depth_model_height = None
 
         self.stop_event.clear()
         self.btn_start.Disable()
@@ -1309,6 +1471,12 @@ class MainFrame(wx.Frame):
             traceback.print_tb(tb)
             error_info = (message, f"{T('Error')}: {e.__class__.__name__}")
 
+        quest = self.args is not None and self.args.quest
+        if quest:
+            self._apply_quest_settings({key: getattr(self.args, key) for key in FIELD_MAP if hasattr(self.args, key)})
+            self._restart_resume_path = self.args.state.get("quest_restart_path", self._restart_resume_path)
+            if self.depth_model is None:
+                self.depth_model_type = self.depth_model_device_id = self.depth_model_height = None
         self.args = None
         self.processing = False
         self.btn_cancel.Disable()
@@ -1320,7 +1488,8 @@ class MainFrame(wx.Frame):
         self.grp_processor.Show()
         self.grp_network.Show()
         self.grp_adjustment.Hide()
-        self.sync_adj_controls(to=False)
+        if not quest:
+            self.sync_adj_controls(to=False)
         refresh_layouts(self)
         wx.CallAfter(refresh_layouts, self)
 
@@ -1331,6 +1500,7 @@ class MainFrame(wx.Frame):
 
         # free vram
         gc_collect()
+        self._finish_quest_restart()
 
     def on_click_btn_cancel(self, event):
         self.stop_event.set()
@@ -1601,7 +1771,14 @@ def main():
 
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--lang", type=str, choices=list(LOCALES.keys()), help="translation language")
+    add_resume_argument(parser)
     args = parser.parse_args()
+    resume_values = None
+    if args.quest_resume:
+        try:
+            resume_values = load_resume(args.quest_resume, gui=True)
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
     if args.lang:
         LOCALE_DICT = LOCALES.get(args.lang, {})
     else:
@@ -1611,8 +1788,12 @@ def main():
 
     sys.argv = [sys.argv[0]]  # clear command arguments
 
-    app = IW3DesktopApp()
+    app = IW3DesktopApp(resume_values=resume_values)
     app.MainLoop()
+    if app.quest_restart_path is not None:
+        # Release the old instance lock before replacing the process.
+        del app.instance
+        restart_process(app.quest_restart_path, gui=True)
 
 
 if __name__ == "__main__":

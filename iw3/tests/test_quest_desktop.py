@@ -6,6 +6,87 @@ import pytest
 from iw3.desktop import utils as desktop
 
 
+@pytest.mark.parametrize("method,canonical", [("row_flow", "row_flow_v3"), ("row_flow_sym", "row_flow_v3_sym")])
+def test_quest_cli_normalizes_legacy_settings_for_menu_and_resume(method, canonical):
+    from iw3.desktop.quest_settings import validate_patch
+
+    args = desktop.create_parser().parse_args(["--quest", "--method", method, "--edge-dilation", "2"])
+    desktop.prepare_quest_args(args)
+    assert args.method == canonical and args.edge_dilation == 2
+    validate_patch({"method": args.method, "edge_dilation": args.edge_dilation})
+
+
+@pytest.mark.parametrize("old,new", [(2.0, 2.1), (3.5, 3.6)])
+def test_single_eye_mlbw_switch_uses_effective_divergence(monkeypatch, old, new):
+    from argparse import Namespace
+
+    calls = []
+    args = Namespace(method="mlbw_l2", synthetic_view="right", gpu=[0], compile=False)
+    monkeypatch.setattr(desktop.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(desktop.IW3U, "create_stereo_model", lambda *a, **kw: calls.append(kw) or "new")
+    assert desktop.try_switch_mlbw_model(old, new, "old", args) == "new"
+    assert calls[0]["divergence"] == new * 2
+
+
+def test_new_divergence_model_is_selected_before_first_changed_frame(monkeypatch):
+    from argparse import Namespace
+
+    import torch
+
+    from iw3.desktop import quest_server
+
+    args = desktop.create_parser().parse_args(
+        ["--quest", "--bind-addr", "127.0.0.1", "--method", "mlbw_l2", "--synthetic-view", "right"]
+    )
+    desktop.prepare_quest_args(args)
+    depth = Namespace(
+        loaded=lambda: True,
+        enable_ema=lambda *a, **kw: None,
+        is_metric=lambda: False,
+        clear_compiled_model=lambda: None,
+        reset=lambda: None,
+    )
+    args.state = dict(
+        depth_model=depth, convergence_model=None, args_lock=threading.Lock(), stop_event=None, fps_event=None
+    )
+    made, inferred = [], []
+
+    class Capture:
+        def __init__(self, **kwargs):
+            self.count = 0
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def get_frame(self):
+            self.count += 1
+            args.divergence = 3.0
+            return torch.zeros(3, 16, 16) if self.count == 1 else None
+
+    server = Namespace(
+        start=lambda: None,
+        stop=lambda: None,
+        check_error=lambda: None,
+        set_audio_gain=lambda gain: None,
+        set_frame_data=lambda data: None,
+    )
+    monkeypatch.setattr(desktop, "create_device", lambda args: torch.device("cpu"))
+    monkeypatch.setattr(desktop.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(desktop, "ScreenshotThreadPIL", Capture)
+    monkeypatch.setattr(desktop, "get_monitor_size_list", lambda: [(16, 16)])
+    monkeypatch.setattr(desktop, "test_output_size", lambda *a: (16, 32))
+    monkeypatch.setattr(desktop.IW3U, "create_stereo_model", lambda *a, **kw: made.append(kw["divergence"]) or made[-1])
+    monkeypatch.setattr(
+        desktop.IW3U, "process_image", lambda frame, args, depth, side, **kw: inferred.append(side) or frame
+    )
+    monkeypatch.setattr(quest_server, "QuestServer", lambda **kw: server)
+    desktop._iw3_desktop_main_once(args, init_wxapp=False)
+    assert made == [2.0, 6.0] and inferred == [6.0]
+
+
 def test_quest_selects_full_sbs_without_changing_web_defaults() -> None:
     web = desktop.create_parser().parse_args([])
     assert not getattr(web, "quest", False)
@@ -284,7 +365,7 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
         (ValueError, "simulated input binding failure") if binding_fails else (RuntimeError, "simulated stop failure")
     )
     with pytest.raises(error, match=message):
-        desktop.iw3_desktop_main(args, init_wxapp=False)
+        desktop._iw3_desktop_main_once(args, init_wxapp=False)
     assert cleaned == (["clear", "reset"] if binding_fails else ["capture", "clear", "reset"])
     assert bound == ([("Browser", capture_kind, (1, 2, 3, 4))] if control else [])
     assert len(controllers) == int(control and not binding_fails)

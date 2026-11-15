@@ -1,6 +1,7 @@
 import threading
 import time
 from collections import deque
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +51,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
         self.stop_event = threading.Event()
         self.fps_counter = deque(maxlen=120)
         self.tick = 0
+        self._capture: Any = None
 
     def run(self):
         from wc_cuda import WindowsCapture
@@ -68,6 +70,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
             window_name=self.window_name,
             device_id=self.device.index,
         )
+        self._capture = capture
 
         @capture.event
         def on_frame_arrived(frame, capture_control):
@@ -118,10 +121,15 @@ class ScreenshotThreadWCCUDA(threading.Thread):
 
         try:
             # event loop
-            capture.start()
+            if not self.stop_event.is_set():
+                capture.start()
         finally:
-            self.frame_set_event.set()
-            time.sleep(0.1)
+            try:
+                capture.stop()
+            finally:
+                self._capture = None
+                self.frame_set_event.set()
+                time.sleep(0.1)
 
     def get_frame(self):
         while not self.frame_set_event.wait(1):
@@ -145,7 +153,15 @@ class ScreenshotThreadWCCUDA(threading.Thread):
             else:
                 return 0
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_event.set()
-        if self.ident is not None:
-            self.join(timeout=4)
+        deadline = time.monotonic() + 4
+        while self.is_alive():
+            capture = self._capture
+            if capture is not None:
+                # wc_cuda.start 初始化后会覆盖之前的 stop；退出前必须再次停止。
+                capture.stop()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("CUDA capture thread did not stop within 4 seconds")
+            self.join(timeout=min(0.1, remaining))

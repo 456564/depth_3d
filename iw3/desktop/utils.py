@@ -233,6 +233,9 @@ def prepare_quest_args(args: Namespace) -> None:
             raise ValueError("Quest PC control requires no padding, IPD offset or rotation")
     if not args.quest:
         return
+    args.method = {"row_flow": "row_flow_v3", "row_flow_sym": "row_flow_v3_sym"}.get(args.method, args.method)
+    if isinstance(args.edge_dilation, list) and len(args.edge_dilation) == 1:
+        args.edge_dilation = args.edge_dilation[0]
     if not math.isfinite(args.quest_audio_gain) or not 0 <= args.quest_audio_gain <= 4:
         raise ValueError("Quest audio gain must be finite and between 0 and 4")
     if args.local_viewer or args.gpu[0] < 0:
@@ -246,11 +249,15 @@ def prepare_quest_args(args: Namespace) -> None:
     args.anaglyph = None
 
 
-def set_state_args(args, args_lock=None, stop_event=None, fps_event=None, depth_model=None):
+def set_state_args(args, args_lock=None, stop_event=None, fps_event=None, depth_model=None, quest_owner=False):
     prepare_quest_args(args)
     if args.quest:
         pyav_init_cuda_primary_context()
-    IW3U.set_state_args(args, stop_event=stop_event, depth_model=depth_model)
+    if args.quest and not quest_owner:
+        # 先建立管理菜单；自动会聚等可能下载/失败的模型初始化留给媒体owner。
+        args.state = {"stop_event": stop_event, "depth_model": None, "convergence_model": None}
+    else:
+        IW3U.set_state_args(args, stop_event=stop_event, depth_model=depth_model)
     args.state["fps_event"] = fps_event
     args.state["args_lock"] = args_lock if args_lock is not None else threading.Lock()
     if args.edge_dilation is None or (isinstance(args.edge_dilation, list) and len(args.edge_dilation) == 0):
@@ -267,8 +274,9 @@ def test_output_size(size, args, depth_model, side_model):
 def try_switch_mlbw_model(old_divergence, new_divergence, old_side_model, args):
     assert args.method in {"mlbw_l2", "mlbw_l4", "mlbw_l2s", "mlbw_l4s"}
 
-    old_level = get_mlbw_divergence_level(old_divergence)
-    new_level = get_mlbw_divergence_level(new_divergence)
+    scale = 2.0 if args.synthetic_view in {"right", "left"} else 1.0
+    old_level = get_mlbw_divergence_level(old_divergence * scale)
+    new_level = get_mlbw_divergence_level(new_divergence * scale)
 
     # print("switch_mlbw_model", old_level, new_level, old_divergence, new_divergence)
 
@@ -280,7 +288,7 @@ def try_switch_mlbw_model(old_divergence, new_divergence, old_side_model, args):
 
     new_side_model = IW3U.create_stereo_model(
         args.method,
-        divergence=new_divergence * (2.0 if args.synthetic_view in {"right", "left"} else 1.0),
+        divergence=new_divergence * scale,
         device_id=args.gpu[0],
     )
     if args.compile and not isinstance(new_side_model, DeviceSwitchInference):
@@ -294,7 +302,16 @@ def try_switch_mlbw_model(old_divergence, new_divergence, old_side_model, args):
 
 
 def iw3_desktop_main(args, init_wxapp=True):
+    if args.quest and not args.state.get("quest_session"):
+        from .quest_session import QuestSession
+
+        return QuestSession(args).run(_iw3_desktop_main_once, init_wxapp)
+    return _iw3_desktop_main_once(args, init_wxapp)
+
+
+def _iw3_desktop_main_once(args, init_wxapp=True):
     init_num_threads(args.gpu[0])
+    session = args.state.get("quest_session")
 
     if not any([args.full_sbs, args.tb, args.half_tb, args.cross_eyed, args.rgbd, args.half_rgbd, args.anaglyph]):
         args.half_sbs = True
@@ -407,7 +424,10 @@ def iw3_desktop_main(args, init_wxapp=True):
             depth_model.load(gpu=args.gpu, resolution=args.resolution, limit_resolution=args.limit_resolution)
 
         # Use Flicker Reduction to prevent 3D sickness
-        depth_model.enable_ema(args.ema_decay, buffer_size=1)
+        if args.ema_normalize:
+            depth_model.enable_ema(args.ema_decay, buffer_size=1)
+        else:
+            depth_model.disable_ema()
         if args.state["convergence_model"] is not None:
             args.state["convergence_model"].reset(enable_ema=True, decay=0.98)
 
@@ -415,7 +435,6 @@ def iw3_desktop_main(args, init_wxapp=True):
             mapper=args.mapper, foreground_scale=args.foreground_scale, metric_depth=depth_model.is_metric()
         )
 
-        # TODO: For mlbw, it is better to switch models when the divergence value dynamically changes
         side_model = IW3U.create_stereo_model(
             args.method,
             divergence=args.divergence * (2.0 if args.synthetic_view in {"right", "left"} else 1.0),
@@ -441,6 +460,8 @@ def iw3_desktop_main(args, init_wxapp=True):
         output_frame_height, output_frame_width = test_output_size(
             (frame_height, frame_width), args, depth_model, side_model
         )
+        if session is not None:
+            session.set_stats(output_size=(output_frame_width, output_frame_height), bind_addr=args.bind_addr)
 
         lock = threading.Lock()
         if init_wxapp:
@@ -461,7 +482,8 @@ def iw3_desktop_main(args, init_wxapp=True):
                         screenshot_thread.get_frame_mapping() if screenshot_thread is not None else None
                     ),
                 )
-            server = QuestServer(
+            server_factory = session.configure if session is not None else QuestServer
+            server = server_factory(
                 host=args.bind_addr,
                 width=output_frame_width,
                 height=output_frame_height,
@@ -529,6 +551,8 @@ def iw3_desktop_main(args, init_wxapp=True):
         # main loop
         server.start()
         screenshot_thread.start()
+        if session is not None:
+            session.capture = screenshot_thread
 
         if args.quest:
             print("Open Pop3D on Quest (close the Pop3D PC app first). UDP 52300 / TCP 52301")
@@ -548,18 +572,27 @@ def iw3_desktop_main(args, init_wxapp=True):
         prev_divergence = args.divergence
 
         while True:
+            if session is not None:
+                frame = session.read_frame(screenshot_thread)
             with args.state["args_lock"]:
                 if args.quest:
                     server.check_error()
                     server.set_audio_gain(args.quest_audio_gain)
                 tick = time.perf_counter()
-                frame = screenshot_thread.get_frame()
+                if session is None:
+                    frame = screenshot_thread.get_frame()
                 if frame is None:
                     break
+                if prev_divergence != args.divergence:
+                    if args.method in {"mlbw_l2", "mlbw_l4", "mlbw_l2s", "mlbw_l4s"}:
+                        side_model = try_switch_mlbw_model(prev_divergence, args.divergence, side_model, args)
+                    prev_divergence = args.divergence
                 sbs = IW3U.process_image(frame, args, depth_model, side_model, autocrop_uncrop=True)
 
                 if args.quest:
                     server.set_frame_data((sbs, tick))
+                    if session is not None and server.get_fps() > 0:
+                        session.media_ready()
                 elif not args.local_viewer:
                     if args.gpu_jpeg:
                         server.set_frame_data(
@@ -581,6 +614,12 @@ def iw3_desktop_main(args, init_wxapp=True):
                     mean_processing_time = sum(fps_counter) / len(fps_counter)
                     estimated_fps = 1.0 / mean_processing_time
                     screen_size_tuple = (screen_size, (frame_width, frame_height))
+                    if session is not None:
+                        session.set_stats(
+                            estimated_fps=estimated_fps,
+                            screenshot_fps=screenshot_thread.get_fps(),
+                            streaming_fps=server.get_fps(),
+                        )
                     if args.state["fps_event"] is not None:
                         args.state["fps_event"].update(
                             estimated_fps, screenshot_thread.get_fps(), server.get_fps(), screen_size_tuple
@@ -604,26 +643,19 @@ def iw3_desktop_main(args, init_wxapp=True):
                 if server.is_closed():
                     break
 
-            if prev_divergence != args.divergence:
-                if args.method in {"mlbw_l2", "mlbw_l4", "mlbw_l2s", "mlbw_l4s"}:
-                    side_model = try_switch_mlbw_model(
-                        old_divergence=prev_divergence,
-                        new_divergence=args.divergence,
-                        old_side_model=side_model,
-                        args=args,
-                    )
-                prev_divergence = args.divergence
-
             process_time = time.perf_counter() - tick
             wait_time = max((1 / (args.stream_fps)) - process_time, 0)
-            time.sleep(wait_time)
+            if session is not None:
+                session.run_stop.wait(wait_time)
+            else:
+                time.sleep(wait_time)
             fps_counter.append(process_time)
             count += 1
             if args.state["stop_event"] and args.state["stop_event"].is_set():
                 break
     finally:
         try:
-            if server is not None:
+            if server is not None and session is None:
                 server.stop()
         finally:
             try:
