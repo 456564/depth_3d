@@ -175,6 +175,11 @@ def create_parser():
         help="Quest horizontal screen arc in degrees (0-120; 0=flat)",
     )
     parser.add_argument("--port", type=int, default=1303, help="HTTP listen port")
+    parser.add_argument(
+        "--quest-ambient", action="store_true", help="Enable video-edge ambient light around the Quest screen"
+    )
+    parser.add_argument("--quest-ambient-brightness", type=float, default=0.25, help="Ambient brightness (0-1)")
+    parser.add_argument("--quest-ambient-spread", type=float, default=2.0, help="Ambient coverage multiplier (1.2-4)")
     parser.add_argument("--bind-addr", type=str, default=local_address, help="HTTP listen address")
     parser.add_argument("--user", type=str, help="HTTP Basic Authentication username")
     parser.add_argument("--password", type=str, help="HTTP Basic Authentication password")
@@ -246,7 +251,12 @@ def prepare_quest_args(args: Namespace) -> None:
         return
     from .quest_settings import validate_patch
 
-    validate_patch({"quest_screen_curvature": args.quest_screen_curvature})
+    validate_patch(
+        {
+            key: getattr(args, key)
+            for key in ("quest_screen_curvature", "quest_ambient", "quest_ambient_brightness", "quest_ambient_spread")
+        }
+    )
     args.method = {"row_flow": "row_flow_v3", "row_flow_sym": "row_flow_v3_sym"}.get(args.method, args.method)
     if isinstance(args.edge_dilation, list) and len(args.edge_dilation) == 1:
         args.edge_dilation = args.edge_dilation[0]
@@ -509,6 +519,9 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 audio_gain=args.quest_audio_gain,
                 controller_factory=(lambda: QuestController(backend)) if args.quest_control else None,
                 screen_curvature=args.quest_screen_curvature,
+                ambient_enabled=args.quest_ambient,
+                ambient_brightness=args.quest_ambient_brightness,
+                ambient_spread=args.quest_ambient_spread,
             )
         elif not args.local_viewer:
             # Web Streaming
@@ -592,17 +605,22 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
         prev_divergence = args.divergence
 
         while True:
-            if session is not None:
-                frame = session.read_frame(screenshot_thread)
+            frame = session.read_frame(screenshot_thread) if session is not None else screenshot_thread.get_frame()
+            if frame is None:
+                break
+            tick = time.perf_counter()
+            with args.state["args_lock"]:
+                ambient_enabled = args.quest and args.quest_ambient
+            if ambient_enabled:
+                # 合成前单目RGB[3,H,W]；ROI使用已消费帧坐标，提色不持设置锁。
+                content_rect = (
+                    screenshot_thread.get_content_rect() if hasattr(screenshot_thread, "get_content_rect") else None
+                )
+                server.set_ambient_frame(frame, content_rect=content_rect)
             with args.state["args_lock"]:
                 if args.quest:
                     server.check_error()
                     server.set_audio_gain(args.quest_audio_gain)
-                tick = time.perf_counter()
-                if session is None:
-                    frame = screenshot_thread.get_frame()
-                if frame is None:
-                    break
                 if prev_divergence != args.divergence:
                     if args.method in {"mlbw_l2", "mlbw_l4", "mlbw_l2s", "mlbw_l4s"}:
                         side_model = try_switch_mlbw_model(prev_divergence, args.divergence, side_model, args)

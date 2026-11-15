@@ -184,6 +184,10 @@ class QuestSession:
                 self.server.set_audio_gain(args.quest_audio_gain)
             if self.server is not None and "quest_screen_curvature" in patch:
                 self.server.set_screen_curvature(args.quest_screen_curvature)
+            if self.server is not None and any(key.startswith("quest_ambient") for key in patch):
+                self.server.configure_ambient(
+                    args.quest_ambient, args.quest_ambient_brightness, args.quest_ambient_spread
+                )
         self.publish(args, patch)
 
     def media_ready(self) -> None:
@@ -207,6 +211,11 @@ class QuestSession:
         self.server.configure_video(settings["width"], settings["height"], settings["fps"], settings["bitrate"])
         self.server.configure_audio(settings["audio"], settings["audio_source"], settings["audio_gain"])
         self.server.set_screen_curvature(settings.get("screen_curvature", 0.0))
+        self.server.configure_ambient(
+            settings.get("ambient_enabled", False),
+            settings.get("ambient_brightness", 0.25),
+            settings.get("ambient_spread", 2.0),
+        )
         self.server.set_controller_factory(settings.get("controller_factory"))
         return self.server
 
@@ -227,6 +236,9 @@ class QuestSession:
             args.quest_bitrate,
             audio=False,
             screen_curvature=getattr(args, "quest_screen_curvature", 0.0),
+            ambient_enabled=getattr(args, "quest_ambient", False),
+            ambient_brightness=getattr(args, "quest_ambient_brightness", 0.25),
+            ambient_spread=getattr(args, "quest_ambient_spread", 2.0),
         )
         self.server.set_menu(QuestMenu(self.snapshot, self.submit))
         self.server.start()

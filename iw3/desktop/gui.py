@@ -752,6 +752,21 @@ class MainFrame(wx.Frame):
             "0为平面；越大两侧越包围，建议30–60°。保持弧长和画面中心，不提高像素或AI立体强度；运行中即时生效。"
         )
         self.sld_quest_screen_curvature.Bind(wx.EVT_SLIDER, self.on_quest_screen_curvature)
+        self.chk_quest_ambient = wx.CheckBox(self.pnl_process, label="环境光背景 · 亮度100%", name="chk_quest_ambient")
+        self.chk_quest_ambient.SetMinSize(self.chk_quest_ambient.GetBestSize())
+        self.chk_quest_ambient.SetLabel("环境光背景 · 亮度25%")
+        self.sld_quest_ambient_brightness = wx.Slider(
+            self.pnl_process, value=25, minValue=0, maxValue=100, name="sld_quest_ambient_brightness"
+        )
+        self.sld_quest_ambient_brightness.SetToolTip("仅改变背景柔光，建议先25%；过亮可能分散注意或不适。")
+        self.lbl_quest_ambient_spread = wx.StaticText(self.pnl_process, label="环境光扩散 2.0×")
+        self.sld_quest_ambient_spread = wx.Slider(
+            self.pnl_process, value=200, minValue=120, maxValue=400, name="sld_quest_ambient_spread"
+        )
+        self.sld_quest_ambient_spread.SetToolTip("范围越大，前方柔光越广；跟随窗口和曲面，不是360房间。")
+        self.chk_quest_ambient.Bind(wx.EVT_CHECKBOX, self.on_quest_ambient)
+        self.sld_quest_ambient_brightness.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
+        self.sld_quest_ambient_spread.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
 
         layout = wx.GridBagSizer(vgap=5, hgap=4)
         layout.Add(self.btn_start, (0, 0), flag=wx.EXPAND)
@@ -763,6 +778,10 @@ class MainFrame(wx.Frame):
         layout.Add(self.lbl_quest_screen_help, (2, 0), (1, 4), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_screen_curvature, (3, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_screen_curvature, (3, 2), (1, 2), flag=wx.EXPAND)
+        layout.Add(self.chk_quest_ambient, (4, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.sld_quest_ambient_brightness, (4, 2), (1, 2), flag=wx.EXPAND)
+        layout.Add(self.lbl_quest_ambient_spread, (5, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.sld_quest_ambient_spread, (5, 2), (1, 2), flag=wx.EXPAND)
         self.pnl_process.SetSizer(layout)
 
         # language panel
@@ -972,6 +991,25 @@ class MainFrame(wx.Frame):
         session = getattr(self.args, "state", {}).get("quest_session")
         if session is not None:
             session.submit("set", {"quest_screen_curvature": value})
+
+    def on_quest_ambient(self, event):
+        brightness = self.sld_quest_ambient_brightness.GetValue()
+        spread = self.sld_quest_ambient_spread.GetValue() / 100
+        self.chk_quest_ambient.SetLabel(f"环境光背景 · 亮度{brightness}%")
+        self.lbl_quest_ambient_spread.SetLabel(f"环境光扩散 {spread:g}×")
+        if self._applying_settings or self.args is None or event is None:
+            return
+        session = getattr(self.args, "state", {}).get("quest_session")
+        if session is not None:
+            control = event.GetEventObject()
+            for key, widget, value in (
+                ("quest_ambient", self.chk_quest_ambient, self.chk_quest_ambient.GetValue()),
+                ("quest_ambient_brightness", self.sld_quest_ambient_brightness, brightness / 100),
+                ("quest_ambient_spread", self.sld_quest_ambient_spread, spread),
+            ):
+                if control is widget:
+                    session.submit("set", {key: value})
+                    break
 
     def update_args_adjustment(self, event):
         if self.args is None or self._applying_settings:
@@ -1254,6 +1292,9 @@ class MainFrame(wx.Frame):
                 quest_audio_gain=self.sld_quest_audio_gain.GetValue() / 100,
                 quest_control=self.chk_quest_control.GetValue(),
                 quest_screen_curvature=self.sld_quest_screen_curvature.GetValue(),
+                quest_ambient=self.chk_quest_ambient.GetValue(),
+                quest_ambient_brightness=self.sld_quest_ambient_brightness.GetValue() / 100,
+                quest_ambient_spread=self.sld_quest_ambient_spread.GetValue() / 100,
                 stream_fps=int(self.cbo_stream_fps.GetValue()),
                 stream_height=int(self.cbo_stream_height.GetValue()),
             )
@@ -1369,6 +1410,12 @@ class MainFrame(wx.Frame):
             if "quest_screen_curvature" in values:
                 self.sld_quest_screen_curvature.SetValue(round(values["quest_screen_curvature"]))
                 self.on_quest_screen_curvature(None)
+            if "quest_ambient" in values:
+                self.chk_quest_ambient.SetValue(values["quest_ambient"])
+            for key in ("quest_ambient_brightness", "quest_ambient_spread"):
+                if key in values:
+                    getattr(self, "sld_" + key).SetValue(round(values[key] * 100))
+            self.on_quest_ambient(None)
             for key in ("preserve_screen_border", "ema_normalize", "compile", "quest_control"):
                 if key in values:
                     getattr(self, "chk_" + key).SetValue(values[key])
@@ -1575,6 +1622,7 @@ class MainFrame(wx.Frame):
         persistent_manager_unregister_all(manager)
         self.on_quest_audio_gain(None)
         self.on_quest_screen_curvature(None)
+        self.on_quest_ambient(None)
 
     def on_click_divergence_warning(self, event):
         self.lbl_divergence_warning.Hide()
@@ -1738,6 +1786,10 @@ class MainFrame(wx.Frame):
             self.lbl_quest_screen_help,
             self.lbl_quest_screen_curvature,
             self.sld_quest_screen_curvature,
+            self.chk_quest_ambient,
+            self.sld_quest_ambient_brightness,
+            self.lbl_quest_ambient_spread,
+            self.sld_quest_ambient_spread,
         ]:
             control.Show(quest)
         for control in [

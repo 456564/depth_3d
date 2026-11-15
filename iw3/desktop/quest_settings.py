@@ -5,7 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-PAGES = ("画面与立体", "模型与性能", "串流与声音", "捕获与控制", "屏幕与状态")
+PAGES = ("画面与立体", "模型与性能", "串流与声音", "捕获与控制", "屏幕与状态", "环境光")
 COMMANDS = frozenset({"set", "apply", "restart_stream", "restart_app", "restore", "refresh_windows", "recenter"})
 
 
@@ -307,6 +307,36 @@ FIELDS = (
         10,
         True,
         "作用：将整块屏幕弯成水平圆柱面。0为平面，建议从30–60度开始。增大：两侧更向你包围；减小：更平。保持弧长、画面中心和高度，不增加视频清晰度或AI立体强度；需接收端支持圆柱层，否则保持平面。可随时设0恢复。",
+    ),
+    Field(
+        "quest_ambient",
+        "环境光背景",
+        PAGES[5],
+        "bool",
+        immediate=True,
+        help="作用：把当前捕获画面的四边颜色扩散到主屏周围，左右上下保持对应。开：前方柔光随视频变化；关：恢复黑色背景。网页白边、工具栏也会参与，建议视频全屏；不自动识别播放器，不增加AI立体强度。",
+    ),
+    Field(
+        "quest_ambient_brightness",
+        "环境光亮度",
+        PAGES[5],
+        "number",
+        0,
+        1,
+        0.05,
+        True,
+        "作用：调整周围柔光亮度，默认25%。增大：周围更亮、颜色更明显，也更易分散注意或不适；减小：更暗，0为无光。不会调亮主视频，Quest自身亮度仍独立。背景低清低频更新，新增传输开销需实际观察。",
+    ),
+    Field(
+        "quest_ambient_spread",
+        "环境光扩散范围",
+        PAGES[5],
+        "number",
+        1.2,
+        4,
+        0.2,
+        True,
+        "作用：控制围绕窗口的柔光覆盖范围，默认2倍。增大：前方覆盖更广；减小：更靠近窗口。跟随窗口移动、缩放和曲面，外围渐暗；最大圆柱弧度受限，不是360房间，也不覆盖整个头顶和身后。不改变视频像素。",
     ),
 )
 FIELD_MAP = {field.key: field for field in FIELDS}

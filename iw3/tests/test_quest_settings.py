@@ -43,6 +43,9 @@ def test_schema_covers_quest_fields_with_chinese_help() -> None:
         "pad_mode",
         "quest_control",
         "quest_screen_curvature",
+        "quest_ambient",
+        "quest_ambient_brightness",
+        "quest_ambient_spread",
     }
     assert all(field.label and len(field.help) >= 25 for field in fields)
     assert {field.page for field in fields} <= set(schema().PAGES)

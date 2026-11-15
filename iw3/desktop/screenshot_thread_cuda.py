@@ -61,6 +61,8 @@ class ScreenshotThreadWCCUDA(threading.Thread):
         self._frame_geometry: Any = None
         self._pending_mapping: dict[str, Any] | None = None
         self._pending_geometry: Any = None
+        self._content_rect: tuple[int, int, int, int] | None = None
+        self._pending_content_rect: tuple[int, int, int, int] | None = None
         self._ready_event: torch.cuda.Event | None = None
         self._pinned_pid = None
         self.frame_set_event = threading.Event()
@@ -104,6 +106,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                 if geometry != self._frame_geometry:
                     self.frame_mapping = None
             mapping = None
+            content_rect = (0, 0, self.frame_width, self.frame_height)
             with torch.inference_mode():
                 # 原生输入 uint8[H,W,4] BGRA，输出 float32[3,canvas_H,canvas_W] RGB，范围 [0,1]。
                 source_frame = frame.frame_buffer[..., [2, 1, 0]].permute(2, 0, 1)
@@ -133,6 +136,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                         left, top = (self.frame_width - width) // 2, (self.frame_height - height) // 2
                         resized = resize_frame(source_frame, size=(height, width))
                         dest_frame[:, top : top + height, left : left + width] = resized
+                        content_rect = (left, top, left + width, top + height)
                         if self.fit_window and geometry is not None and geometry == self._get_geometry():
                             if self.window_handle is not None:
                                 pid, window_rect, capture_rect = geometry
@@ -175,6 +179,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                 self.frame = dest_frame
                 self._pending_mapping = mapping
                 self._pending_geometry = geometry
+                self._pending_content_rect = content_rect
                 self._ready_event = ready_event
                 self.frame_set_event.set()
 
@@ -207,6 +212,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                     self.frame = None
                     self.frame_mapping = self._pending_mapping = None
                     self._frame_geometry = self._pending_geometry = None
+                    self._content_rect = self._pending_content_rect = None
                     self._ready_event = None
                 self.frame_set_event.set()
                 time.sleep(0.1)
@@ -226,8 +232,10 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                 frame.record_stream(consumer_stream)
             self.frame_mapping = self._pending_mapping
             self._frame_geometry = self._pending_geometry
+            self._content_rect = self._pending_content_rect
             self.frame = None
             self._pending_mapping = self._pending_geometry = self._ready_event = None
+            self._pending_content_rect = None
             self.frame_set_event.clear()
 
         if frame is None:
@@ -251,6 +259,10 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                 return None
             return dict(self.frame_mapping)
 
+    def get_content_rect(self) -> tuple[int, int, int, int] | None:
+        with self.frame_lock:
+            return None if self.stop_event.is_set() else self._content_rect
+
     def get_fps(self):
         with self.fps_lock:
             if self.fps_counter:
@@ -261,6 +273,8 @@ class ScreenshotThreadWCCUDA(threading.Thread):
 
     def stop(self) -> None:
         self.stop_event.set()
+        with self.frame_lock:
+            self._content_rect = self._pending_content_rect = None
         deadline = time.monotonic() + 4
         while self.is_alive():
             capture = self._capture

@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from .quest_ambient import AmbientBackground
 from .quest_audio import QuestAudio
 from .quest_encoder import QuestEncoder
 from .quest_input import QuestController, _rotate
@@ -42,6 +43,9 @@ class QuestServer:
         audio_source: str = "speaker",
         audio_gain: float = 1.0,
         screen_curvature: float = 0.0,
+        ambient_enabled: bool = False,
+        ambient_brightness: float = 0.25,
+        ambient_spread: float = 2.0,
     ) -> None:
         address = ipaddress.IPv4Address(host)
         private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
@@ -57,6 +61,7 @@ class QuestServer:
             raise ValueError("Quest ports must be between 0 and 65535")
         if type(screen_curvature) not in (int, float) or not 0 <= screen_curvature <= 120:
             raise ValueError("Quest screen curvature must be a finite number between 0 and 120 degrees")
+        self._validate_ambient(ambient_enabled, ambient_brightness, ambient_spread)
         self.host, self.port, self.discovery_port = host, port, discovery_port
         self.width, self.height, self.fps, self.bitrate = width, height, fps, bitrate
         self.audio = audio
@@ -64,6 +69,13 @@ class QuestServer:
         self.audio_gain = audio_gain
         self._screen_curvature = float(screen_curvature)
         self._cylinder_supported: bool | None = None
+        self._ambient_enabled = ambient_enabled
+        self._ambient_brightness = float(ambient_brightness)
+        self._ambient_spread = float(ambient_spread)
+        self._ambient_background: AmbientBackground | None = None
+        self._ambient_generation = 0
+        self._ambient_pending: tuple[bytes, int] | None = None
+        self._ambient_visible = False
         self._controller_factory = controller_factory
         self._controller: QuestController | None = None
         self._condition = threading.Condition()
@@ -89,7 +101,7 @@ class QuestServer:
         self._last_input: float | None = None
         self._recenter_requested = threading.Event()
         self._sent_layers: dict[str, Any] = self._layers()
-        self._sent_quad = {key: self._sent_layers["camadas"][0][key].copy() for key in ("pos", "rot", "tam")}
+        self._sent_quad = {key: self._main_video(self._sent_layers)[key].copy() for key in ("pos", "rot", "tam")}
         self._threads: list[threading.Thread] = []
         self._sent: deque[float] = deque(maxlen=120)
         self._error: Exception | None = None
@@ -166,6 +178,8 @@ class QuestServer:
                     request.done.set()
             self._condition.notify_all()
         with self._layer_lock:
+            with self._condition:
+                self._reset_ambient()
             self._cylinder_supported = None
             self._reset_input()
         self._close(connection)
@@ -223,14 +237,23 @@ class QuestServer:
             with self._condition:
                 if self._shutdown.is_set():
                     raise RuntimeError("Quest服务尚未启动")
+                remove_ambient = video and self._ambient_visible
                 if video:
                     self._generation += 1
                     self._pending = None
                     self._video_enabled = False
                     self._video_request = request
+                    self._reset_ambient()
                 else:
                     self._audio_request = request
+                connection = self._connection
                 self._condition.notify_all()
+            if remove_ambient and connection is not None:
+                with self._layer_lock:
+                    try:
+                        self._send_layers(connection)
+                    except OSError:
+                        self._disconnect(connection)
             # 不持condition等待：owner必须取得同一锁来完成命令。
             if not request.done.wait(5):
                 with self._condition:
@@ -262,6 +285,68 @@ class QuestServer:
         self._request_media(True, None)
         self.configure_audio(False, self.audio_source, self.audio_gain)
 
+    @staticmethod
+    def _validate_ambient(enabled: bool, brightness: float, spread: float) -> None:
+        if type(enabled) is not bool:
+            raise ValueError("Quest ambient enabled must be a boolean")
+        if type(brightness) not in (int, float) or not 0 <= brightness <= 1:
+            raise ValueError("Quest ambient brightness must be a finite number between 0 and 1")
+        if type(spread) not in (int, float) or not 1.2 <= spread <= 4:
+            raise ValueError("Quest ambient spread must be a finite number between 1.2 and 4")
+
+    def _reset_ambient(self) -> None:
+        # 只丢弃历史；持server锁时不构造含Torch运算的生成器。
+        self._ambient_background = None
+        self._ambient_generation += 1
+        self._ambient_pending = None
+        self._ambient_visible = False
+
+    def configure_ambient(self, enabled: bool, brightness: float, spread: float) -> None:
+        self._validate_ambient(enabled, brightness, spread)
+        with self._layer_lock:
+            with self._condition:
+                if (enabled, brightness, spread) == (
+                    self._ambient_enabled,
+                    self._ambient_brightness,
+                    self._ambient_spread,
+                ):
+                    return
+                self._ambient_enabled = enabled
+                self._ambient_brightness = float(brightness)
+                self._ambient_spread = float(spread)
+                self._reset_ambient()
+                connection = self._connection
+                self._condition.notify_all()
+            if connection is not None:
+                try:
+                    self._send_layers(connection)
+                except OSError:
+                    self._disconnect(connection)
+
+    def set_ambient_frame(self, frame: torch.Tensor, content_rect: tuple[int, int, int, int] | None = None) -> None:
+        with self._condition:
+            if (
+                self._shutdown.is_set()
+                or not self._video_enabled
+                or not self._ambient_enabled
+                or self._connection is None
+            ):
+                return
+            generation = self._ambient_generation
+            background = self._ambient_background
+            brightness = self._ambient_brightness
+        # 实测RGB float CHW[3,H,W]→压缩RGBA[90,160,4]；提色与压缩由媒体owner在锁外完成。
+        if background is None:
+            background = AmbientBackground()
+        payload = background.update(frame, brightness, content_rect)
+        if payload is None:
+            return
+        with self._condition:
+            if generation == self._ambient_generation and self._video_enabled and not self._shutdown.is_set():
+                self._ambient_background = background
+                self._ambient_pending = payload, generation
+                self._condition.notify_all()
+
     def set_menu(self, menu: Any) -> None:
         with self._layer_lock:
             if self._menu is not None:
@@ -277,7 +362,7 @@ class QuestServer:
     def actual_cylinder(self) -> bool:
         # 这是已发送的配置，协议没有头显渲染成功的ACK。
         with self._layer_lock:
-            return self._cylinder_supported is True and self._sent_layers["camadas"][0]["tipo"] == "cilindro"
+            return self._cylinder_supported is True and self._main_video(self._sent_layers)["tipo"] == "cilindro"
 
     def set_screen_curvature(self, degrees: float) -> None:
         if type(degrees) not in (int, float) or not 0 <= degrees <= 120:
@@ -374,6 +459,8 @@ class QuestServer:
                         except Exception as error:
                             release_error = error
                     self._connection = None
+                    self._pending = None
+                    self._reset_ambient()
                     if release_error is not None:
                         self._shutdown.set()
                     self._condition.notify_all()
@@ -401,6 +488,10 @@ class QuestServer:
     def _send_json(self, connection: socket.socket, kind: int, payload: dict[str, Any]) -> None:
         self._send(connection, kind, json.dumps(payload, separators=(",", ":")).encode())
 
+    @staticmethod
+    def _main_video(layers: dict[str, Any]) -> dict[str, Any]:
+        return next(layer for layer in layers["camadas"] if layer.get("tex") == "video" and layer.get("olho") == "esq")
+
     def _layers(
         self, pose: tuple[list[float], list[float]] | None = None, size: list[float] | None = None
     ) -> dict[str, Any]:
@@ -422,7 +513,7 @@ class QuestServer:
                 "angulo": angle,
                 "aspecto": size[0] / size[1],
             }
-        return {
+        layers: dict[str, Any] = {
             "camadas": [
                 {
                     **geometry,
@@ -434,6 +525,38 @@ class QuestServer:
                 for index, eye in enumerate(("esq", "dir"))
             ]
         }
+        if self._ambient_visible:
+            ambient_position = [a + b for a, b in zip(position, _rotate(rotation, [0.0, 0.0, -0.05]))]
+            ambient: dict[str, Any] = {
+                "tipo": "quad",
+                "pos": ambient_position,
+                "rot": list(rotation),
+                "tam": [value * self._ambient_spread for value in size],
+            }
+            if self._cylinder_supported is True:
+                base_angle = max(angle, math.pi / 2)
+                radius = size[0] / base_angle
+                ambient_angle = min(math.radians(170), base_angle * self._ambient_spread)
+                offset = _rotate(rotation, [0.0, 0.0, radius])
+                ambient = {
+                    "tipo": "cilindro",
+                    "pos": [a + b for a, b in zip(ambient_position, offset)],
+                    "rot": list(rotation),
+                    "raio": radius,
+                    "angulo": ambient_angle,
+                    "aspecto": radius * ambient_angle / (size[1] * self._ambient_spread),
+                }
+            layers["camadas"].insert(
+                0,
+                {
+                    **ambient,
+                    "tex": AmbientBackground.TEXTURE_ID,
+                    "olho": "ambos",
+                    "alpha": True,
+                    "rect": [0, 0, AmbientBackground.WIDTH, AmbientBackground.HEIGHT],
+                },
+            )
+        return layers
 
     def _reset_input(self) -> None:
         with self._layer_lock:
@@ -463,6 +586,29 @@ class QuestServer:
             connection, 0x01, {"largura": self.width, "altura": self.height, "fps": self.fps, "codec": "hevc"}
         )
 
+    def _send_ambient(self, connection: socket.socket) -> None:
+        with self._layer_lock:
+            with self._condition:
+                pending = self._ambient_pending
+                if (
+                    pending is None
+                    or pending[1] != self._ambient_generation
+                    or connection is not self._connection
+                    or not self._video_enabled
+                    or not self._ambient_enabled
+                    or self._shutdown.is_set()
+                ):
+                    return
+                self._ambient_pending = None
+            self._send(connection, 0x10, pending[0])
+            with self._condition:
+                if pending[1] != self._ambient_generation or not self._video_enabled:
+                    return
+                first = not self._ambient_visible
+                self._ambient_visible = True
+            if first:
+                self._send_layers(connection)
+
     def _accept_loop(self, listener: socket.socket) -> None:
         try:
             while not self._shutdown.is_set():
@@ -482,7 +628,9 @@ class QuestServer:
                         self._reset_input()
                         self._cylinder_supported = None
                         self._video_config(connection)
-                        self._send_layers(connection, self._layers()["camadas"][0])
+                        with self._condition:
+                            self._reset_ambient()
+                        self._send_layers(connection, self._main_video(self._layers()))
                         if self._source is not None:
                             self._send_json(connection, 0x03, {"taxa": self._source.sample_rate, "canais": 2})
                     except OSError:
@@ -674,7 +822,7 @@ class QuestServer:
                             self._control(connection, "reset")
                             screen.reset()
                         else:
-                            suppress_pc = screen.update(data, self._sent_layers["camadas"][0])
+                            suppress_pc = screen.update(data, self._main_video(self._sent_layers))
                         quad = screen.quad
                         layers = self._layers((quad["pos"], quad["rot"]), quad["tam"])
                         if self._menu is not None:
@@ -693,7 +841,7 @@ class QuestServer:
                         if suppress_pc:
                             self._control(connection, "reset")
                         else:
-                            self._control(connection, "update", data, self._sent_layers["camadas"][0])
+                            self._control(connection, "update", data, self._main_video(self._sent_layers))
         except (OSError, ValueError):
             pass
         except Exception as error:
@@ -790,13 +938,22 @@ class QuestServer:
                     if packets:
                         with self._condition:
                             self._sent.append(time.monotonic())
+                    self._send_ambient(connection)
                 except OSError:
                     self._disconnect(connection)
             except Exception as error:
                 encoder = None
-                with self._condition:
-                    self._video_enabled = False
-                    self._pending = None
+                with self._layer_lock:
+                    with self._condition:
+                        remove_ambient = self._ambient_visible
+                        self._video_enabled = False
+                        self._pending = None
+                        self._reset_ambient()
+                    if remove_ambient:
+                        try:
+                            self._send_layers(connection)
+                        except OSError:
+                            self._disconnect(connection)
                 self._media_failed(error)
             finally:
                 del frame, ready, pending

@@ -410,7 +410,7 @@ class QuestMenu:
             return "关" if value else "开"
         if type(value) is bool:
             return "开" if value else "关"
-        if key == "quest_audio_gain":
+        if key in {"quest_audio_gain", "quest_ambient_brightness"}:
             return f"{value * 100:g}%"
         if type(value) is float:
             return f"{value:g}"
@@ -425,8 +425,9 @@ class QuestMenu:
         self._text(draw, (32, 25), "iw3 · Quest 完整设置", 1200, 42)
         self._text(draw, (1190, 40), "B / Y 关闭", 315)
         for index, page in enumerate(PAGES):
-            x = 32 + index * 296
-            self._button(draw, (x, 100, x + 284, 158), page, "page", index, active=index == self._page)
+            tab_width = (self.WIDTH - 64) // len(PAGES)
+            x = 32 + index * tab_width
+            self._button(draw, (x, 100, x + tab_width - 12, 158), page, "page", index, active=index == self._page)
         status = {"loading": "正在加载", "running": "正在串流", "error": "失败 / 可重试", "ready": "已准备"}.get(
             self._state.get("status", ""), self._state.get("status", "")
         )

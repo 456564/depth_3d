@@ -556,6 +556,8 @@ def capture_process(
         if not frame_event.is_set():
             with frame_lock:
                 source_frame = frame.frame_buffer
+                buffer_height, buffer_width = frame_buffer.shape[:2]
+                content_rect = (0, 0, buffer_width, buffer_height)
                 geometry = None
                 if fit_window:
                     if monitor_target is not None:
@@ -604,6 +606,7 @@ def capture_process(
                                 )
                             )
                             frame_buffer[top : top + fitted_height, left : left + fitted_width] = resized
+                            content_rect = (left, top, left + fitted_width, top + fitted_height)
                             # 像素与映射同锁发布；尺寸变化中间帧不能沿用旧点击坐标。
                             unchanged = (
                                 _monitor_geometry(monitor_target["monitor_index"]) == monitor_target
@@ -641,6 +644,7 @@ def capture_process(
                         if frame_count % 30 == 0:
                             frame_buffer[:] = 0.0
                         frame_buffer[0:min_h, 0:min_w, :] = source_frame[0:min_h, 0:min_w, :]
+                        content_rect = (0, 0, min_w, min_h)
                         frame_count += 1
                         if frame_count > 0xFFFF:
                             frame_count = 0
@@ -650,6 +654,9 @@ def capture_process(
                         )
                 else:
                     frame_buffer[:] = source_frame
+
+                if frame_mapping is not None:
+                    frame_mapping[16:22] = [*content_rect, buffer_width, buffer_height]
 
                 if hasattr(capture_control, "frame_pos"):
                     frame_pos[0] = capture_control.frame_pos[0] + (crop_top if crop_applied else 0)
@@ -720,6 +727,8 @@ class ScreenshotProcess(threading.Thread):
         self.draw_cursor_enabled = draw_cursor_enabled
         self.frame = None
         self.frame_mapping: dict[str, Any] | None = None
+        self._content_rect: tuple[int, int, int, int] | None = None
+        self._pending_content_rect: tuple[int, int, int, int] | None = None
         self.process: Any = None
         self.process_frame_buffer: Any = None
         self.process_stop_event: Any = None
@@ -804,6 +813,7 @@ class ScreenshotProcess(threading.Thread):
                     )
                     frame = frame.copy()
                     mapping = _decode_frame_mapping(self.process_frame_mapping, self.monitor_target)
+                    left, top, right, bottom, buffer_width, buffer_height = self.process_frame_mapping[16:22]
 
                 frame = torch.from_numpy(frame)
                 if frame_buffer is None:
@@ -860,9 +870,21 @@ class ScreenshotProcess(threading.Thread):
                             antialias=True,
                         )
 
+                content_rect = None
+                if 0 <= left < right <= buffer_width and 0 <= top < bottom <= buffer_height:
+                    # 原始 BGRA[1440,2560,4] → RGB[3,1080,1920]；ROI 必须同步缩放到最终帧。
+                    content_rect = (
+                        round(left * frame.shape[2] / buffer_width),
+                        round(top * frame.shape[1] / buffer_height),
+                        round(right * frame.shape[2] / buffer_width),
+                        round(bottom * frame.shape[1] / buffer_height),
+                    )
+                    if content_rect[0] >= content_rect[2] or content_rect[1] >= content_rect[3]:
+                        content_rect = None
                 with self.frame_lock:
                     self.frame = frame
                     self.frame_mapping = mapping
+                    self._pending_content_rect = content_rect
                     self.frame_set_event.set()
 
                 process_time = time.perf_counter() - tick
@@ -874,6 +896,7 @@ class ScreenshotProcess(threading.Thread):
         finally:
             with self.frame_lock:
                 self.frame_mapping = None
+                self._content_rect = self._pending_content_rect = None
             self.stop_event.set()
             self.frame_set_event.set()
             try:
@@ -904,6 +927,8 @@ class ScreenshotProcess(threading.Thread):
             if self.cuda_stream is not None:
                 torch.cuda.current_stream().wait_stream(self.cuda_stream)
             frame = self.frame
+            self._content_rect = self._pending_content_rect
+            self._pending_content_rect = None
             self.frame_set_event.clear()
 
         return frame
@@ -928,7 +953,13 @@ class ScreenshotProcess(threading.Thread):
                         return None
             return dict(self.frame_mapping) if self.frame_mapping is not None else None
 
+    def get_content_rect(self) -> tuple[int, int, int, int] | None:
+        with self.frame_lock:
+            return None if self.stop_event.is_set() else self._content_rect
+
     def stop(self):
         self.stop_event.set()
+        with self.frame_lock:
+            self._content_rect = self._pending_content_rect = None
         if self.ident is not None:
             self.join(timeout=4)
