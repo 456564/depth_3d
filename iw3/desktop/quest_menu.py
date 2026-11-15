@@ -398,6 +398,10 @@ class QuestMenu:
 
     @staticmethod
     def _value(key: str, value: Any) -> str:
+        if key == "window_name" and not value:
+            return "整个桌面（所选显示器）"
+        if key == "quest_screen_curvature":
+            return "平面（0°）" if value == 0 else f"曲面 {value:g}°"
         if key == "edge_dilation":
             return f"横 {value} / 纵跟随" if type(value) is int else f"横 {value[0]} / 纵 {value[1]}"
         if value is None:
@@ -516,7 +520,7 @@ class QuestMenu:
                 self._render_status(draw)
         selected = FIELD_MAP[self._selected]
         title, help_text = selected.label + " · 调节说明", selected.help
-        if self._page == 4 and self._picker is None:
+        if self._page == 4 and self._picker is None and selected.page != PAGES[4]:
             title = "屏幕与状态 · 操作说明"
             help_text = (
                 "菜单打开时暂停抓屏和网页输入。B / Y关闭后，先松开两手扳机与握柄、摇杆回中，再恢复控制。"
@@ -545,7 +549,6 @@ class QuestMenu:
         lines = [
             "握柄抓住画面并移动：平移屏幕；同手摇杆：上下调远近、左右调大小。",
             "调整屏幕位置只改变观看大小，不增加源像素，也不是AI会聚。",
-            "电脑端完成首帧和编码后才报告已应用；头显是否正常出画仍以实际观察为准。",
         ]
         for key, label in (
             ("depth_model", "当前模型"),
@@ -555,10 +558,11 @@ class QuestMenu:
             ("screenshot_fps", "捕获 FPS"),
             ("streaming_fps", "电脑发送 FPS"),
             ("bind_addr", "当前连接地址"),
+            ("screen_surface", "当前屏幕形状"),
         ):
             if key in values:
                 lines.append(f"{label}：{values[key]}")
-        self._wrap(draw, "\n".join(lines), 40, 330, 1450, 26, lines=11)
+        self._wrap(draw, "\n".join(lines), 40, 418, 1450, 26, lines=10)
         self._button(draw, (40, 796, 450, 858), "屏幕居中（重新定位）", "command", "recenter")
 
     def texture(self) -> bytes | None:

@@ -1,6 +1,7 @@
 import ctypes
 import importlib
 import sys
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -124,7 +125,7 @@ def frame_mapping(api: WindowsAPI, **changes: Any) -> dict[str, Any]:
     }
 
 
-def mapped_backend(mapping: list[dict[str, Any] | None], screenshot: str = "wc_mp") -> Any:
+def mapped_backend(mapping: Sequence[dict[str, Any] | None], screenshot: str = "wc_mp") -> Any:
     module = importlib.import_module("iw3.desktop.quest_windows")
     return module.WindowsInput("Source Browser", screenshot, (0, 0, 0, 0), frame_mapping=lambda: mapping[0])
 
@@ -136,13 +137,13 @@ def test_mapping_waits_for_a_captured_frame_and_exposes_pinned_hwnd(api: Windows
     assert not api.points
 
 
-@pytest.mark.parametrize("screenshot", ["wc_mp", "mss"])
+@pytest.mark.parametrize("screenshot", ["wc_mp", "mss", "wc_cuda"])
 def test_fullscreen_mapping_follows_same_hwnd_then_windowed_again(api: WindowsAPI, screenshot: str) -> None:
     mapping: list[dict[str, Any] | None] = [None]
     control = mapped_backend(mapping, screenshot)
     api.window_rect = api.dwm_rect = (0, 0, 2560, 1440)
     mapping[0] = frame_mapping(
-        api, backend="windows_capture" if screenshot == "wc_mp" else "mss", content_rect=(0, 42, 420, 278)
+        api, backend="windows_capture" if screenshot == "wc_mp" else screenshot, content_rect=(0, 42, 420, 278)
     )
     assert control.move(0.5, 0.5)
     assert api.points[-1] == (1280, 720)
@@ -150,7 +151,7 @@ def test_fullscreen_mapping_follows_same_hwnd_then_windowed_again(api: WindowsAP
     assert api.points[-1] == (640, 720)
     api.window_rect = api.dwm_rect = (100, 100, 520, 420)
     assert not control.move(0.5, 0.5)
-    mapping[0] = frame_mapping(api, backend="windows_capture" if screenshot == "wc_mp" else "mss")
+    mapping[0] = frame_mapping(api, backend="windows_capture" if screenshot == "wc_mp" else screenshot)
     assert control.move(0.5, 0.5)
     assert api.points[-1] == (310, 260)
 
@@ -244,6 +245,127 @@ def test_mapping_change_after_move_still_allows_owned_button_cleanup(api: Window
     assert not control.move(0.5, 0.5)
     control.mouse_up()
     assert api.batches == [[(0, 2, 0)], [(0, 4, 0)]]
+
+
+def test_cuda_mapping_uses_dwm_origin_and_rejects_other_backend_metadata(api: WindowsAPI) -> None:
+    mapping = [frame_mapping(api, backend="wc_cuda", buffer_size=(402, 311), content_rect=(0, 0, 402, 311))]
+    control = mapped_backend(mapping, "wc_cuda")
+    assert control.move(0, 0) and api.points[-1] == (109, 100)
+    assert control.move(1, 1) and api.points[-1] == (510, 410)
+    mapping[0]["backend"] = "windows_capture"
+    assert not control.move(0.5, 0.5) and not control.mouse_down()
+
+
+@pytest.fixture
+def monitor_control(api: WindowsAPI, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from iw3.desktop import screenshot_process
+
+    target = {
+        "monitor_index": 1,
+        "monitor_handle": 31,
+        "monitor_device": "DISPLAY_TEST",
+        "monitor_rect": (-1920, -100, 0, 980),
+    }
+    current = [dict(target)]
+    monkeypatch.setattr(
+        screenshot_process, "_monitor_geometry", lambda index: current[0] if index == 1 else None, raising=False
+    )
+    mapping = [
+        {
+            "target": "monitor",
+            **target,
+            "backend": "wc_cuda",
+            "capture_rect": target["monitor_rect"],
+            "crops": (0, 0, 0, 0),
+            "content_rect": (0, 0, 960, 540),
+            "buffer_size": (960, 540),
+        }
+    ]
+    module = importlib.import_module("iw3.desktop.quest_windows")
+    control = module.WindowsInput(None, "wc_cuda", (0, 0, 0, 0), frame_mapping=lambda: mapping[0], monitor_index=1)
+    return SimpleNamespace(control=control, mapping=mapping, target=target, current=current)
+
+
+def test_monitor_control_maps_negative_origin_and_can_click_new_windows(api: WindowsAPI, monitor_control: Any) -> None:
+    state = monitor_control
+    assert state.control.hwnd is None and state.control.monitor_target == state.target
+    copied = state.control.monitor_target
+    copied["monitor_handle"] = 99
+    assert state.control.monitor_target == state.target
+    api.foreground, api.point_root = 9, 12
+    assert state.control.move(0, 0) and api.points[-1] == (-1920, -100)
+    assert state.control.mouse_down()
+    state.control.mouse_up()
+    assert state.control.move(1, 1) and api.points[-1] == (-1, 979)
+    assert all(-1920 <= x < 0 and -100 <= y < 980 for x, y in api.points)
+
+
+def test_monitor_keys_require_pointed_window_to_be_foreground(api: WindowsAPI, monitor_control: Any) -> None:
+    control = monitor_control.control
+    assert control.move(0.5, 0.5)
+    api.foreground, api.point_root = 9, 12
+    assert not control.tap_key("down") and not api.batches
+    api.foreground = 12
+    assert control.tap_key("down")
+    assert api.batches == [[(1, 0, 0x28), (1, 2, 0x28)]]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("monitor_handle", 32),
+        ("monitor_device", "OTHER_DISPLAY"),
+        ("monitor_index", 0),
+        ("monitor_rect", (-1920, 0, 0, 1080)),
+    ],
+)
+def test_monitor_topology_change_blocks_input_and_keeps_owned_release(
+    api: WindowsAPI, monitor_control: Any, field: str, value: Any
+) -> None:
+    state = monitor_control
+    assert state.control.move(0.5, 0.5) and state.control.mouse_down()
+    state.current[0] = {**state.current[0], field: value}
+    assert not state.control.move(0.5, 0.5) and not state.control.tap_key("down")
+    state.control.mouse_up()
+    assert api.batches == [[(0, 2, 0)], [(0, 4, 0)]]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"target": "window"},
+        {"monitor_handle": 32},
+        {"monitor_device": "OTHER_DISPLAY"},
+        {"backend": "windows_capture"},
+        {"capture_rect": (0, 0, 1920, 1080)},
+        {"crops": (0, 1, 0, 0)},
+        {"content_rect": (0, 0, 961, 540)},
+    ],
+)
+def test_monitor_mapping_cannot_change_capture_identity_or_bounds(
+    api: WindowsAPI, monitor_control: Any, changes: dict[str, Any]
+) -> None:
+    state = monitor_control
+    state.mapping[0] = {**state.mapping[0], **changes}
+    assert not state.control.move(0.5, 0.5)
+    assert not api.points and not api.batches
+
+
+def test_monitor_mapping_black_bars_and_stale_frames_are_not_clickable(api: WindowsAPI, monitor_control: Any) -> None:
+    state = monitor_control
+    state.mapping[0]["content_rect"] = (0, 100, 960, 440)
+    assert not state.control.move(0.5, 0)
+    assert state.control.move(0.5, 0.5)
+    state.mapping[0] = None
+    assert not state.control.mouse_down() and not state.control.tap_key("down")
+    assert not api.batches
+
+
+@pytest.mark.parametrize("crops,mapping", [((0, 0, 0, 0), None), ((1, 0, 0, 0), lambda: {})])
+def test_monitor_control_requires_uncropped_frame_mapping(api: WindowsAPI, crops: Any, mapping: Any) -> None:
+    module = importlib.import_module("iw3.desktop.quest_windows")
+    with pytest.raises(ValueError):
+        module.WindowsInput(None, "wc_cuda", crops, frame_mapping=mapping)
 
 
 def test_capture_metadata_drives_real_backend_inverse_mapping(monkeypatch: pytest.MonkeyPatch) -> None:

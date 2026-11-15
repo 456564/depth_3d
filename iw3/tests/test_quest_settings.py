@@ -42,6 +42,7 @@ def test_schema_covers_quest_fields_with_chinese_help() -> None:
         "autocrop",
         "pad_mode",
         "quest_control",
+        "quest_screen_curvature",
     }
     assert all(field.label and len(field.help) >= 25 for field in fields)
     assert {field.page for field in fields} <= set(schema().PAGES)
@@ -101,9 +102,9 @@ def test_dynamic_choices_validate_models_gpu_and_monitor() -> None:
 @pytest.mark.parametrize(
     "patch,current",
     [
-        ({"quest_control": True}, {"screenshot": "wc_cuda", "window_name": "Browser", "pad_mode": None}),
+        ({"quest_control": True}, {"screenshot": "pil", "window_name": "Browser", "pad_mode": None}),
         ({"pad_mode": "16:9"}, {"quest_control": True, "screenshot": "mss", "window_name": "Browser"}),
-        ({"window_name": None}, {"quest_control": True, "screenshot": "wc_mp"}),
+        ({"window_name": None}, {"quest_control": True, "screenshot": "wc_mp", "crop_top": 1}),
         ({"resolution": 512}, {"depth_model": "DepthPro"}),
         ({"method": "forward_fill"}, {"preserve_screen_border": True}),
     ],
@@ -125,6 +126,13 @@ def test_related_edits_can_be_validated_atomically() -> None:
         "refresh_windows",
         "recenter",
     }
+
+
+@pytest.mark.parametrize("capture", ["wc_mp", "mss", "wc_cuda"])
+@pytest.mark.parametrize("window_name", [None, "", "Browser"])
+def test_control_supports_window_or_uncropped_monitor(capture: str, window_name: str | None) -> None:
+    patch = {"quest_control": True, "screenshot": capture, "window_name": window_name, "pad_mode": None}
+    assert schema().validate_patch(patch) == patch
 
 
 def test_native_cli_padding_default_can_be_restored() -> None:

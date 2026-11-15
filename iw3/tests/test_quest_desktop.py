@@ -100,7 +100,7 @@ def test_quest_selects_full_sbs_without_changing_web_defaults() -> None:
     assert args.quest_bitrate == 40 and not args.quest_no_audio
 
 
-@pytest.mark.parametrize("capture", ["wc_mp", "mss"])
+@pytest.mark.parametrize("capture", ["wc_mp", "mss", "wc_cuda"])
 def test_quest_control_accepts_explicit_windows_capture_target(monkeypatch, capture: str) -> None:
     monkeypatch.setattr(desktop.sys, "platform", "win32")
     args = desktop.create_parser().parse_args(
@@ -110,14 +110,30 @@ def test_quest_control_accepts_explicit_windows_capture_target(monkeypatch, capt
     assert args.quest_control and args.full_sbs
 
 
+@pytest.mark.parametrize("capture", ["wc_mp", "mss", "wc_cuda"])
+@pytest.mark.parametrize("window_name", [None, "", "   "])
+def test_quest_control_accepts_uncropped_monitor_target(monkeypatch, capture, window_name):
+    monkeypatch.setattr(desktop.sys, "platform", "win32")
+    args = desktop.create_parser().parse_args(["--quest", "--quest-control", "--screenshot", capture])
+    args.window_name = window_name
+    desktop.prepare_quest_args(args)
+    assert args.window_name is None
+
+
+def test_quest_monitor_control_rejects_silently_ignored_crops(monkeypatch):
+    monkeypatch.setattr(desktop.sys, "platform", "win32")
+    args = desktop.create_parser().parse_args(
+        ["--quest", "--quest-control", "--screenshot", "wc_cuda", "--crop-left", "3"]
+    )
+    with pytest.raises(ValueError, match="crop"):
+        desktop.prepare_quest_args(args)
+
+
 @pytest.mark.parametrize(
     "changes",
     [
         {"quest": False},
-        {"window_name": None},
-        {"window_name": "   "},
         {"screenshot": "pil"},
-        {"screenshot": "wc_cuda"},
         {"screenshot": "obs"},
         {"screenshot": "kwcapture"},
         {"pad": 0.1},
@@ -229,8 +245,8 @@ def test_gui_switches_native_web_and_local_without_changing_saved_web_settings(m
         monkeypatch.setattr(gui, "set_state_args", lambda args, **kwargs: desktop.prepare_quest_args(args))
         monkeypatch.setattr(gui.wx, "MessageBox", lambda message, *args: errors.append(message))
         frame.cbo_window_name.SetValue("")
-        assert frame.parse_args() is None
-        assert "window name" in errors[0]
+        assert frame.parse_args().window_name is None
+        assert not errors
         frame.cbo_window_name.SetValue("Browser")
         frame.cbo_view_mode.SetValue("Web Streaming")
         frame.update_view_mode()
@@ -256,11 +272,20 @@ def test_gui_switches_native_web_and_local_without_changing_saved_web_settings(m
 
 
 @pytest.mark.parametrize(
-    "control,binding_fails,capture_kind",
-    [(False, False, "pil"), (True, False, "mss"), (True, False, "wc_mp"), (True, True, "mss")],
+    "control,binding_fails,capture_kind,monitor",
+    [
+        (False, False, "pil", False),
+        (True, False, "mss", False),
+        (True, False, "wc_mp", False),
+        (True, False, "wc_cuda", False),
+        (True, True, "mss", False),
+        (True, False, "mss", True),
+        (True, False, "wc_mp", True),
+        (True, False, "wc_cuda", True),
+    ],
 )
 def test_failed_startup_or_stop_still_cleans_capture_and_depth(
-    monkeypatch, control: bool, binding_fails: bool, capture_kind: str
+    monkeypatch, control: bool, binding_fails: bool, capture_kind: str, monitor: bool
 ) -> None:
     import torch
 
@@ -271,14 +296,23 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
     controllers = []
     mapping_getters = []
     captures = []
+    monitor_target = {
+        "monitor_index": 0,
+        "monitor_handle": 31,
+        "monitor_device": "DISPLAY_TEST",
+        "monitor_rect": (0, 0, 64, 64),
+    }
+    captured_mapping = {"target": "monitor"} if monitor else {"hwnd": 7}
 
     class InputBackend:
-        def __init__(self, window_name, screenshot, crops, frame_mapping=None):
+        def __init__(self, window_name, screenshot, crops, frame_mapping=None, monitor_index=0):
             assert control
             assert callable(frame_mapping)
             assert frame_mapping() is None
+            assert monitor_index == 0
             mapping_getters.append(frame_mapping)
-            self.hwnd = 7
+            self.hwnd = None if monitor else 7
+            self.monitor_target = dict(monitor_target) if monitor else None
             bound.append((window_name, screenshot, crops))
             if binding_fails:
                 raise ValueError("simulated input binding failure")
@@ -308,13 +342,15 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
         def start(self):
             self.started = True
             if control:
-                assert self.kwargs["window_handle"] == 7 and self.kwargs["fit_window"] is True
-                assert mapping_getters[0]() == {"hwnd": 7}
+                assert self.kwargs["window_handle"] == (None if monitor else 7)
+                assert self.kwargs["monitor_target"] == (monitor_target if monitor else None)
+                assert self.kwargs["fit_window"] is True
+                assert mapping_getters[0]() == captured_mapping
             else:
                 assert "window_handle" not in self.kwargs and "fit_window" not in self.kwargs
 
         def get_frame_mapping(self):
-            return {"hwnd": 7} if self.started else None
+            return captured_mapping if self.started else None
 
         def get_frame(self):
             return None
@@ -345,9 +381,10 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
     args = desktop.create_parser().parse_args(["--quest", "--bind-addr", "127.0.0.1"])
     if control:
         args.quest_control = True
-        args.window_name = "Browser"
+        args.window_name = None if monitor else "Browser"
         args.screenshot = capture_kind
-        args.crop_top, args.crop_left, args.crop_right, args.crop_bottom = 1, 2, 3, 4
+        if not monitor:
+            args.crop_top, args.crop_left, args.crop_right, args.crop_bottom = 1, 2, 3, 4
     desktop.prepare_quest_args(args)
     args.state = dict(
         depth_model=Depth(), convergence_model=None, args_lock=threading.Lock(), stop_event=None, fps_event=None
@@ -355,6 +392,7 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
     monkeypatch.setattr(desktop, "create_device", lambda args: torch.device("cpu"))
     monkeypatch.setattr(desktop, "ScreenshotThreadPIL", Capture)
     monkeypatch.setattr(desktop, "ScreenshotProcess", Capture)
+    monkeypatch.setattr(desktop, "ScreenshotThreadWCCUDA", Capture)
     monkeypatch.setattr(desktop, "get_monitor_size_list", lambda: [(64, 64)])
     monkeypatch.setattr(desktop, "get_window_rect_by_title", lambda title: {"width": 64, "height": 64})
     monkeypatch.setattr(desktop, "test_output_size", lambda *args: (64, 128))
@@ -367,7 +405,8 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
     with pytest.raises(error, match=message):
         desktop._iw3_desktop_main_once(args, init_wxapp=False)
     assert cleaned == (["clear", "reset"] if binding_fails else ["capture", "clear", "reset"])
-    assert bound == ([("Browser", capture_kind, (1, 2, 3, 4))] if control else [])
+    expected_binding = (None, capture_kind, (0, 0, 0, 0)) if monitor else ("Browser", capture_kind, (1, 2, 3, 4))
+    assert bound == ([expected_binding] if control else [])
     assert len(controllers) == int(control and not binding_fails)
     assert len(captures) == int(not binding_fails)
     if mapping_getters:

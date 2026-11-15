@@ -6,6 +6,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from . import screenshot_process as capture_source
+
 
 def resize_frame(frame, size):
     # CHW uint8 - > CHW float
@@ -32,6 +34,9 @@ class ScreenshotThreadWCCUDA(threading.Thread):
         crop_left=0,
         crop_right=0,
         crop_bottom=0,
+        window_handle=None,
+        fit_window=False,
+        monitor_target=None,
         **_ignore_unsupported_kwargs,
     ):
         super().__init__(daemon=True)
@@ -39,6 +44,11 @@ class ScreenshotThreadWCCUDA(threading.Thread):
         self.frame_height = frame_height
         self.monitor_index = monitor_index
         self.window_name = window_name
+        self.window_handle = window_handle
+        self.fit_window = fit_window
+        self.monitor_target = dict(monitor_target) if monitor_target is not None else None
+        if fit_window and window_handle is None and monitor_target is None:
+            raise ValueError("Fitted capture requires a fixed window or monitor")
         self.crop_top = crop_top
         self.crop_bottom = crop_bottom
         self.crop_left = crop_left
@@ -47,6 +57,12 @@ class ScreenshotThreadWCCUDA(threading.Thread):
         self.frame_lock = threading.Lock()
         self.fps_lock = threading.Lock()
         self.frame = None
+        self.frame_mapping: dict[str, Any] | None = None
+        self._frame_geometry: Any = None
+        self._pending_mapping: dict[str, Any] | None = None
+        self._pending_geometry: Any = None
+        self._ready_event: torch.cuda.Event | None = None
+        self._pinned_pid = None
         self.frame_set_event = threading.Event()
         self.stop_event = threading.Event()
         self.fps_counter = deque(maxlen=120)
@@ -56,7 +72,7 @@ class ScreenshotThreadWCCUDA(threading.Thread):
     def run(self):
         from wc_cuda import WindowsCapture
 
-        if self.window_name:
+        if self.window_name or self.window_handle is not None:
             # ignore
             monitor_index = None
         else:
@@ -67,18 +83,37 @@ class ScreenshotThreadWCCUDA(threading.Thread):
             cursor_capture=None,
             draw_border=None,
             monitor_index=monitor_index,
-            window_name=self.window_name,
+            # native 优先匹配标题；固定 HWND 时必须清空标题。
+            window_name=None if self.window_handle is not None else self.window_name,
+            window_hwnd=self.window_handle,
             device_id=self.device.index,
         )
         self._capture = capture
+        if self.fit_window and self.window_handle is not None:
+            geometry = self._get_geometry()
+            if geometry is not None:
+                self._pinned_pid = geometry[0]
 
         @capture.event
         def on_frame_arrived(frame, capture_control):
-            # NOTE: wc_cuda already ensures that `frame` uses dedicated memory and is not reused.
+            if self.stop_event.is_set():
+                capture_control.stop()
+                return
+            geometry = self._get_geometry() if self.fit_window else None
+            with self.frame_lock:
+                if geometry != self._frame_geometry:
+                    self.frame_mapping = None
+            mapping = None
             with torch.inference_mode():
-                # BGRA HWC -> RGB CHW
+                # 原生输入 uint8[H,W,4] BGRA，输出 float32[3,canvas_H,canvas_W] RGB，范围 [0,1]。
                 source_frame = frame.frame_buffer[..., [2, 1, 0]].permute(2, 0, 1)
-                if self.window_name and (
+                window_capture = self.window_name or self.window_handle is not None
+                crops = (
+                    (self.crop_top, self.crop_left, self.crop_right, self.crop_bottom)
+                    if window_capture
+                    else (0, 0, 0, 0)
+                )
+                if window_capture and (
                     self.crop_top > 0 or self.crop_left > 0 or self.crop_right > 0 or self.crop_bottom > 0
                 ):
                     h, w = source_frame.shape[-2:]
@@ -88,21 +123,59 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                     right = w - self.crop_right if self.crop_right > 0 else w
                     source_frame = source_frame[:, top:bottom, left:right]
 
-                if source_frame.shape != (3, self.frame_height, self.frame_width):
-                    if self.window_name is not None:
-                        min_h = min(self.frame_height, source_frame.shape[1])
-                        min_w = min(self.frame_width, source_frame.shape[2])
-                        dest_frame = torch.zeros(
-                            (3, self.frame_height, self.frame_width), dtype=torch.float32, device=self.device
-                        )
-                        dest_frame[:, 0:min_h, 0:min_w].copy_(source_frame[:, 0:min_h, 0:min_w]).div_(255.0)
-                    else:
-                        dest_frame = resize_frame(source_frame, size=(self.frame_height, self.frame_width))
+                source_height, source_width = source_frame.shape[-2:]
+                if window_capture or self.fit_window:
+                    dest_frame = source_frame.new_zeros((3, self.frame_height, self.frame_width), dtype=torch.float32)
+                    if source_width > 0 and source_height > 0:
+                        scale = min(self.frame_width / source_width, self.frame_height / source_height)
+                        width = max(1, min(self.frame_width, round(source_width * scale)))
+                        height = max(1, min(self.frame_height, round(source_height * scale)))
+                        left, top = (self.frame_width - width) // 2, (self.frame_height - height) // 2
+                        resized = resize_frame(source_frame, size=(height, width))
+                        dest_frame[:, top : top + height, left : left + width] = resized
+                        if self.fit_window and geometry is not None and geometry == self._get_geometry():
+                            if self.window_handle is not None:
+                                pid, window_rect, capture_rect = geometry
+                                if pid == self._pinned_pid:
+                                    mapping = {
+                                        "hwnd": self.window_handle,
+                                        "pid": pid,
+                                        "window_rect": window_rect,
+                                        "capture_rect": capture_rect,
+                                    }
+                            elif geometry == self.monitor_target:
+                                mapping = {"target": "monitor", **geometry, "capture_rect": geometry["monitor_rect"]}
+                            if mapping is not None:
+                                cl, ct, cr, cb = mapping["capture_rect"]
+                                if frame.frame_buffer.shape[:2] != (cb - ct, cr - cl):
+                                    mapping = None
+                                else:
+                                    mapping.update(
+                                        backend="wc_cuda",
+                                        crops=crops,
+                                        content_rect=(left, top, left + width, top + height),
+                                        buffer_size=(self.frame_width, self.frame_height),
+                                    )
+                elif source_frame.shape != (3, self.frame_height, self.frame_width):
+                    dest_frame = resize_frame(source_frame, size=(self.frame_height, self.frame_width))
                 else:
                     dest_frame = source_frame / 255.0
+                ready_event = None
+                if dest_frame.is_cuda:
+                    producer_stream = torch.cuda.current_stream(dest_frame.device)
+                    frame.frame_buffer.record_stream(producer_stream)
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(producer_stream)
 
             with self.frame_lock:
+                if self.stop_event.is_set():
+                    return
+                if mapping is None or geometry != self._frame_geometry:
+                    self.frame_mapping = None
                 self.frame = dest_frame
+                self._pending_mapping = mapping
+                self._pending_geometry = geometry
+                self._ready_event = ready_event
                 self.frame_set_event.set()
 
             now = time.perf_counter()
@@ -117,7 +190,8 @@ class ScreenshotThreadWCCUDA(threading.Thread):
 
         @capture.event
         def on_closed():
-            pass
+            with self.frame_lock:
+                self.frame_mapping = None
 
         try:
             # event loop
@@ -128,6 +202,12 @@ class ScreenshotThreadWCCUDA(threading.Thread):
                 capture.stop()
             finally:
                 self._capture = None
+                self.stop_event.set()
+                with self.frame_lock:
+                    self.frame = None
+                    self.frame_mapping = self._pending_mapping = None
+                    self._frame_geometry = self._pending_geometry = None
+                    self._ready_event = None
                 self.frame_set_event.set()
                 time.sleep(0.1)
 
@@ -136,14 +216,40 @@ class ScreenshotThreadWCCUDA(threading.Thread):
             if not self.is_alive():
                 raise RuntimeError("thread is already dead")
         with self.frame_lock:
+            if self.stop_event.is_set():
+                raise RuntimeError("thread is dead")
             frame = self.frame
+            if frame is not None and frame.is_cuda:
+                consumer_stream = torch.cuda.current_stream(frame.device)
+                if self._ready_event is not None:
+                    consumer_stream.wait_event(self._ready_event)
+                frame.record_stream(consumer_stream)
+            self.frame_mapping = self._pending_mapping
+            self._frame_geometry = self._pending_geometry
             self.frame = None
+            self._pending_mapping = self._pending_geometry = self._ready_event = None
             self.frame_set_event.clear()
 
         if frame is None:
             raise RuntimeError("thread is dead")
 
         return frame
+
+    def _get_geometry(self):
+        if self.window_handle is not None:
+            return capture_source._window_geometry(self.window_handle, "windows_capture")
+        if self.monitor_target is not None:
+            return capture_source._monitor_geometry(self.monitor_index)
+        return None
+
+    def get_frame_mapping(self) -> dict[str, Any] | None:
+        with self.frame_lock:
+            if self.stop_event.is_set() or self.frame_mapping is None:
+                return None
+            if self._get_geometry() != self._frame_geometry:
+                self.frame_mapping = None
+                return None
+            return dict(self.frame_mapping)
 
     def get_fps(self):
         with self.fps_lock:

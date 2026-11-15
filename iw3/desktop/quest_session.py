@@ -182,6 +182,8 @@ class QuestSession:
                 estimator.reset()
             if self.server is not None and "quest_audio_gain" in patch:
                 self.server.set_audio_gain(args.quest_audio_gain)
+            if self.server is not None and "quest_screen_curvature" in patch:
+                self.server.set_screen_curvature(args.quest_screen_curvature)
         self.publish(args, patch)
 
     def media_ready(self) -> None:
@@ -204,6 +206,7 @@ class QuestSession:
         self.server.pause_media()
         self.server.configure_video(settings["width"], settings["height"], settings["fps"], settings["bitrate"])
         self.server.configure_audio(settings["audio"], settings["audio_source"], settings["audio_gain"])
+        self.server.set_screen_curvature(settings.get("screen_curvature", 0.0))
         self.server.set_controller_factory(settings.get("controller_factory"))
         return self.server
 
@@ -216,7 +219,15 @@ class QuestSession:
 
         args = self.args
         address = args.bind_addr or utils.get_local_address()
-        self.server = QuestServer(address, 3840, 1080, args.stream_fps, args.quest_bitrate, audio=False)
+        self.server = QuestServer(
+            address,
+            3840,
+            1080,
+            args.stream_fps,
+            args.quest_bitrate,
+            audio=False,
+            screen_curvature=getattr(args, "quest_screen_curvature", 0.0),
+        )
         self.server.set_menu(QuestMenu(self.snapshot, self.submit))
         self.server.start()
         restart_app = False

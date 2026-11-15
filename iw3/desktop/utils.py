@@ -165,7 +165,15 @@ def create_parser():
     parser.add_argument("--quest-no-audio", action="store_true", help="Disable PC speaker audio in Quest mode")
     parser.add_argument("--quest-audio-source", choices=["process", "speaker"], default="process")
     parser.add_argument("--quest-audio-gain", type=float, default=1.0, help="Quest-only audio gain (0-4)")
-    parser.add_argument("--quest-control", action="store_true", help="Control the captured Windows window with Quest")
+    parser.add_argument(
+        "--quest-control", action="store_true", help="Control the captured Windows window or monitor with Quest"
+    )
+    parser.add_argument(
+        "--quest-screen-curvature",
+        type=float,
+        default=0.0,
+        help="Quest horizontal screen arc in degrees (0-120; 0=flat)",
+    )
     parser.add_argument("--port", type=int, default=1303, help="HTTP listen port")
     parser.add_argument("--bind-addr", type=str, default=local_address, help="HTTP listen address")
     parser.add_argument("--user", type=str, help="HTTP Basic Authentication username")
@@ -221,8 +229,11 @@ def prepare_quest_args(args: Namespace) -> None:
     if args.quest_control:
         if not args.quest or sys.platform != "win32":
             raise ValueError("Quest PC control requires Quest mode and Windows")
-        if not args.window_name or not args.window_name.strip() or args.screenshot not in {"wc_mp", "mss"}:
-            raise ValueError("Quest PC control requires a window name and wc_mp or mss capture")
+        args.window_name = args.window_name if args.window_name and args.window_name.strip() else None
+        if args.screenshot not in {"wc_mp", "mss", "wc_cuda"}:
+            raise ValueError("Quest PC control requires wc_mp, mss or wc_cuda capture")
+        if args.window_name is None and any((args.crop_top, args.crop_left, args.crop_right, args.crop_bottom)):
+            raise ValueError("Quest PC control of a monitor requires zero crop values")
         if (
             args.pad is not None
             or args.pad_mode not in {None, "tblr"}
@@ -233,6 +244,9 @@ def prepare_quest_args(args: Namespace) -> None:
             raise ValueError("Quest PC control requires no padding, IPD offset or rotation")
     if not args.quest:
         return
+    from .quest_settings import validate_patch
+
+    validate_patch({"quest_screen_curvature": args.quest_screen_curvature})
     args.method = {"row_flow": "row_flow_v3", "row_flow_sym": "row_flow_v3_sym"}.get(args.method, args.method)
     if isinstance(args.edge_dilation, list) and len(args.edge_dilation) == 1:
         args.edge_dilation = args.edge_dilation[0]
@@ -481,6 +495,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     frame_mapping=lambda: (
                         screenshot_thread.get_frame_mapping() if screenshot_thread is not None else None
                     ),
+                    monitor_index=args.monitor_index,
                 )
             server_factory = session.configure if session is not None else QuestServer
             server = server_factory(
@@ -493,6 +508,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 audio_source=args.quest_audio_source,
                 audio_gain=args.quest_audio_gain,
                 controller_factory=(lambda: QuestController(backend)) if args.quest_control else None,
+                screen_curvature=args.quest_screen_curvature,
             )
         elif not args.local_viewer:
             # Web Streaming
@@ -539,7 +555,11 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 crop_right=args.crop_right,
                 crop_bottom=args.crop_bottom,
                 draw_cursor_enabled=not args.disable_draw_cursor,
-                **({"window_handle": backend.hwnd, "fit_window": True} if args.quest_control else {}),
+                **(
+                    {"window_handle": backend.hwnd, "monitor_target": backend.monitor_target, "fit_window": True}
+                    if args.quest_control
+                    else {}
+                ),
             )
 
         if args.compile:
@@ -619,6 +639,9 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                             estimated_fps=estimated_fps,
                             screenshot_fps=screenshot_thread.get_fps(),
                             streaming_fps=server.get_fps(),
+                            screen_surface="曲面配置已发送"
+                            if server.actual_cylinder
+                            else "平面配置（曲面须接收端支持）",
                         )
                     if args.state["fps_event"] is not None:
                         args.state["fps_event"].update(

@@ -79,6 +79,7 @@ HAS_OBS = is_obs_supported()
 HAS_KWCAPTURE = is_kwcapture_supported()
 # Backends that can capture one monitor or one window (the others grab the whole screen)
 BACKENDS_WITH_TARGET = {"wc_mp", "wc_cuda", "mss", "kwcapture"}
+DESKTOP_TARGET = "整个桌面（所选显示器）"
 BACKENDS_WITH_CROP = BACKENDS_WITH_TARGET | {"obs"}
 
 
@@ -469,8 +470,9 @@ class MainFrame(wx.Frame):
         self.chk_quest_control = wx.CheckBox(self.grp_network, label="手柄控制电脑", name="chk_quest_control")
         self.chk_quest_control.SetValue(False)
         self.chk_quest_control.SetToolTip(
-            "右手指向浏览器画面；扳机左键点击/拖动；摇杆上下拨动一次切一个抖音视频，回中后可再切。"
-            "仅支持 Windows 的 wc_mp/mss 和指定窗口；调屏时暂停电脑操作，松开握柄后先松扳机、摇杆回中。"
+            "右手指向；扳机左键点击/拖动；摇杆上下拨动一次切一个抖音视频，回中后可再切。"
+            "支持Windows的wc_mp/mss/wc_cuda。捕获窗口选整个桌面时控制所选显示器，四边裁剪须为0；"
+            "切视频须指向该屏幕的前台窗口。调屏时暂停电脑操作，松开握柄后先松扳机、摇杆回中。"
         )
         self.sep_network1 = wx.StaticLine(self.grp_network, style=wx.LI_HORIZONTAL)
 
@@ -580,9 +582,10 @@ class MainFrame(wx.Frame):
 
         self.lbl_window_name = wx.StaticText(self.grp_processor, label=T("Window Name"))
         self.cbo_window_name = EditableComboBox(
-            self.grp_processor, size=self.FromDIP((200, -1)), choices=[""], name="cbo_window_name"
+            self.grp_processor, size=self.FromDIP((200, -1)), choices=[DESKTOP_TARGET], name="cbo_window_name"
         )
         self.cbo_window_name.SetSelection(0)
+        self.cbo_window_name.SetToolTip("选择整个桌面后，用上方显示器编号选择屏幕；指定窗口时忽略显示器编号。")
         self.btn_reload_window_name = GenBitmapButton(self.grp_processor, bitmap=load_icon("view-refresh.png"))
         self.btn_reload_window_name.SetToolTip(T("Reload"))
 
@@ -741,6 +744,14 @@ class MainFrame(wx.Frame):
             "松开恢复网页操作；Quest居中恢复屏幕位置和大小。",
         )
         self.lbl_quest_screen_help.SetToolTip("调屏无需勾选手柄控制电脑；换手前先松开两手握柄键。")
+        self.lbl_quest_screen_curvature = wx.StaticText(self.pnl_process, label="屏幕曲度 0°（平面）")
+        self.sld_quest_screen_curvature = wx.Slider(
+            self.pnl_process, value=0, minValue=0, maxValue=120, name="sld_quest_screen_curvature"
+        )
+        self.sld_quest_screen_curvature.SetToolTip(
+            "0为平面；越大两侧越包围，建议30–60°。保持弧长和画面中心，不提高像素或AI立体强度；运行中即时生效。"
+        )
+        self.sld_quest_screen_curvature.Bind(wx.EVT_SLIDER, self.on_quest_screen_curvature)
 
         layout = wx.GridBagSizer(vgap=5, hgap=4)
         layout.Add(self.btn_start, (0, 0), flag=wx.EXPAND)
@@ -750,6 +761,8 @@ class MainFrame(wx.Frame):
         layout.Add(self.lbl_quest_audio_gain, (1, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_audio_gain, (1, 2), (1, 2), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_screen_help, (2, 0), (1, 4), flag=wx.EXPAND)
+        layout.Add(self.lbl_quest_screen_curvature, (3, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.sld_quest_screen_curvature, (3, 2), (1, 2), flag=wx.EXPAND)
         self.pnl_process.SetSizer(layout)
 
         # language panel
@@ -950,6 +963,15 @@ class MainFrame(wx.Frame):
                 return
             with self.args_lock:
                 self.args.quest_audio_gain = value / 100
+
+    def on_quest_screen_curvature(self, event):
+        value = self.sld_quest_screen_curvature.GetValue()
+        self.lbl_quest_screen_curvature.SetLabel(f"屏幕曲度 {value}°" + ("（平面）" if value == 0 else "（曲面）"))
+        if self._applying_settings or self.args is None:
+            return
+        session = getattr(self.args, "state", {}).get("quest_session")
+        if session is not None:
+            session.submit("set", {"quest_screen_curvature": value})
 
     def update_args_adjustment(self, event):
         if self.args is None or self._applying_settings:
@@ -1212,6 +1234,8 @@ class MainFrame(wx.Frame):
 
         monitor_index = int(self.cbo_monitor_index.GetValue() or 0)
         window_name = self.cbo_window_name.GetValue()
+        if window_name == DESKTOP_TARGET:
+            window_name = None
         if self.cbo_screenshot.GetValue() not in BACKENDS_WITH_TARGET:
             monitor_index = 0
             window_name = None
@@ -1229,6 +1253,7 @@ class MainFrame(wx.Frame):
                 quest_audio_source="process" if self.cbo_quest_audio_source.GetSelection() == 0 else "speaker",
                 quest_audio_gain=self.sld_quest_audio_gain.GetValue() / 100,
                 quest_control=self.chk_quest_control.GetValue(),
+                quest_screen_curvature=self.sld_quest_screen_curvature.GetValue(),
                 stream_fps=int(self.cbo_stream_fps.GetValue()),
                 stream_height=int(self.cbo_stream_height.GetValue()),
             )
@@ -1320,7 +1345,7 @@ class MainFrame(wx.Frame):
                 self.update_monitor_index()
                 window_name = values.get("window_name", self.cbo_window_name.GetValue())
                 self.update_window_names()
-                self.cbo_window_name.ChangeValue(window_name or "")
+                self.cbo_window_name.ChangeValue(window_name or DESKTOP_TARGET)
             text_controls = {
                 "divergence": "cbo_divergence",
                 "convergence": "cbo_convergence",
@@ -1334,12 +1359,16 @@ class MainFrame(wx.Frame):
                 "stream_fps": "cbo_stream_fps",
                 "quest_bitrate": "cbo_quest_bitrate",
                 "monitor_index": "cbo_monitor_index",
-                "window_name": "cbo_window_name",
                 "autocrop": "cbo_autocrop",
             }
             for key, name in text_controls.items():
                 if key in values:
                     getattr(self, name).ChangeValue(str(values[key]) if values[key] is not None else "")
+            if "window_name" in values:
+                self.cbo_window_name.ChangeValue(values["window_name"] or DESKTOP_TARGET)
+            if "quest_screen_curvature" in values:
+                self.sld_quest_screen_curvature.SetValue(round(values["quest_screen_curvature"]))
+                self.on_quest_screen_curvature(None)
             for key in ("preserve_screen_border", "ema_normalize", "compile", "quest_control"):
                 if key in values:
                     getattr(self, "chk_" + key).SetValue(values[key])
@@ -1545,6 +1574,7 @@ class MainFrame(wx.Frame):
         persistent_manager_restore_all(manager, exclude_names)
         persistent_manager_unregister_all(manager)
         self.on_quest_audio_gain(None)
+        self.on_quest_screen_curvature(None)
 
     def on_click_divergence_warning(self, event):
         self.lbl_divergence_warning.Hide()
@@ -1634,7 +1664,9 @@ class MainFrame(wx.Frame):
             self.lbl_window_name.Show()
             self.cbo_window_name.Show()
             self.btn_reload_window_name.Show()
-            self.cbo_window_name.SetItems([""] + enum_window_names())
+            value = self.cbo_window_name.GetValue()
+            self.cbo_window_name.SetItems([DESKTOP_TARGET] + enum_window_names())
+            self.cbo_window_name.ChangeValue(value or DESKTOP_TARGET)
         else:
             self.lbl_window_name.Hide()
             self.cbo_window_name.Hide()
@@ -1704,6 +1736,8 @@ class MainFrame(wx.Frame):
             self.lbl_quest_audio_gain,
             self.sld_quest_audio_gain,
             self.lbl_quest_screen_help,
+            self.lbl_quest_screen_curvature,
+            self.sld_quest_screen_curvature,
         ]:
             control.Show(quest)
         for control in [

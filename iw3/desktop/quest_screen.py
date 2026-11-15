@@ -52,7 +52,7 @@ class QuestScreen:
         self._last_time: float | None = None
         self._armed = False
 
-    def update(self, data: Any) -> bool:
+    def update(self, data: Any, geometry: dict[str, Any] | None = None) -> bool:
         # 0x83 dict → 两手 pos[3]/rot[4]/analogico[2] → quad pos[3]/rot[4]/tam[2]。
         hands = data.get("maos") if isinstance(data, dict) and data.get("estado") == "focado" else None
         if not isinstance(hands, dict) or any(
@@ -81,7 +81,10 @@ class QuestScreen:
         if self._hand is None:
             if armed:
                 for side in ("esq", "dir"):
-                    if hands[side]["aperto"] and ray_to_uv(hands[side], self.quad) is not None:
+                    if (
+                        hands[side]["aperto"]
+                        and ray_to_uv(hands[side], self.quad if geometry is None else geometry) is not None
+                    ):
                         self._hand = side
                         break
             if self._hand is None:

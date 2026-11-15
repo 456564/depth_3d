@@ -237,8 +237,8 @@ FIELDS = (
         "enum",
         help=(
             "wc_mp：Windows窗口捕获，独立进程处理，推荐网页控制。mss：截取屏幕区域，遮挡也会入画，可作兼容备用。"
-            "wc_cuda：GPU直取，减少CPU中转，不保证总帧率更高；窗口缩放有局限。pil：桌面基础备用，不支持指定窗口/显示器。"
-            "电脑控制仅支持wc_mp/mss。它们不是AI画质档，切换后确认窗口与裁剪。"
+            "wc_cuda：GPU直取，减少CPU中转，不保证总帧率更高。pil：桌面基础备用，不支持指定窗口/显示器。"
+            "电脑控制支持wc_mp/mss/wc_cuda，空窗口名控制所选整台显示器且需裁剪为0。它们不是AI画质档，切换后确认窗口与裁剪。"
         ),
         choices=("pil", "mss", "wc_mp", "wc_cuda", "kwcapture", "obs"),
     ),
@@ -258,7 +258,7 @@ FIELDS = (
         "捕获窗口",
         PAGES[3],
         "window",
-        help="作用：指定播放网页的窗口，减少把其他桌面内容传出。默认空通常捕获显示器。电脑控制要求唯一且前台的窗口；同名窗口须先处理。刷新只更新候选，不自动更换当前捕获源。",
+        help="作用：指定播放网页的窗口，减少把其他桌面内容传出。留空捕获所选整台显示器，手柄可点击该屏幕内窗口，需四边裁剪为0。指定窗口控制要求标题唯一且窗口在前台；同名窗口须先处理。刷新只更新候选，不自动更换当前捕获源。",
     ),
     *(
         Field(
@@ -295,7 +295,18 @@ FIELDS = (
         "手柄控制电脑",
         PAGES[3],
         "bool",
-        help="开：右手指向移动光标，扳机左键或拖动，摇杆上下切视频。需Windows、wc_mp或mss、唯一且前台的窗口、无额外补边。关：仍可握柄移动虚拟屏幕。菜单打开时电脑控制和抓屏暂停。",
+        help="开：右手指向移动光标，扳机左键或拖动，摇杆上下切视频。需Windows、wc_mp/mss/wc_cuda、无额外补边。指定窗口须唯一且前台；空窗口名控制所选整台显示器，裁剪须为0，切视频前须指向该屏幕的前台窗口。显示器布局变化后须重启串流。关：仍可握柄移动虚拟屏幕。菜单打开时电脑控制和抓屏暂停。",
+    ),
+    Field(
+        "quest_screen_curvature",
+        "屏幕曲度（度，0为平面）",
+        PAGES[4],
+        "number",
+        0,
+        120,
+        10,
+        True,
+        "作用：将整块屏幕弯成水平圆柱面。0为平面，建议从30–60度开始。增大：两侧更向你包围；减小：更平。保持弧长、画面中心和高度，不增加视频清晰度或AI立体强度；需接收端支持圆柱层，否则保持平面。可随时设0恢复。",
     ),
 )
 FIELD_MAP = {field.key: field for field in FIELDS}
@@ -353,13 +364,12 @@ def validate_patch(
         return copy.deepcopy(patch)
     merged = {**(current or {}), **patch}
     if merged.get("quest_control"):
-        if (
-            merged.get("screenshot") not in {"wc_mp", "mss"}
-            or not isinstance(merged.get("window_name"), str)
-            or not merged["window_name"].strip()
-            or merged.get("pad_mode") not in {None, "tblr"}
+        if merged.get("screenshot") not in {"wc_mp", "mss", "wc_cuda"} or merged.get("pad_mode") not in {None, "tblr"}:
+            raise ValueError("电脑控制要求 wc_mp/mss/wc_cuda 且关闭补边")
+        if not (merged.get("window_name") or "").strip() and any(
+            merged.get(key, 0) for key in ("crop_top", "crop_left", "crop_right", "crop_bottom")
         ):
-            raise ValueError("电脑控制要求 wc_mp/mss、指定窗口且关闭补边")
+            raise ValueError("整台显示器控制要求四边裁剪为0")
     if str(merged.get("depth_model", "")).startswith("DepthPro") and merged.get("resolution") is not None:
         raise ValueError("DepthPro 不支持自定义深度分辨率，请选择默认")
     if merged.get("method") == "forward_fill" and merged.get("preserve_screen_border"):

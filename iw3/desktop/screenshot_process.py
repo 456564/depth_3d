@@ -59,9 +59,50 @@ def _window_geometry(hwnd, backend):
         return None
 
 
-def _decode_frame_mapping(values):
+def _monitor_geometry(index):
+    import win32api
+
+    if type(index) is not int or index < 0:
+        return None
+    try:
+        monitors = win32api.EnumDisplayMonitors()
+        if index >= len(monitors):
+            return None
+        handle, _, rect = monitors[index]
+        info = win32api.GetMonitorInfo(handle)
+        if tuple(info["Monitor"]) != tuple(rect):
+            return None
+        return {
+            "monitor_index": index,
+            "monitor_handle": int(handle),
+            "monitor_device": info["Device"],
+            "monitor_rect": tuple(rect),
+        }
+    except Exception:
+        # 热插拔时枚举与查询可能跨越设备销毁，拒绝沿用旧坐标。
+        return None
+
+
+def _decode_frame_mapping(values, monitor_target=None):
     if not values[0]:
         return None
+    if values[3] in {3, 4}:
+        if (
+            monitor_target is None
+            or monitor_target["monitor_handle"] != values[1]
+            or monitor_target["monitor_index"] != values[2]
+            or monitor_target["monitor_rect"] != tuple(values[4:8])
+        ):
+            return None
+        return {
+            "target": "monitor",
+            **monitor_target,
+            "backend": "mss" if values[3] == 3 else "windows_capture",
+            "capture_rect": tuple(values[8:12]),
+            "crops": tuple(values[12:16]),
+            "content_rect": tuple(values[16:20]),
+            "buffer_size": tuple(values[20:22]),
+        }
     return {
         "hwnd": values[1],
         "pid": values[2],
@@ -131,10 +172,11 @@ class CaptureControlMSS:
 
 
 class WindowsCaptureMSS:
-    def __init__(self, monitor_index=0, window_name=None, window_handle=None):
+    def __init__(self, monitor_index=0, window_name=None, window_handle=None, monitor_target=None):
         self.window_name = window_name
         self.monitor_index = monitor_index
         self.window_handle = window_handle
+        self.monitor_target = monitor_target
 
     def event(self, handler):
         if handler.__name__ == "on_frame_arrived":
@@ -162,6 +204,14 @@ class WindowsCaptureMSS:
                 elif self.window_name is not None:
                     position = get_window_rect_by_title(self.window_name, sct=sct)
                     control.frame_pos = [position["top"], position["left"]]
+                elif self.monitor_target is not None:
+                    current = _monitor_geometry(self.monitor_index)
+                    if current != self.monitor_target:
+                        raise RuntimeError("显示器布局已变化，请重启串流")
+                    left, top, right, bottom = current["monitor_rect"]
+                    control.monitor_geometry = current
+                    position = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+                    control.frame_pos = [top, left]
                 else:
                     position = sct.monitors[self.monitor_index + 1]
                 shot = sct.grab(position)
@@ -442,24 +492,33 @@ def capture_process(
     window_handle=None,
     fit_window=False,
     frame_mapping=None,
+    monitor_target=None,
 ):
     frame_buffer = np.ndarray(frame_size, dtype=np.uint8, buffer=frame_shm.buf)
     frame_count = 0
     pinned_pid = None
     if fit_window:
-        if window_handle is None or frame_mapping is None:
+        if (window_handle is None and monitor_target is None) or frame_mapping is None:
             raise ValueError("Fitted window capture requires a fixed window and shared mapping")
         shcore = ctypes.WinDLL("shcore")
         shcore.SetProcessDpiAwareness.argtypes = (ctypes.c_int,)
         shcore.SetProcessDpiAwareness.restype = ctypes.c_int32
         shcore.SetProcessDpiAwareness(2)
-        geometry = _window_geometry(window_handle, backend)
-        if geometry is None:
-            raise RuntimeError("Capture window is no longer available")
-        pinned_pid = geometry[0]
+        if monitor_target is not None:
+            if window_handle is not None or window_name or any((crop_top, crop_left, crop_right, crop_bottom)):
+                raise ValueError("桌面控制要求显示器目标且不裁剪")
+            if _monitor_geometry(monitor_target["monitor_index"]) != monitor_target:
+                raise RuntimeError("显示器布局已变化，请重启串流")
+        else:
+            geometry = _window_geometry(window_handle, backend)
+            if geometry is None:
+                raise RuntimeError("Capture window is no longer available")
+            pinned_pid = geometry[0]
 
     if backend == "mss":
         options = {"window_handle": window_handle} if window_handle is not None else {}
+        if monitor_target is not None:
+            options["monitor_target"] = monitor_target
         capture = WindowsCaptureMSS(monitor_index=monitor_index, window_name=window_name, **options)
     elif backend == "windows_capture":
         try:
@@ -499,11 +558,18 @@ def capture_process(
                 source_frame = frame.frame_buffer
                 geometry = None
                 if fit_window:
-                    geometry = (
-                        getattr(capture_control, "frame_geometry", None)
-                        if backend == "mss"
-                        else _window_geometry(window_handle, backend)
-                    )
+                    if monitor_target is not None:
+                        current = _monitor_geometry(monitor_target["monitor_index"])
+                        before = getattr(capture_control, "monitor_geometry", current)
+                        if current == before == monitor_target:
+                            rect = current["monitor_rect"]
+                            geometry = (None, rect, rect)
+                    else:
+                        geometry = (
+                            getattr(capture_control, "frame_geometry", None)
+                            if backend == "mss"
+                            else _window_geometry(window_handle, backend)
+                        )
                 if fit_window:
                     frame_mapping[0] = 0
                 # Apply cropping for window capture
@@ -539,12 +605,19 @@ def capture_process(
                             )
                             frame_buffer[top : top + fitted_height, left : left + fitted_width] = resized
                             # 像素与映射同锁发布；尺寸变化中间帧不能沿用旧点击坐标。
-                            if _window_geometry(window_handle, backend) == geometry:
+                            unchanged = (
+                                _monitor_geometry(monitor_target["monitor_index"]) == monitor_target
+                                if monitor_target is not None
+                                else _window_geometry(window_handle, backend) == geometry
+                            )
+                            if unchanged:
                                 frame_mapping[:] = [
                                     1,
-                                    window_handle,
-                                    pinned_pid,
-                                    1 if backend == "mss" else 2,
+                                    monitor_target["monitor_handle"] if monitor_target is not None else window_handle,
+                                    monitor_target["monitor_index"] if monitor_target is not None else pinned_pid,
+                                    (3 if backend == "mss" else 4)
+                                    if monitor_target is not None
+                                    else (1 if backend == "mss" else 2),
                                     *window_rect,
                                     *capture_rect,
                                     crop_top,
@@ -628,6 +701,7 @@ class ScreenshotProcess(threading.Thread):
         draw_cursor_enabled=True,
         window_handle: int | None = None,
         fit_window: bool = False,
+        monitor_target: dict[str, Any] | None = None,
     ):
         super().__init__(daemon=True)
         self.backend = backend
@@ -637,6 +711,7 @@ class ScreenshotProcess(threading.Thread):
         self.window_name = window_name
         self.window_handle = window_handle
         self.fit_window = fit_window
+        self.monitor_target = dict(monitor_target) if monitor_target is not None else None
         self.device = device
         self.crop_top = crop_top
         self.crop_left = crop_left
@@ -659,7 +734,12 @@ class ScreenshotProcess(threading.Thread):
             self.cuda_stream = torch.cuda.Stream(device=device)
 
     def start_process(self):
-        if self.window_handle is not None:
+        if self.monitor_target is not None:
+            if _monitor_geometry(self.monitor_index) != self.monitor_target:
+                raise RuntimeError("显示器布局已变化，请重启串流")
+            left, top, right, bottom = self.monitor_target["monitor_rect"]
+            screen_size = right - left, bottom - top
+        elif self.window_handle is not None:
             geometry = _window_geometry(self.window_handle, self.backend)
             if geometry is None:
                 raise RuntimeError("Capture window is no longer available")
@@ -700,6 +780,7 @@ class ScreenshotProcess(threading.Thread):
                 self.window_handle,
                 self.fit_window,
                 self.process_frame_mapping,
+                self.monitor_target,
             ),
         )
         self.process.start()
@@ -722,7 +803,7 @@ class ScreenshotProcess(threading.Thread):
                         (self.screen_height, self.screen_width, 4), dtype=np.uint8, buffer=self.process_frame_buffer.buf
                     )
                     frame = frame.copy()
-                    mapping = _decode_frame_mapping(self.process_frame_mapping)
+                    mapping = _decode_frame_mapping(self.process_frame_mapping, self.monitor_target)
 
                 frame = torch.from_numpy(frame)
                 if frame_buffer is None:
@@ -837,11 +918,13 @@ class ScreenshotProcess(threading.Thread):
 
     def get_frame_mapping(self) -> dict[str, Any] | None:
         with self.frame_lock:
+            if self.monitor_target is not None and _monitor_geometry(self.monitor_index) != self.monitor_target:
+                return None
             if self.stop_event.is_set() or (self.process is not None and not self.process.is_alive()):
                 return None
             if self.process is not None:
                 with self.process_frame_lock:
-                    if _decode_frame_mapping(self.process_frame_mapping) != self.frame_mapping:
+                    if _decode_frame_mapping(self.process_frame_mapping, self.monitor_target) != self.frame_mapping:
                         return None
             return dict(self.frame_mapping) if self.frame_mapping is not None else None
 

@@ -15,7 +15,7 @@ import torch
 
 from .quest_audio import QuestAudio
 from .quest_encoder import QuestEncoder
-from .quest_input import QuestController
+from .quest_input import QuestController, _rotate
 from .quest_screen import QuestScreen
 
 
@@ -41,6 +41,7 @@ class QuestServer:
         controller_factory: Callable[[], QuestController] | None = None,
         audio_source: str = "speaker",
         audio_gain: float = 1.0,
+        screen_curvature: float = 0.0,
     ) -> None:
         address = ipaddress.IPv4Address(host)
         private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
@@ -54,11 +55,15 @@ class QuestServer:
             )
         if not 0 <= port <= 65535 or not 0 <= discovery_port <= 65535:
             raise ValueError("Quest ports must be between 0 and 65535")
+        if type(screen_curvature) not in (int, float) or not 0 <= screen_curvature <= 120:
+            raise ValueError("Quest screen curvature must be a finite number between 0 and 120 degrees")
         self.host, self.port, self.discovery_port = host, port, discovery_port
         self.width, self.height, self.fps, self.bitrate = width, height, fps, bitrate
         self.audio = audio
         self.audio_source = audio_source
         self.audio_gain = audio_gain
+        self._screen_curvature = float(screen_curvature)
+        self._cylinder_supported: bool | None = None
         self._controller_factory = controller_factory
         self._controller: QuestController | None = None
         self._condition = threading.Condition()
@@ -84,6 +89,7 @@ class QuestServer:
         self._last_input: float | None = None
         self._recenter_requested = threading.Event()
         self._sent_layers: dict[str, Any] = self._layers()
+        self._sent_quad = {key: self._sent_layers["camadas"][0][key].copy() for key in ("pos", "rot", "tam")}
         self._threads: list[threading.Thread] = []
         self._sent: deque[float] = deque(maxlen=120)
         self._error: Exception | None = None
@@ -159,7 +165,9 @@ class QuestServer:
                     request.error = RuntimeError("Quest媒体已停止")
                     request.done.set()
             self._condition.notify_all()
-        self._reset_input()
+        with self._layer_lock:
+            self._cylinder_supported = None
+            self._reset_input()
         self._close(connection)
         self._close(self._listener)
         self._close(self._discovery)
@@ -260,6 +268,35 @@ class QuestServer:
                 self._menu.reset()
             self._menu = menu
 
+    @property
+    def cylinder_supported(self) -> bool | None:
+        with self._layer_lock:
+            return self._cylinder_supported
+
+    @property
+    def actual_cylinder(self) -> bool:
+        # 这是已发送的配置，协议没有头显渲染成功的ACK。
+        with self._layer_lock:
+            return self._cylinder_supported is True and self._sent_layers["camadas"][0]["tipo"] == "cilindro"
+
+    def set_screen_curvature(self, degrees: float) -> None:
+        if type(degrees) not in (int, float) or not 0 <= degrees <= 120:
+            raise ValueError("Quest screen curvature must be a finite number between 0 and 120 degrees")
+        with self._layer_lock:
+            if degrees == self._screen_curvature:
+                return
+            self._screen_curvature = float(degrees)
+            with self._condition:
+                connection = self._connection
+            if connection is not None:
+                self._control(connection, "reset")
+                if self._screen is not None:
+                    self._screen.reset()
+                try:
+                    self._send_layers(connection)
+                except OSError:
+                    self._disconnect(connection)
+
     def set_controller_factory(self, factory: Callable[[], QuestController] | None) -> None:
         with self._layer_lock:
             with self._condition:
@@ -341,6 +378,7 @@ class QuestServer:
                         self._shutdown.set()
                     self._condition.notify_all()
             if disconnected:
+                self._cylinder_supported = None
                 self._reset_input()
         self._close(connection)
         if release_error is not None:
@@ -366,20 +404,32 @@ class QuestServer:
     def _layers(
         self, pose: tuple[list[float], list[float]] | None = None, size: list[float] | None = None
     ) -> dict[str, Any]:
-        position, rotation = pose if pose is not None else ([0, 0, -3], [0, 0, 0, 1])
+        position, rotation = pose if pose is not None else ([0.0, 0.0, -3.0], [0.0, 0.0, 0.0, 1.0])
         eye_width = self.width // 2
         size = size if size is not None else [3.6, 3.6 * self.height / eye_width]
+        # 实测中面dict(pos[3],rot[4],tam[2]) → 双眼camadas[2]；曲面只换几何，不改SBS rect[4]。
+        geometry: dict[str, Any] = {"tipo": "quad", "pos": list(position), "rot": list(rotation), "tam": list(size)}
+        angle = math.radians(self._screen_curvature)
+        # 原生层要求角度>0.001rad；未知/不支持能力时与射线一起保留平面。
+        if self._cylinder_supported is True and angle > 0.001:
+            radius = size[0] / angle
+            offset = _rotate(rotation, [0.0, 0.0, radius])
+            geometry = {
+                "tipo": "cilindro",
+                "pos": [a + b for a, b in zip(position, offset)],
+                "rot": list(rotation),
+                "raio": radius,
+                "angulo": angle,
+                "aspecto": size[0] / size[1],
+            }
         return {
             "camadas": [
                 {
-                    "tipo": "quad",
+                    **geometry,
                     "tex": "video",
                     "olho": eye,
                     "alpha": False,
                     "rect": [index * eye_width, 0, eye_width, self.height],
-                    "pos": list(position),
-                    "rot": list(rotation),
-                    "tam": list(size),
                 }
                 for index, eye in enumerate(("esq", "dir"))
             ]
@@ -396,7 +446,7 @@ class QuestServer:
     def _send_layers(self, connection: socket.socket, quad: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._layer_lock:
             if quad is None:
-                quad = self._sent_layers["camadas"][0]
+                quad = self._sent_quad
             layers = self._layers((quad["pos"], quad["rot"]), quad["tam"])
             if self._menu is not None:
                 texture = self._menu.texture()
@@ -405,6 +455,7 @@ class QuestServer:
                 layers["camadas"].extend(self._menu.layers())
             self._send_json(connection, 0x11, layers)
             self._sent_layers = layers
+            self._sent_quad = {key: quad[key].copy() for key in ("pos", "rot", "tam")}
             return layers
 
     def _video_config(self, connection: socket.socket) -> None:
@@ -429,6 +480,7 @@ class QuestServer:
                 with self._layer_lock:
                     try:
                         self._reset_input()
+                        self._cylinder_supported = None
                         self._video_config(connection)
                         self._send_layers(connection, self._layers()["camadas"][0])
                         if self._source is not None:
@@ -568,6 +620,22 @@ class QuestServer:
                     with self._condition:
                         if connection is self._connection:
                             self._need_idr = True
+                elif header[0] == 0x84:
+                    try:
+                        hello = json.loads(payload)
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(hello, dict) or type(hello.get("cilindro")) is not bool:
+                        continue
+                    with self._layer_lock:
+                        with self._condition:
+                            if connection is not self._connection:
+                                return
+                        if hello["cilindro"] != self._cylinder_supported:
+                            self._cylinder_supported = hello["cilindro"]
+                            self._control(connection, "reset")
+                            screen.reset()
+                            self._send_layers(connection)
                 elif header[0] == 0x83:
                     try:
                         data = json.loads(payload)
@@ -598,7 +666,7 @@ class QuestServer:
                             screen.recenter(pose)
                             anchored = True
                         self._last_input = time.monotonic()
-                        video_quad = self._sent_layers["camadas"][0]
+                        video_quad = self._sent_quad
                         if isinstance(data, dict) and data.get("estado") != "focado" and self._menu is not None:
                             self._menu.reset()
                         suppress_pc = self._menu.update(data, video_quad) if self._menu is not None else False
@@ -606,7 +674,7 @@ class QuestServer:
                             self._control(connection, "reset")
                             screen.reset()
                         else:
-                            suppress_pc = screen.update(data)
+                            suppress_pc = screen.update(data, self._sent_layers["camadas"][0])
                         quad = screen.quad
                         layers = self._layers((quad["pos"], quad["rot"]), quad["tam"])
                         if self._menu is not None:
@@ -671,7 +739,7 @@ class QuestServer:
                                 connection = self._connection
                             if connection is not None:
                                 try:
-                                    quad = self._sent_layers["camadas"][0].copy()
+                                    quad = self._sent_quad.copy()
                                     quad["tam"] = [quad["tam"][0], quad["tam"][0] * height / (width // 2)]
                                     if self._screen is not None:
                                         self._screen.set_aspect(height / (width // 2))

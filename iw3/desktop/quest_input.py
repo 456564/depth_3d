@@ -25,8 +25,7 @@ def ray_to_uv(hand: Any, quad: Any) -> tuple[float, float] | None:
         return None
     origin, aim = _vector(hand.get("pos"), 3), _vector(hand.get("rot"), 4)
     center, rotation = _vector(quad.get("pos"), 3), _vector(quad.get("rot"), 4)
-    size = _vector(quad.get("tam"), 2)
-    if origin is None or aim is None or center is None or rotation is None or size is None or min(size) <= 0:
+    if origin is None or aim is None or center is None or rotation is None:
         return None
     for q in (aim, rotation):
         norm = math.hypot(*q)
@@ -36,8 +35,37 @@ def ray_to_uv(hand: Any, quad: Any) -> tuple[float, float] | None:
     inverse = [-rotation[0], -rotation[1], -rotation[2], rotation[3]]
     local = _rotate(inverse, [a - b for a, b in zip(origin, center)])
     direction = _rotate(inverse, _rotate(aim, [0, 0, -1]))
+    if not all(math.isfinite(v) for v in local + direction):
+        return None
+    kind = quad.get("tipo", "quad")
+    if kind == "cilindro":
+        values = _vector([quad.get("raio"), quad.get("angulo"), quad.get("aspecto")], 3)
+        if values is None:
+            return None
+        radius, angle, aspect = values
+        if radius <= 0.01 or not 0.001 < angle <= 2 * math.pi or aspect <= 0.001:
+            return None
+        # OpenXR圆柱pos是轴心：x²+z²=R²，正面内法向朝轴心；UV按弧长映射。
+        a = direction[0] ** 2 + direction[2] ** 2
+        b = local[0] * direction[0] + local[2] * direction[2]
+        c = local[0] * local[0] + local[2] * local[2] - radius * radius
+        discriminant = b * b - a * c
+        if a < 1e-12 or not math.isfinite(discriminant) or discriminant <= 0:
+            return None
+        root = math.sqrt(discriminant)
+        distance = -c / (b + root) if b > 0 else (-b + root) / a
+        if distance <= 0 or not math.isfinite(distance):
+            return None
+        x, y, z = [value + distance * delta for value, delta in zip(local, direction)]
+        if x * direction[0] + z * direction[2] <= 0:
+            return None
+        u, v = 0.5 + math.atan2(x, -z) / angle, 0.5 - y * aspect / (radius * angle)
+        if -1e-9 <= u <= 1 + 1e-9 and -1e-9 <= v <= 1 + 1e-9:
+            return max(0.0, min(1.0, u)), max(0.0, min(1.0, v))
+        return None
+    size = _vector(quad.get("tam"), 2)
     # OpenXR quad 本地正面朝 +Z，瞄准射线沿手柄 -Z；只接受正面向内的交点。
-    if not all(math.isfinite(v) for v in local + direction) or local[2] <= 0 or direction[2] >= -1e-6:
+    if kind != "quad" or size is None or min(size) <= 0 or local[2] <= 0 or direction[2] >= -1e-6:
         return None
     distance = -local[2] / direction[2]
     u = 0.5 + (local[0] + distance * direction[0]) / size[0]
