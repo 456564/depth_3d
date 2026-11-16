@@ -14,6 +14,7 @@ def packet(side: str = "dir", **changes: Any) -> dict[str, Any]:
         "pos": [0, 0, 0],
         "rot": [0, 0, 0, 1],
         "b": False,
+        "a": False,
         "gatilho": False,
         "aperto": False,
         "analogico": [0, 0],
@@ -131,6 +132,52 @@ def test_missed_press_does_not_click_when_aim_enters_later(menu: Any) -> None:
     state.update(packet(gatilho=True, pos=[100, 0, 0]), VIDEO)
     state.update(packet(gatilho=True), VIDEO)
     assert commands == []
+
+
+@pytest.mark.parametrize("side", ["esq", "dir"])
+def test_a_or_x_clicks_menu_once_without_hold_repeat(menu: Any, clock: list[float], side: str) -> None:
+    state, _, commands = menu
+    opened(state)
+    rect = next(
+        rect for rect, action, value, _ in state._buttons if action == "adjust" and value == ("divergence", 1, "x")
+    )
+    pos = point(state, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+    state.update(packet(side, pos=pos), VIDEO)
+    for _ in range(5):
+        clock[0] += 0.2
+        state.update(packet(side, pos=pos, a=True), VIDEO)
+    assert commands == [("set", {"divergence": 1.25})]
+    assert state.layers()[1]["mao"] == side
+    state.update(packet(side, pos=pos), VIDEO)
+    state.update(packet(side, pos=pos, a=True), VIDEO)
+    assert len(commands) == 2
+
+
+def test_menu_close_waits_for_a_release_before_pc_control(menu: Any) -> None:
+    state, _, _ = menu
+    opened(state)
+    state.update(packet(b=True, a=True), VIDEO)
+    assert not state.visible
+    assert state.update(packet(a=True), VIDEO)
+    assert state.update(packet(), VIDEO)
+    assert not state.update(packet(), VIDEO)
+
+
+@pytest.mark.parametrize("side", ["esq", "dir"])
+def test_a_cannot_continue_trigger_repeat_after_trigger_release(menu: Any, clock: list[float], side: str) -> None:
+    state, _, commands = menu
+    opened(state)
+    rect = next(
+        rect for rect, action, value, _ in state._buttons if action == "adjust" and value == ("divergence", 1, "x")
+    )
+    pos = point(state, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+    state.update(packet(side, pos=pos), VIDEO)
+    state.update(packet(side, pos=pos, gatilho=True), VIDEO)
+    state.update(packet(side, pos=pos, gatilho=True, a=True), VIDEO)
+    for _ in range(5):
+        clock[0] += 0.2
+        state.update(packet(side, pos=pos, a=True), VIDEO)
+    assert commands == [("set", {"divergence": 1.25})]
 
 
 def test_texture_is_single_fixed_id_rgba_and_cached_across_pointer_motion(menu: Any, clock: list[float]) -> None:

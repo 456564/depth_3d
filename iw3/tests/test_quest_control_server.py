@@ -126,6 +126,25 @@ def test_tcp_disconnect_releases_and_reconnect_does_not_replay_held_trigger(cont
     backend.wait("up", count=2)
 
 
+def test_tcp_a_click_is_complete_and_held_packets_do_not_repeat(controlled) -> None:
+    server, backend = controlled
+    with connect(server) as client:
+        initial_messages(client)
+        send_json(client, 0x83, entrada())
+        backend.wait((0.5, 0.5))
+        data = entrada()
+        data["maos"]["dir"]["a"] = True
+        for _ in range(3):
+            send_json(client, 0x83, data)
+        backend.wait((0.5, 0.5), count=4)
+        assert backend.events.count("down") == backend.events.count("up") == 1
+        send_json(client, 0x83, entrada())
+        send_json(client, 0x83, data)
+        backend.wait("up", count=2)
+        assert backend.events.count("down") == 2
+    server.check_error()
+
+
 @pytest.mark.parametrize("keep_alive", [False, True])
 def test_no_controller_input_for_500ms_releases_even_when_other_packets_arrive(controlled, keep_alive: bool) -> None:
     server, backend = controlled

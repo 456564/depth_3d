@@ -78,11 +78,12 @@ class QuestController:
         self.backend = backend
         self._pressed = False
         self._trigger_armed = False
+        self._a_armed = False
         self._stick_armed = False
         self._last_valid: float | None = None
 
     def reset(self) -> None:
-        self._trigger_armed = self._stick_armed = False
+        self._trigger_armed = self._a_armed = self._stick_armed = False
         self._last_valid = None
         try:
             if self._pressed:
@@ -110,7 +111,14 @@ class QuestController:
         uv = ray_to_uv(hand, quad)
         stick = _vector(hand.get("analogico"), 2) if isinstance(hand, dict) else None
         trigger = hand.get("gatilho") if isinstance(hand, dict) else None
-        if uv is None or stick is None or any(abs(v) > 1 for v in stick) or type(trigger) is not bool:
+        a = hand.get("a", False) if isinstance(hand, dict) else None
+        if (
+            uv is None
+            or stick is None
+            or any(abs(v) > 1 for v in stick)
+            or type(trigger) is not bool
+            or type(a) is not bool
+        ):
             self.reset()
             return None
         if not self.backend.move(*uv):
@@ -129,6 +137,8 @@ class QuestController:
         point = _rotate([value / norm for value in rotation], local)
         pointer = {"tipo": "laser", "mao": "dir", "ponto": [a + b for a, b in zip(quad["pos"], point)]}
         self._last_valid = time.monotonic()
+        # 0x83 maos.dir.a为bool；一次按下完成左键down/up，按住或拖动期间不重复点击。
+        click, self._a_armed = a and self._a_armed, not a
         if trigger:
             self._stick_armed = False
             if self._trigger_armed:
@@ -141,6 +151,13 @@ class QuestController:
             return pointer
         self._trigger_armed = True
         if self._pressed:
+            self.backend.mouse_up()
+            self._pressed = False
+        if click:
+            self._pressed = True
+            if not self.backend.mouse_down():
+                self.reset()
+                return None
             self.backend.mouse_up()
             self._pressed = False
         y = stick[1]

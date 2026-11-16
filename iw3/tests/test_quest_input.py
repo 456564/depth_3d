@@ -224,6 +224,79 @@ def test_trigger_waits_for_release_then_drags_without_repeated_down() -> None:
     assert backend.events.count("up") == 1
 
 
+def test_a_clicks_once_on_press_without_drag_or_repeat() -> None:
+    backend = Backend()
+    state = controller(backend)
+    state.update(entrada(a=True), quad())
+    assert "down" not in backend.events
+    state.update(entrada(), quad())
+    backend.events.clear()
+    state.update(entrada(a=True, pos=[1, 0, 0]), quad())
+    assert backend.events == [("move", 0.75, 0.5), "down", "up"]
+    state.update(entrada(a=True), quad())
+    state.update(entrada(), quad())
+    state.update(entrada(a=True), quad())
+    assert [event for event in backend.events if isinstance(event, str)] == ["down", "up", "down", "up"]
+
+
+@pytest.mark.parametrize("fault", ["focus", "miss", "backend", "timeout"])
+def test_a_requires_release_after_losing_valid_input(monkeypatch, fault: str) -> None:
+    module = importlib.import_module("iw3.desktop.quest_input")
+    now = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    backend = Backend()
+    state = controller(backend)
+    state.update(entrada(), quad())
+    data = entrada(a=True)
+    if fault == "focus":
+        data["estado"] = "visivel"
+    elif fault == "miss":
+        data["maos"]["dir"]["pos"] = [100, 0, 0]
+    elif fault == "backend":
+        backend.allowed = False
+    else:
+        now[0] += 0.5
+    state.update(data, quad())
+    backend.allowed = True
+    state.update(entrada(a=True), quad())
+    assert "down" not in backend.events
+    state.update(entrada(), quad())
+    state.update(entrada(a=True), quad())
+    assert backend.events[-2:] == ["down", "up"]
+
+
+def test_a_is_consumed_during_trigger_drag() -> None:
+    backend = Backend()
+    state = controller(backend)
+    for changes in ({}, {"gatilho": True}, {"gatilho": True, "a": True}, {"a": True}, {"a": True}):
+        state.update(entrada(**changes), quad())
+    assert [event for event in backend.events if isinstance(event, str)] == ["down", "up"]
+    state.update(entrada(), quad())
+    state.update(entrada(a=True), quad())
+    assert [event for event in backend.events if isinstance(event, str)] == ["down", "up", "down", "up"]
+
+
+@pytest.mark.parametrize("value", [1, None, "true"])
+def test_invalid_a_disarms_click(value: Any) -> None:
+    backend = Backend()
+    state = controller(backend)
+    state.update(entrada(), quad())
+    assert state.update(entrada(a=value), quad()) is None
+    state.update(entrada(a=True), quad())
+    assert "down" not in backend.events
+
+
+def test_a_partial_down_error_keeps_ownership_for_cleanup() -> None:
+    backend = Backend()
+    state = controller(backend)
+    state.update(entrada(), quad())
+    backend.down_error = True
+    with pytest.raises(OSError, match="partial input failure"):
+        state.update(entrada(a=True), quad())
+    state.reset()
+    assert backend.events[-2:] == ["down", "up"]
+
+
 def test_stick_requires_center_and_one_deflection_per_video() -> None:
     backend = Backend()
     state = controller(backend)

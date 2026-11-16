@@ -100,6 +100,7 @@ class QuestMenu:
             if not isinstance(hands, dict) or any(
                 not isinstance(hands.get(side), dict)
                 or any(type(hands[side].get(key)) is not bool for key in ("b", "gatilho", "aperto"))
+                or type(hands[side].get("a", False)) is not bool
                 or (stick := _vector(hands[side].get("analogico"), 2)) is None
                 or any(abs(v) > 1 for v in stick)
                 for side in ("esq", "dir")
@@ -128,7 +129,10 @@ class QuestMenu:
             if not self.visible:
                 if self._release_gate:
                     if all(
-                        not hand["gatilho"] and not hand["aperto"] and max(map(abs, hand["analogico"])) <= 0.3
+                        not hand["gatilho"]
+                        and not hand.get("a", False)
+                        and not hand["aperto"]
+                        and max(map(abs, hand["analogico"])) <= 0.3
                         for hand in hands.values()
                     ):
                         self._release_gate = False
@@ -138,7 +142,7 @@ class QuestMenu:
             self._laser = None
             if self._release_gate:
                 if any(
-                    hand["gatilho"] or hand["aperto"] or max(map(abs, hand["analogico"])) > 0.3
+                    hand["gatilho"] or hand.get("a", False) or hand["aperto"] or max(map(abs, hand["analogico"])) > 0.3
                     for hand in hands.values()
                 ):
                     return True
@@ -148,7 +152,11 @@ class QuestMenu:
                 self._pressed[0]
                 if self._pressed is not None
                 else next(
-                    (side for side in ("dir", "esq") if hands[side]["gatilho"] and hits[side] is not None),
+                    (
+                        side
+                        for side in ("dir", "esq")
+                        if (hands[side]["gatilho"] or hands[side].get("a", False)) and hits[side] is not None
+                    ),
                     self._pointer_side,
                 )
             )
@@ -167,7 +175,7 @@ class QuestMenu:
                 }
             for side in ("dir", "esq"):
                 hand, uv = hands[side], hits[side]
-                if not hand["gatilho"]:
+                if not (hand["gatilho"] or hand.get("a", False)):
                     self._trigger_armed[side] = uv is not None
                     if self._pressed is not None and self._pressed[0] == side:
                         self._pressed = None
@@ -176,14 +184,14 @@ class QuestMenu:
                 button = self._hit(uv)
                 if armed and self._pressed is None and button is not None:
                     rect, action, payload, repeat = button
-                    self._pressed = (side, rect, action, payload, repeat)
+                    self._pressed = (side, rect, action, payload, repeat and hand["gatilho"])
                     self._repeat_at = now + 0.45
                     self._act(action, payload)
                 elif self._pressed is not None and self._pressed[0] == side:
                     _, rect, action, payload, repeat = self._pressed
                     if button is None or button[:3] != (rect, action, payload):
                         self._pressed = None
-                    elif repeat and now >= self._repeat_at:
+                    elif repeat and hand["gatilho"] and now >= self._repeat_at:
                         self._repeat_at = now + 0.12
                         self._act(action, payload)
             if self._pressed is None:
@@ -527,7 +535,7 @@ class QuestMenu:
         if self._page == 4 and self._picker is None and selected.page != PAGES[4]:
             title = "屏幕与状态 · 操作说明"
             help_text = (
-                "菜单打开时暂停抓屏和网页输入。B / Y关闭后，先松开两手扳机与握柄、摇杆回中，再恢复控制。"
+                "菜单打开时暂停抓屏和网页输入。B / Y关闭后，先松开两手扳机、A / X与握柄、摇杆回中，再恢复控制。"
                 "屏幕居中会恢复默认摆放；三项FPS都来自电脑，不是Quest刷新率，也不是头显接收确认。"
             )
         self._text(draw, (36, 882), title, 1450, 29, "#91d7ff")
@@ -544,7 +552,7 @@ class QuestMenu:
         ):
             self._button(draw, rect, label, "command", command)
         self._text(
-            draw, (34, 1210), "双手指向 + 扳机点击；长按加减连续调节；摇杆上下滚动。重启使用已应用设置。", 1465, 25
+            draw, (34, 1210), "双手指向；扳机或A / X点击；扳机长按加减连调；摇杆滚动。重启使用已应用设置。", 1465, 25
         )
         return image
 

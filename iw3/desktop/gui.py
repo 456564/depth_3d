@@ -470,9 +470,9 @@ class MainFrame(wx.Frame):
         self.chk_quest_control = wx.CheckBox(self.grp_network, label="手柄控制电脑", name="chk_quest_control")
         self.chk_quest_control.SetValue(False)
         self.chk_quest_control.SetToolTip(
-            "右手指向；扳机左键点击/拖动；摇杆上下拨动一次切一个抖音视频，回中后可再切。"
+            "右手指向；A键单击，长按不连点；扳机左键点击/拖动；摇杆上下拨动一次切一个抖音视频，回中后可再切。"
             "支持Windows的wc_mp/mss/wc_cuda。捕获窗口选整个桌面时控制所选显示器，四边裁剪须为0；"
-            "切视频须指向该屏幕的前台窗口。调屏时暂停电脑操作，松开握柄后先松扳机、摇杆回中。"
+            "切视频须指向该屏幕的前台窗口。调屏时暂停电脑操作，松开握柄后先松扳机和A键、摇杆回中。"
         )
         self.sep_network1 = wx.StaticLine(self.grp_network, style=wx.LI_HORIZONTAL)
 
