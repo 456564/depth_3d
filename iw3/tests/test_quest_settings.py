@@ -130,6 +130,7 @@ def test_related_edits_can_be_validated_atomically() -> None:
         "restore",
         "refresh_windows",
         "recenter",
+        "exit_fullscreen",
     }
 
 

@@ -67,6 +67,13 @@ class QuestSession:
     def submit(self, command: str, patch: dict[str, Any]) -> None:
         if command not in COMMANDS:
             raise ValueError("Unknown Quest setting command")
+        if command == "exit_fullscreen":
+            if not isinstance(patch, dict) or patch:
+                raise ValueError("退出全屏不接受设置参数")
+            # 固定命令 str + 空dict立即作用当前连接，避免排队后跨重连误发。
+            if self.server is None or not self.server.exit_fullscreen():
+                raise ValueError("退出未发送：请开启手柄控制，并保持捕获窗口位于电脑前台。")
+            return
         with self._lock:
             clean = validate_patch(patch, self._values, self._choices)
             if command == "set":

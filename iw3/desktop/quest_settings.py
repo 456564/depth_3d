@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 PAGES = ("画面与立体", "模型与性能", "串流与声音", "捕获与控制", "屏幕与状态", "环境光")
-COMMANDS = frozenset({"set", "apply", "restart_stream", "restart_app", "restore", "refresh_windows", "recenter"})
+COMMANDS = frozenset(
+    {"set", "apply", "restart_stream", "restart_app", "restore", "refresh_windows", "recenter", "exit_fullscreen"}
+)
 
 
 @dataclass(frozen=True)

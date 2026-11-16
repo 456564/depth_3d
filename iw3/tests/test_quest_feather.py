@@ -40,6 +40,69 @@ def settled(ambient, image, **kwargs):
     return pixels(result)
 
 
+def gl_sample(rgba, u, v, scale=(2.0, 2.0)):
+    # 接收端RGBA纹素中心为(i+.5)/size；按实际GL双线性坐标合成。
+    x = (0.5 + (u - 0.5) / scale[0]) * rgba.shape[1] - 0.5
+    y = (0.5 + (v - 0.5) / scale[1]) * rgba.shape[0] - 0.5
+    left, top = math.floor(x), math.floor(y)
+    tx, ty = x - left, y - top
+    return (rgba[top, left].float() * (1 - tx) + rgba[top, left + 1].float() * tx) * (1 - ty) + (
+        rgba[top + 1, left].float() * (1 - tx) + rgba[top + 1, left + 1].float() * tx
+    ) * ty
+
+
+@pytest.mark.parametrize("border", [1, 3, 6])
+@pytest.mark.parametrize("feather", [0.0, 0.03])
+@pytest.mark.parametrize("scale", [(2.0, 2.0), (4.0, 4.0)])
+def test_thin_paired_black_borders_have_no_dark_seam_at_real_gl_samples(border, feather, scale):
+    image = frame((border, border, 384 - border, 216 - border))
+    rgba = settled(background(), image, sbs=torch.cat((image, image), 2), feather=feather, scale=scale)
+    color = torch.tensor([51.0, 153.0, 255.0])
+    for u, v in (
+        (border / 2 / 384, 0.5),
+        ((384 - border / 2) / 384, 0.5),
+        (0.5, border / 2 / 216),
+        (0.5, (216 - border / 2) / 216),
+        (0.5, (216 - border + 0.5) / 216),
+    ):
+        sample = gl_sample(rgba, u, v, scale)
+        assert sample[3] == pytest.approx(255.0, abs=0.01)
+        # 黑视频叠加后应与外侧柔光同色，不留低alpha或混黑提色造成的暗圈。
+        assert sample[:3] * (sample[3] / 255) == pytest.approx(color, abs=3)
+    assert gl_sample(rgba, 0.5, 0.5, scale)[3] == 0
+
+
+@pytest.mark.parametrize("border", [1, 3])
+def test_thin_single_bottom_border_is_filled_without_changing_portrait_content(border):
+    image = frame((132, 0, 252, 216 - border))
+    before = image.clone()
+    rgba = settled(background(), image, sbs=torch.cat((image, image), 2), feather=0.03)
+    sample = gl_sample(rgba, 0.5, (216 - border + 0.5) / 216)
+    assert sample[3] == pytest.approx(255.0, abs=0.01)
+    assert sample[:3] == pytest.approx((51, 153, 255), abs=3)
+    assert torch.equal(image, before)
+
+
+def test_fine_edge_color_crop_keeps_capture_roi_offset_and_fractional_pixel_bounds():
+    source = torch.zeros(3, 279, 475)
+    source[0] = 1
+    content = torch.zeros(3, 215, 383)
+    content[:, 1:-3, 1:-3] = torch.tensor([0.2, 0.6, 1.0])[:, None, None]
+    source[:, 31:246, 47:430] = content
+    ambient = background()
+    rgba = settled(ambient, source, content_rect=(47, 31, 430, 246), sbs=torch.cat((content, content), 2), feather=0.03)
+    assert gl_sample(rgba, 0.5, (215 - 2) / 215)[:3] == pytest.approx((51, 153, 255), abs=3)
+    assert ambient._source_window.active == pytest.approx((1 / 383, 1 / 215, 380 / 383, 212 / 215))
+
+
+def test_fine_edges_do_not_shrink_the_protected_window_in_a_low_confidence_dark_scene():
+    image = torch.full((3, 216, 384), 7 / 255)
+    image[:, -3:] = 0
+    ambient = background()
+    settled(ambient, image, sbs=torch.cat((image, image), 2), feather=0.0)
+    assert ambient._source_window.active == ambient._display_window.active == (0.0, 0.0, 1.0, 1.0)
+
+
 @pytest.mark.parametrize("rect", [(132, 0, 252, 216), (0, 24, 384, 192)])
 @pytest.mark.parametrize("noise", [False, True])
 def test_content_colors_replace_black_edges_without_covering_center(rect, noise):

@@ -318,6 +318,9 @@ class QuestMenu:
                     else:
                         self._confirm_until = time.monotonic() + 5
                         self._message = "5秒内再次点击：保存已应用设置并重开 iw3，头显将短暂断线"
+                elif payload == "exit_fullscreen":
+                    self._submit(payload, {})
+                    self._message = "已发送 Esc；请确认网页是否退出全屏。"
                 else:
                     if payload == "restore":
                         self._draft.clear()
@@ -565,6 +568,9 @@ class QuestMenu:
                 lines.append(f"{label}：{values[key]}")
         self._wrap(draw, "\n".join(lines), 40, 418, 1450, 26, lines=10)
         self._button(draw, (40, 796, 450, 858), "屏幕居中（重新定位）", "command", "recenter")
+        self._button(draw, (470, 796, 1000, 858), "退出网页全屏（Esc）", "command", "exit_fullscreen")
+        self._text(draw, (1020, 798), "需开启电脑控制、目标位于前台", 476, 22)
+        self._text(draw, (1020, 830), "发送 Esc；B / Y 仍负责关闭菜单", 476, 22)
 
     def texture(self) -> bytes | None:
         with self._lock:

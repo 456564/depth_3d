@@ -6,6 +6,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -92,6 +93,138 @@ def test_reject_non_private_ipv4_bind(module: Any, host: str) -> None:
 def test_reject_bad_video_geometry(module: Any, width: int, height: int, fps: int, bitrate: int) -> None:
     with pytest.raises(ValueError):
         module.QuestServer("127.0.0.1", width, height, fps, bitrate, audio=False)
+
+
+def fullscreen_action_server(module: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:
+    target = module.QuestServer("127.0.0.1", 128, 64, 30, 35, audio=False)
+    target._shutdown.clear()
+    target._connection = object()
+    target._last_input = 100.0
+    monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
+    seen: list[str] = []
+
+    def exit_fullscreen() -> bool:
+        seen.append("escape")
+        return True
+
+    target._controller = SimpleNamespace(exit_fullscreen=exit_fullscreen, reset=lambda: None)
+    target._menu = SimpleNamespace(visible=True)
+    target._menu.reset = lambda: setattr(target._menu, "visible", False)
+    return target, seen
+
+
+def test_exit_fullscreen_uses_only_the_current_focused_menu_controller(module: Any, monkeypatch) -> None:
+    target, seen = fullscreen_action_server(module, monkeypatch)
+    assert target.exit_fullscreen()
+    assert seen == ["escape"]
+
+
+@pytest.mark.parametrize(
+    "blocked",
+    ["connection", "controller", "menu", "focus", "missing_input", "stale", "hidden", "shutdown", "paused_video"],
+)
+def test_exit_fullscreen_rejects_inactive_input_without_sending(module: Any, monkeypatch, blocked: str) -> None:
+    target, seen = fullscreen_action_server(module, monkeypatch)
+    if blocked in {"connection", "controller", "menu"}:
+        setattr(target, "_" + blocked, None)
+    elif blocked == "focus":
+        target._menu.visible = False
+    elif blocked == "missing_input":
+        target._last_input = None
+    elif blocked == "stale":
+        target._last_input = 99.5
+    elif blocked == "hidden":
+        target._suspended = True
+    elif blocked == "shutdown":
+        target._shutdown.set()
+    else:
+        target._video_enabled = False
+    assert not target.exit_fullscreen()
+    assert seen == [] and target._error is None and target._media_error is None
+
+
+def test_fullscreen_command_failure_does_not_fail_the_media_service(module: Any, monkeypatch) -> None:
+    target, _ = fullscreen_action_server(module, monkeypatch)
+
+    def reject():
+        raise OSError("Windows rejected the Quest key tap")
+
+    target._controller.exit_fullscreen = reject
+    with pytest.raises(RuntimeError, match="Windows rejected"):
+        target.exit_fullscreen()
+    assert not target._shutdown.is_set() and target._error is None and target._media_error is None
+
+
+def test_reconnection_does_not_reuse_the_previous_fullscreen_click_authorization(module: Any, monkeypatch) -> None:
+    target, seen = fullscreen_action_server(module, monkeypatch)
+    old, peer = socket.socketpair()
+    with old, peer:
+        target._connection = old
+        target._disconnect(old)
+    target._connection = object()
+
+    def exit_fullscreen() -> bool:
+        seen.append("new escape")
+        return True
+
+    target._controller = SimpleNamespace(exit_fullscreen=exit_fullscreen)
+    assert not target.exit_fullscreen()
+    assert seen == [] and target._last_input is None and not target._menu.visible
+
+
+def test_tcp_menu_exit_reaches_guarded_windows_input_and_failure_keeps_media_alive(module: Any, monkeypatch) -> None:
+    from iw3.desktop.quest_input import QuestController
+    from iw3.desktop.quest_menu import QuestMenu
+
+    from .test_quest_menu import packet, point
+    from .test_quest_session import make_session
+    from .test_quest_windows import backend, patch_windows_api
+
+    api = patch_windows_api(monkeypatch)
+    control = QuestController(backend())
+    owner = make_session()
+    target = module.QuestServer(
+        "127.0.0.1", 128, 64, 30, 35, audio=False, port=0, discovery_port=0, controller_factory=lambda: control
+    )
+    owner.server = target
+    menu = QuestMenu(owner.snapshot, owner.submit)
+    target.set_menu(menu)
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 1
+        while not predicate():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+
+    target.start()
+    try:
+        with connect(target) as client:
+            initial_messages(client)
+            send_json(client, 0x83, packet())
+            send_json(client, 0x83, packet(b=True))
+            wait_for(lambda: menu.visible)
+            with menu._lock:
+                menu._act("page", 4)
+                menu._render()
+                rect = next(r for r, action, value, _ in menu._buttons if value == "exit_fullscreen")
+                pos = point(menu, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+            send_json(client, 0x83, packet(pos=pos))
+            send_json(client, 0x83, packet(pos=pos, gatilho=True))
+            wait_for(lambda: len(api.batches) == 1)
+            assert api.batches == [[(1, 0, 0x1B), (1, 2, 0x1B)]]
+            assert menu.visible and not owner.run_stop.is_set()
+            api.foreground = 9
+            send_json(client, 0x83, packet(pos=pos))
+            send_json(client, 0x83, packet(pos=pos, gatilho=True))
+            wait_for(lambda: "退出未发送" in menu._message)
+            assert len(api.batches) == 1 and target._connection is not None
+            target.check_error()
+            target.set_frame_data((torch.ones(3, 64, 128), 1.0))
+            while read_message(client)[0] != 0x02:
+                pass
+            assert not owner.run_stop.is_set() and target._media_error is None
+    finally:
+        target.stop()
 
 
 def test_discovery_exact_wire_format(server: Any) -> None:

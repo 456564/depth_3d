@@ -99,6 +99,10 @@ class QuestController:
             self.reset()
         return 0.5
 
+    def exit_fullscreen(self) -> bool:
+        self.reset()
+        return self.backend.move(0.5, 0.5) and self.backend.tap_key("escape")
+
     def update(self, data: Any, quad: dict[str, Any]) -> None:
         self.expire()
         hands = data.get("maos") if isinstance(data, dict) and data.get("estado") == "focado" else None

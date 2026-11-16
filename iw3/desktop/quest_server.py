@@ -444,6 +444,24 @@ class QuestServer:
         if connection is not None:
             self._control(connection, "reset")
 
+    def exit_fullscreen(self) -> bool:
+        with self._layer_lock:
+            with self._condition:
+                connection = self._connection
+                if (
+                    connection is None
+                    or self._controller is None
+                    or self._shutdown.is_set()
+                    or self._suspended
+                    or not self._video_enabled
+                    or self._menu is None
+                    or not self._menu.visible
+                    or self._last_input is None
+                    or time.monotonic() - self._last_input >= 0.5
+                ):
+                    return False
+                return bool(self._control(connection, "exit_fullscreen"))
+
     def set_audio_gain(self, gain: float) -> None:
         if type(gain) not in (int, float) or not 0 <= gain <= 4:
             raise ValueError("Quest音量增益必须是0到4之间的有限数字")

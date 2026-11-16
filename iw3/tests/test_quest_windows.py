@@ -300,14 +300,17 @@ def test_monitor_control_maps_negative_origin_and_can_click_new_windows(api: Win
     assert all(-1920 <= x < 0 and -100 <= y < 980 for x, y in api.points)
 
 
-def test_monitor_keys_require_pointed_window_to_be_foreground(api: WindowsAPI, monitor_control: Any) -> None:
+@pytest.mark.parametrize("direction,key", [("down", 0x28), ("escape", 0x1B)])
+def test_monitor_keys_require_pointed_window_to_be_foreground(
+    api: WindowsAPI, monitor_control: Any, direction: str, key: int
+) -> None:
     control = monitor_control.control
     assert control.move(0.5, 0.5)
     api.foreground, api.point_root = 9, 12
-    assert not control.tap_key("down") and not api.batches
+    assert not control.tap_key(direction) and not api.batches
     api.foreground = 12
-    assert control.tap_key("down")
-    assert api.batches == [[(1, 0, 0x28), (1, 2, 0x28)]]
+    assert control.tap_key(direction)
+    assert api.batches == [[(1, 0, key), (1, 2, key)]]
 
 
 @pytest.mark.parametrize(
@@ -505,7 +508,7 @@ def test_left_button_edges_and_owned_release_ignore_lost_focus(api: WindowsAPI) 
     assert api.batches == [[(0, 2, 0)], [(0, 4, 0)]]
 
 
-@pytest.mark.parametrize("direction,key", [("up", 0x26), ("down", 0x28)])
+@pytest.mark.parametrize("direction,key", [("up", 0x26), ("down", 0x28), ("escape", 0x1B)])
 def test_arrow_tap_batches_press_and_release(api: WindowsAPI, direction: str, key: int) -> None:
     controller = backend()
     assert controller.move(0.5, 0.5)
@@ -522,35 +525,56 @@ def test_keyboard_rechecks_occlusion(api: WindowsAPI) -> None:
     assert not api.batches
 
 
+@pytest.mark.parametrize("direction,key", [("down", 0x28), ("escape", 0x1B)])
 @pytest.mark.parametrize("count", [0, 1])
-def test_failed_key_tap_releases_before_raising(api: WindowsAPI, count: int) -> None:
+def test_failed_key_tap_releases_before_raising(api: WindowsAPI, count: int, direction: str, key: int) -> None:
     controller = backend()
     assert controller.move(0.5, 0.5)
     api.send_counts = [count]
     with pytest.raises(OSError):
-        controller.tap_key("down")
+        controller.tap_key(direction)
     if count == 1:
         assert len(api.batches) == 2
-        assert api.batches[1][0][1] & 2 and api.batches[1][0][2] == 0x28
+        assert api.batches[1][0][1] & 2 and api.batches[1][0][2] == key
 
 
-def test_partial_key_cleanup_remains_retryable_after_focus_loss(api: WindowsAPI) -> None:
+@pytest.mark.parametrize("direction,key", [("down", 0x28), ("escape", 0x1B)])
+def test_partial_key_cleanup_remains_retryable_after_focus_loss(api: WindowsAPI, direction: str, key: int) -> None:
     controller = backend()
     assert controller.move(0.5, 0.5)
     api.send_counts = [1, 0, 0, 1]
     with pytest.raises(OSError):
-        controller.tap_key("down")
+        controller.tap_key(direction)
     api.foreground = 9
     with pytest.raises(OSError):
         controller.release_keys()
     controller.release_keys()
     controller.release_keys()
     assert api.batches == [
-        [(1, 0, 0x28), (1, 2, 0x28)],
-        [(1, 2, 0x28)],
-        [(1, 2, 0x28)],
-        [(1, 2, 0x28)],
+        [(1, 0, key), (1, 2, key)],
+        [(1, 2, key)],
+        [(1, 2, key)],
+        [(1, 2, key)],
     ]
+
+
+@pytest.mark.parametrize("change", ["focus", "occlusion", "mapping", "geometry", "cursor"])
+def test_escape_rechecks_current_captured_target(api: WindowsAPI, change: str) -> None:
+    mapping: list[dict[str, Any] | None] = [frame_mapping(api)]
+    control = mapped_backend(mapping)
+    assert control.move(0.5, 0.5)
+    if change == "focus":
+        api.foreground = 9
+    elif change == "occlusion":
+        api.point_root = 9
+    elif change == "mapping":
+        mapping[0] = None
+    elif change == "geometry":
+        api.window_rect = api.dwm_rect = (0, 0, 2560, 1440)
+    else:
+        api.cursor = (900, 900)
+    assert not control.tap_key("escape")
+    assert not api.batches
 
 
 @pytest.mark.parametrize("count", [0, 2])

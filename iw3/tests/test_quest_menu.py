@@ -183,6 +183,40 @@ def test_restart_app_requires_two_distinct_clicks(menu: Any, clock: list[float])
     assert commands == [("restart_app", {})]
 
 
+@pytest.mark.parametrize("side", ["esq", "dir"])
+def test_exit_fullscreen_button_sends_once_per_click_and_preserves_menu_draft(menu: Any, clock, side: str) -> None:
+    state, _, commands = menu
+    opened(state)
+    state._draft = {"stream_fps": 60}
+    click(state, "page", 4, side=side)
+    state._render()
+    rect = next(rect for rect, action, value, _ in state._buttons if action == "command" and value == "exit_fullscreen")
+    pos = point(state, (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+    state.update(packet(side, pos=pos), VIDEO)
+    state.update(packet(side, pos=pos, gatilho=True), VIDEO)
+    for _ in range(5):
+        clock[0] += 0.2
+        state.update(packet(side, pos=pos, gatilho=True), VIDEO)
+    assert commands == [("exit_fullscreen", {})]
+    assert state.visible and state._draft == {"stream_fps": 60}
+    assert "已发送 Esc" in state._message and "确认" in state._message
+
+
+def test_exit_fullscreen_failure_stays_in_menu_instead_of_restarting_media(menu: Any) -> None:
+    state, _, commands = menu
+    opened(state)
+    click(state, "page", 4)
+    state._render()
+
+    def reject(command, patch):
+        raise RuntimeError("退出未发送：捕获窗口不在前台")
+
+    state._submit = reject
+    click(state, "command", "exit_fullscreen")
+    assert state.visible and "退出未发送" in state._message
+    assert commands == []
+
+
 def test_restart_confirmation_expires_and_stream_restart_is_independent(menu: Any, clock: list[float]) -> None:
     state, _, commands = menu
     opened(state)

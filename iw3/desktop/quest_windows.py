@@ -305,8 +305,9 @@ class WindowsInput:
             self._left_down = False
 
     def tap_key(self, direction: str) -> bool:
-        if direction not in {"up", "down"}:
-            raise ValueError("Only up/down video navigation is allowed")
+        keys = {"up": 0x26, "down": 0x28, "escape": 0x1B}
+        if direction not in keys:
+            raise ValueError("Only up/down navigation and escape are allowed")
         self.release_keys()
         if not self._last_target_valid():
             return False
@@ -320,7 +321,7 @@ class WindowsInput:
         events = (INPUT * 2)()
         for event in events:
             event.type = 1
-            event.ki.wVk = 0x26 if direction == "up" else 0x28
+            event.ki.wVk = keys[direction]
         events[1].ki.dwFlags = 2
         sent = self._user32.SendInput(2, events, ctypes.sizeof(INPUT))
         if sent != 2:
@@ -332,7 +333,7 @@ class WindowsInput:
 
     def release_keys(self) -> None:
         if self._pending_key is not None:
-            # 只释放本会话已注入的方向键；失败保留归属，供断线或停止时重试。
+            # 只释放本会话已注入的按键；失败保留归属，供断线或停止时重试。
             release = (INPUT * 1)()
             release[0].type = 1
             release[0].ki.wVk = self._pending_key

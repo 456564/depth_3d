@@ -72,6 +72,25 @@ def test_reset_cleans_pending_keys_even_without_a_mouse_press() -> None:
     assert backend.key_releases == 1
 
 
+def test_exit_fullscreen_releases_owned_input_then_targets_capture_center() -> None:
+    backend = Backend()
+    control = controller(backend)
+    control.update(entrada(), quad())
+    control.update(entrada(gatilho=True), quad())
+    backend.events.clear()
+    assert control.exit_fullscreen()
+    assert backend.events == ["up", ("move", 0.5, 0.5), "key_escape"]
+    assert control._last_valid is None and not control._trigger_armed and not control._stick_armed
+
+
+@pytest.mark.parametrize("move_allowed,key_allowed", [(False, True), (True, False)])
+def test_exit_fullscreen_does_not_bypass_target_rejection(move_allowed: bool, key_allowed: bool) -> None:
+    backend = Backend()
+    backend.allowed, backend.key_allowed = move_allowed, key_allowed
+    assert not controller(backend).exit_fullscreen()
+    assert backend.events == [("move", 0.5, 0.5)] + (["key_escape"] if move_allowed else [])
+
+
 def test_expiry_reports_remaining_wait_without_extending_deadline(monkeypatch) -> None:
     module = importlib.import_module("iw3.desktop.quest_input")
     now = [1.0]

@@ -110,16 +110,51 @@ class AmbientBackground:
             min(_SAMPLE_H, bottom + guard) / _SAMPLE_H,
         )
 
+    @staticmethod
+    def _refine_black_edges(frame: torch.Tensor, reduced: torch.Tensor, rect: _Rect, strict: bool) -> _Rect:
+        left, top, right, bottom = rect
+        content = reduced[
+            round(top * _SAMPLE_H) : round(bottom * _SAMPLE_H),
+            round(left * _SAMPLE_W) : round(right * _SAMPLE_W),
+        ]
+        if float((content > 32 / 255).float().mean()) < (0.5 if strict else 0.35):
+            return rect
+        # 原尺寸RGB[3,H,W] → 同设备max[H,W] → 行/列max[H]/[W]；只读回两条投影，定位低清漏掉的窄边。
+        value = frame.detach().amax(0)
+        refined = list(rect)
+        for axis, projection in enumerate((value.amax(0), value.amax(1))):
+            positions = torch.nonzero(projection.to(device="cpu", dtype=torch.float32) > 16 / 255).flatten()
+            if not positions.numel():
+                continue
+            start, stop = int(positions[0]) / projection.numel(), (int(positions[-1]) + 1) / projection.numel()
+            if strict and rect[axis] > 0 and rect[axis + 2] < 1:
+                refined[axis], refined[axis + 2] = start, stop
+            # shortcut: 仅对≤2%的连续窄暗带允许单侧处理；更宽不对称暗带仍保守保留。
+            if 0 < start <= 0.02:
+                refined[axis] = max(refined[axis], start)
+            if 0 < 1 - stop <= 0.02:
+                refined[axis + 2] = min(refined[axis + 2], stop)
+        return refined[0], refined[1], refined[2], refined[3]
+
     def _display_rect(self, frame: torch.Tensor, feather: float, scale: tuple[float, float]) -> _Rect:
         # 最终每眼RGB[3,H,W] → max-pool[1,72,128]，一像素亮点也保留。
         value = F.adaptive_max_pool2d(frame.detach().amax(dim=0, keepdim=True), (_SAMPLE_H, _SAMPLE_W))
         value = value.squeeze(0).to(device="cpu", dtype=torch.float32)
         self._check_values(value)
         rect = self._content_rect(value, strict=True)
+        rect = self._refine_black_edges(frame, value, rect, strict=True)
+        inset = list(rect)
+        for axis, pixels in enumerate((self.WIDTH, self.HEIGHT)):
+            # 已确认黑条的渐隐向内容内走，留一纹素使GL双线性采样的填光端完全不透黑。
+            margin = scale[axis] / (pixels - 1)
+            if rect[axis] > 0:
+                inset[axis] += margin
+            if rect[axis + 2] < 1:
+                inset[axis + 2] -= margin
         # 主体用多数行/列判断，避免较高字幕被并入主体后漏掉渐隐保护。
         primary = self._content_rect(value, strict=False, high_quantile=0.5)
         if primary == _FULL:
-            return rect
+            return inset[0], inset[1], inset[2], inset[3]
         left, top, right, bottom = primary
         outside = torch.ones_like(value, dtype=torch.bool)
         outside[
@@ -128,8 +163,8 @@ class AmbientBackground:
         ] = False
         marks = torch.nonzero(outside & (value > 16 / 255))
         if not marks.numel():
-            return rect
-        protected = list(rect)
+            return inset[0], inset[1], inset[2], inset[3]
+        protected = inset
         for axis, coordinate, samples, pixels in ((0, 1, _SAMPLE_W, self.WIDTH), (1, 0, _SAMPLE_H, self.HEIGHT)):
             start = int(marks[:, coordinate].min()) / samples
             stop = (int(marks[:, coordinate].max()) + 1) / samples
@@ -138,8 +173,8 @@ class AmbientBackground:
             guard = feather * width + scale[axis] / (pixels - 1)
             if start - rect[axis] < guard or rect[axis + 2] - stop < guard:
                 padding = guard / (1 - 2 * feather)
-                protected[axis] -= padding
-                protected[axis + 2] += padding
+                protected[axis] = rect[axis] - padding
+                protected[axis + 2] = rect[axis + 2] + padding
         return protected[0], protected[1], protected[2], protected[3]
 
     def _alpha(self, rect: _Rect, scale: tuple[float, float], feather: float) -> Image.Image:
@@ -210,22 +245,26 @@ class AmbientBackground:
             self.reset()
             self._signature = signature
         source = frame if content_rect is None else frame[:, top:bottom, left:right]
-        # 单目RGB[3,H,W] → 同设备area[3,72,128] → CPU；检测与取色共享小图。
+        # 单目RGB[3,H,W] → 同设备area[3,72,128] → CPU粗检；精定位后从原像素区单独取色。
         reduced = F.interpolate(source.detach().unsqueeze(0), size=(_SAMPLE_H, _SAMPLE_W), mode="area").squeeze(0)
         reduced = reduced.to(device="cpu", dtype=torch.float32)
         self._check_values(reduced)
         source_rect = self._content_rect(reduced.amax(0), strict=False) if fill_borders else _FULL
+        if fill_borders:
+            source_rect = self._refine_black_edges(source, reduced.amax(0), source_rect, strict=False)
         previous_source = self._source_window.active
         source_rect = self._source_window.update(source_rect, now)
         if source_rect != previous_source:
             self._colors = None
         left_f, top_f, right_f, bottom_f = source_rect
-        reduced = reduced[
+        source_content = source[
             :,
-            round(top_f * _SAMPLE_H) : round(bottom_f * _SAMPLE_H),
-            round(left_f * _SAMPLE_W) : round(right_f * _SAMPLE_W),
+            round(top_f * source.shape[1]) : round(bottom_f * source.shape[1]),
+            round(left_f * source.shape[2]) : round(right_f * source.shape[2]),
         ]
-        reduced = F.interpolate(reduced.unsqueeze(0), size=(18, 32), mode="area").squeeze(0)
+        # 按原像素裁后再取色，避免1–3px黑条已混入72×128采样、随后无法剔净。
+        reduced = F.interpolate(source_content.unsqueeze(0), size=(18, 32), mode="area").squeeze(0)
+        reduced = reduced.to(device="cpu", dtype=torch.float32)
         display_rect = _FULL
         if fill_borders:
             if sbs is None:

@@ -50,6 +50,53 @@ def test_settings_requests_are_validated_and_bounded():
     assert session.take_live_patch() == {}
 
 
+def test_exit_fullscreen_is_immediate_without_changing_pending_media_or_status():
+    session = make_session()
+    seen = []
+
+    def leave():
+        assert not session._lock._is_owned()
+        seen.append("escape")
+        return True
+
+    session.server = Namespace(exit_fullscreen=leave)
+    session.submit("apply", {"stream_fps": 60})
+    before = session.snapshot()
+    session.submit("exit_fullscreen", {})
+    assert seen == ["escape"]
+    assert session.snapshot() == before
+    assert session._request == ("apply", {"stream_fps": 60})
+    assert session._controls == set()
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_exit_fullscreen_rejection_does_not_request_media_reload(available):
+    session = make_session()
+    if available:
+        session.server = Namespace(exit_fullscreen=lambda: False)
+    with pytest.raises(ValueError, match="退出"):
+        session.submit("exit_fullscreen", {})
+    assert not session.run_stop.is_set() and session._request is None
+
+
+def test_exit_fullscreen_does_not_accept_settings_payload_or_queue_backend_failure():
+    session = make_session()
+    calls = []
+
+    def fail():
+        calls.append("escape")
+        raise RuntimeError("Windows rejected the Quest key tap")
+
+    session.server = Namespace(exit_fullscreen=fail)
+    with pytest.raises(ValueError):
+        session.submit("exit_fullscreen", {"stream_fps": 60})
+    assert calls == []
+    with pytest.raises(RuntimeError):
+        session.submit("exit_fullscreen", {})
+    assert calls == ["escape"]
+    assert not session.run_stop.is_set() and session._request is None
+
+
 def test_snapshot_is_owned_and_pending_configuration_is_not_claimed_applied():
     session = make_session()
     session.submit("apply", {"stream_fps": 60})
