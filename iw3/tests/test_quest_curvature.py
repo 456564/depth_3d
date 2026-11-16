@@ -31,7 +31,7 @@ def cylinder(**changes: Any) -> dict[str, Any]:
 def read_layers(client: Any) -> list[dict[str, Any]]:
     kind, payload = read_message(client)
     assert kind == 0x11
-    return json.loads(payload)["camadas"]
+    return [layer for layer in json.loads(payload)["camadas"] if layer.get("tex") == "video"]
 
 
 @pytest.fixture
@@ -260,6 +260,8 @@ def test_curved_screen_drag_scale_distance_and_recenter_keep_midpoint_semantics(
         read_layers(client)
         data["maos"][side]["aperto"] = True
         send_json(client, 0x83, data)
+        # 独立射线在开始抓屏时立即消失，随后才发送移动后的几何。
+        assert read_layers(client)[0]["raio"] == pytest.approx(7.2 / math.pi)
         threading.Event().wait(0.05)
         data["maos"][side].update(pos=[0.2, 0.1, 0], analogico=[0.9, 0.9])
         send_json(client, 0x83, data)

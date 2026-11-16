@@ -29,7 +29,7 @@ def packet(
 def read_layers(client: socket.socket) -> list[dict[str, Any]]:
     kind, payload = read_message(client)
     assert kind == 0x11
-    layers = json.loads(payload)["camadas"]
+    layers = [layer for layer in json.loads(payload)["camadas"] if layer.get("tex") == "video"]
     left, right = layers
     assert left["olho"] == "esq" and right["olho"] == "dir"
     assert left["rect"] == [0, 0, 64, 64] and right["rect"] == [64, 0, 64, 64]
@@ -106,6 +106,8 @@ def test_screen_grab_releases_pc_mouse_and_does_not_click_or_switch_video() -> N
             backend.wait("down")
             send_json(client, 0x83, packet("dir", grip=True, trigger=True))
             backend.wait("up")
+            # 抓取先撤下独立射线；这包不改变视频几何。
+            assert read_layers(client)[0]["pos"] == [0, 0, -3]
             threading.Event().wait(0.05)
             send_json(client, 0x83, packet("dir", grip=True, position=[0.3, 0, 0], stick=[0.8, -0.9], trigger=True))
             layers = read_layers(client)

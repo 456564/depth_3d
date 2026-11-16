@@ -65,6 +65,32 @@ def controller(backend: Backend) -> Any:
     return importlib.import_module("iw3.desktop.quest_input").QuestController(backend)
 
 
+def test_valid_pc_move_returns_a_native_pointer_on_the_same_surface() -> None:
+    backend = Backend()
+    laser = controller(backend).update(entrada(pos=[1, 0.5, 0]), quad(rot=[0, 0, 0, 7]))
+    assert backend.events == [("move", 0.75, 0.25)]
+    assert laser == {"tipo": "laser", "mao": "dir", "ponto": [1.0, 0.5, -3.0]}
+
+
+def test_native_pointer_uses_the_world_point_of_a_rotated_surface() -> None:
+    rotation = [0, math.sqrt(0.5), 0, math.sqrt(0.5)]
+    laser = controller(Backend()).update(entrada(pos=[0, 0.5, -1], rot=rotation), quad(pos=[-3, 0, 0], rot=rotation))
+    assert laser["ponto"] == pytest.approx([-3, 0.5, -1])
+
+
+@pytest.mark.parametrize("blocked", ["focus", "miss", "backend"])
+def test_invalid_pc_move_does_not_return_a_native_pointer(blocked: str) -> None:
+    backend = Backend()
+    data = entrada()
+    if blocked == "focus":
+        data["estado"] = "visivel"
+    elif blocked == "miss":
+        data["maos"]["dir"]["pos"] = [10, 0, 0]
+    else:
+        backend.allowed = False
+    assert controller(backend).update(data, quad()) is None
+
+
 def test_reset_cleans_pending_keys_even_without_a_mouse_press() -> None:
     backend = Backend()
     control = controller(backend)

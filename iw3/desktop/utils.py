@@ -443,7 +443,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 crop_left=args.crop_left,
                 crop_right=args.crop_right,
                 crop_bottom=args.crop_bottom,
-                draw_cursor_enabled=not args.disable_draw_cursor,
+                draw_cursor_enabled=not (args.disable_draw_cursor or (args.quest and args.quest_control)),
             )
             screen_width, screen_height = screenshot_thread.init_capture(stop_event=args.state["stop_event"])
         elif args.window_name:
@@ -583,7 +583,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 crop_left=args.crop_left,
                 crop_right=args.crop_right,
                 crop_bottom=args.crop_bottom,
-                draw_cursor_enabled=not args.disable_draw_cursor,
+                draw_cursor_enabled=not (args.disable_draw_cursor or (args.quest and args.quest_control)),
                 **(
                     {"window_handle": backend.hwnd, "monitor_target": backend.monitor_target, "fit_window": True}
                     if args.quest_control

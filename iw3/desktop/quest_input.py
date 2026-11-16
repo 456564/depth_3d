@@ -103,7 +103,7 @@ class QuestController:
         self.reset()
         return self.backend.move(0.5, 0.5) and self.backend.tap_key("escape")
 
-    def update(self, data: Any, quad: dict[str, Any]) -> None:
+    def update(self, data: Any, quad: dict[str, Any]) -> dict[str, Any] | None:
         self.expire()
         hands = data.get("maos") if isinstance(data, dict) and data.get("estado") == "focado" else None
         hand = hands.get("dir") if isinstance(hands, dict) else None
@@ -112,10 +112,22 @@ class QuestController:
         trigger = hand.get("gatilho") if isinstance(hand, dict) else None
         if uv is None or stick is None or any(abs(v) > 1 for v in stick) or type(trigger) is not bool:
             self.reset()
-            return
+            return None
         if not self.backend.move(*uv):
             self.reset()
-            return
+            return None
+        # 已验证 hand/quad 字段：UV[2] → 本地表面点[3] → 世界点[3]，不把光标烘入视频RGB。
+        u, v = uv
+        if quad.get("tipo") == "cilindro":
+            radius, angle, aspect = quad["raio"], quad["angulo"], quad["aspecto"]
+            theta = (u - 0.5) * angle
+            local = [radius * math.sin(theta), (0.5 - v) * radius * angle / aspect, -radius * math.cos(theta)]
+        else:
+            local = [(u - 0.5) * quad["tam"][0], (0.5 - v) * quad["tam"][1], 0.0]
+        rotation = quad["rot"]
+        norm = math.hypot(*rotation)
+        point = _rotate([value / norm for value in rotation], local)
+        pointer = {"tipo": "laser", "mao": "dir", "ponto": [a + b for a, b in zip(quad["pos"], point)]}
         self._last_valid = time.monotonic()
         if trigger:
             self._stick_armed = False
@@ -125,7 +137,8 @@ class QuestController:
                 self._pressed = True
                 if not self.backend.mouse_down():
                     self.reset()
-            return
+                    return None
+            return pointer
         self._trigger_armed = True
         if self._pressed:
             self.backend.mouse_up()
@@ -138,3 +151,5 @@ class QuestController:
             self._stick_armed = False
             if not self.backend.tap_key("up" if y > 0 else "down"):
                 self.reset()
+                return None
+        return pointer

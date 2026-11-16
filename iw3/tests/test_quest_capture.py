@@ -64,6 +64,105 @@ def test_mss_without_window_crop_keeps_original_frame_and_cursor_origin(
     np.testing.assert_array_equal(frame, source)
 
 
+@pytest.mark.parametrize("backend", ["mss", "windows_capture"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_capture_cursor_switch_reaches_native_backend(
+    monkeypatch: pytest.MonkeyPatch, backend: str, enabled: bool
+) -> None:
+    options = []
+    source = np.full((8, 10, 4), [25, 50, 100, 255], dtype=np.uint8)
+    buffer = bytearray(source.nbytes)
+
+    class NativeCapture:
+        def __init__(self, **kwargs: Any) -> None:
+            options.append(kwargs)
+
+        def event(self, handler: Any) -> None:
+            setattr(self, handler.__name__, handler)
+
+        def start(self) -> None:
+            self.on_frame_arrived(SimpleNamespace(frame_buffer=source), SimpleNamespace())  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(capture, "WindowsCaptureMSS", NativeCapture)
+    monkeypatch.setitem(sys.modules, "windows_capture", SimpleNamespace(WindowsCapture=NativeCapture))
+    monkeypatch.setattr(capture.time, "sleep", lambda _: None)
+    capture.capture_process(
+        source.shape,
+        0,
+        None,
+        SimpleNamespace(buf=buffer),
+        [0, 0],
+        threading.Lock(),
+        threading.Event(),
+        threading.Event(),
+        backend,
+        draw_cursor_enabled=enabled,
+    )
+    assert options[0]["cursor_capture"] is (enabled if backend == "mss" else None if enabled else False)
+    np.testing.assert_array_equal(np.ndarray(source.shape, dtype=np.uint8, buffer=buffer), source)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mss_cursor_switch_controls_the_actual_grab(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    options = []
+    frames = []
+
+    class MSS:
+        monitors = [None, {"left": 0, "top": 0, "width": 10, "height": 8}]
+
+        def __init__(self, **kwargs: Any) -> None:
+            options.append(kwargs)
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def grab(self, position: Any) -> np.ndarray:
+            return np.full((8, 10, 4), 37, dtype=np.uint8)
+
+    monkeypatch.setitem(sys.modules, "mss", SimpleNamespace(mss=MSS))
+    native = capture.WindowsCaptureMSS(cursor_capture=enabled)
+
+    @native.event
+    def on_frame_arrived(frame: Any, control: Any) -> None:
+        frames.append(frame.frame_buffer)
+        control.stop()
+
+    @native.event
+    def on_closed() -> None:
+        pass
+
+    native.start()
+    assert options == [{"with_cursor": enabled}]
+    assert frames[0].shape == (8, 10, 4)
+    assert (frames[0] == 37).all()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_capture_thread_sends_its_cursor_switch_to_the_child(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    import torch
+
+    processes = []
+
+    def process(**kwargs: Any) -> Any:
+        processes.append(kwargs)
+        return SimpleNamespace(start=lambda: None)
+
+    monkeypatch.setattr(capture, "get_screen_size", lambda _: (10, 8))
+    monkeypatch.setattr(capture.mp, "Process", process)
+    thread = capture.ScreenshotProcess(30, 10, 8, 0, None, torch.device("cpu"), draw_cursor_enabled=enabled)
+    try:
+        thread.start_process()
+        assert processes[0]["target"] is capture.capture_process
+        assert processes[0]["args"][-1] is enabled
+    finally:
+        if thread.process_frame_buffer is not None:
+            thread.process_frame_buffer.close()
+            thread.process_frame_buffer.unlink()
+
+
 class CaptureWindows:
     def __init__(self) -> None:
         self.rect = (100, 100, 110, 108)

@@ -207,11 +207,16 @@ def test_background_does_not_change_pc_mapping_or_grab_target(server: Any) -> No
         data["maos"]["dir"]["aperto"] = True
         send_json(client, 0x83, data)
         backend.wait("up")
+        assert all(layer["tipo"] != "laser" for layer in read_layers(client))
         # 射线命中背景但错过主视频，不能开始新的抓取。
         data = entrada()
         send_json(client, 0x83, data)
+        # 松握柄首包用于结束抓取；下一包恢复网页控制，用wire射线确认已处理。
+        send_json(client, 0x83, data)
+        assert read_layers(client)[-1]["tipo"] == "laser"
         data["maos"]["dir"].update(pos=[2.5, 0, 0], aperto=True)
         send_json(client, 0x83, data)
+        assert all(layer["tipo"] != "laser" for layer in read_layers(client))
         with server._layer_lock:
             assert server._screen is not None and not server._screen.active
 

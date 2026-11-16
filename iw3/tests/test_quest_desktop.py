@@ -284,8 +284,9 @@ def test_gui_switches_native_web_and_local_without_changing_saved_web_settings(m
         (True, False, "wc_cuda", True),
     ],
 )
+@pytest.mark.parametrize("disable_cursor", [False, True])
 def test_failed_startup_or_stop_still_cleans_capture_and_depth(
-    monkeypatch, control: bool, binding_fails: bool, capture_kind: str, monitor: bool
+    monkeypatch, control: bool, binding_fails: bool, capture_kind: str, monitor: bool, disable_cursor: bool
 ) -> None:
     import torch
 
@@ -379,6 +380,7 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
             raise RuntimeError("simulated stop failure")
 
     args = desktop.create_parser().parse_args(["--quest", "--bind-addr", "127.0.0.1"])
+    args.disable_draw_cursor = disable_cursor
     if control:
         args.quest_control = True
         args.window_name = None if monitor else "Browser"
@@ -409,11 +411,14 @@ def test_failed_startup_or_stop_still_cleans_capture_and_depth(
     assert bound == ([expected_binding] if control else [])
     assert len(controllers) == int(control and not binding_fails)
     assert len(captures) == int(not binding_fails)
+    if captures:
+        assert captures[0].kwargs["draw_cursor_enabled"] is (not control and not disable_cursor)
     if mapping_getters:
         assert mapping_getters[0]() is None
     if controllers:
         assert isinstance(controllers[0], quest_input.QuestController)
         assert isinstance(controllers[0].backend, InputBackend)
+    assert args.disable_draw_cursor is disable_cursor
 
 
 def test_loaded_audio_gain_label_matches_restored_slider(monkeypatch) -> None:

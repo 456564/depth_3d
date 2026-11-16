@@ -172,11 +172,12 @@ class CaptureControlMSS:
 
 
 class WindowsCaptureMSS:
-    def __init__(self, monitor_index=0, window_name=None, window_handle=None, monitor_target=None):
+    def __init__(self, monitor_index=0, window_name=None, window_handle=None, monitor_target=None, cursor_capture=True):
         self.window_name = window_name
         self.monitor_index = monitor_index
         self.window_handle = window_handle
         self.monitor_target = monitor_target
+        self.cursor_capture = cursor_capture
 
     def event(self, handler):
         if handler.__name__ == "on_frame_arrived":
@@ -191,7 +192,7 @@ class WindowsCaptureMSS:
 
         control = CaptureControlMSS()
         while True:
-            with mss.mss(with_cursor=True) as sct:
+            with mss.mss(with_cursor=self.cursor_capture) as sct:
                 tick = time.perf_counter()
                 if self.window_handle is not None:
                     geometry = _window_geometry(self.window_handle, "mss")
@@ -493,6 +494,7 @@ def capture_process(
     fit_window=False,
     frame_mapping=None,
     monitor_target=None,
+    draw_cursor_enabled=True,
 ):
     frame_buffer = np.ndarray(frame_size, dtype=np.uint8, buffer=frame_shm.buf)
     frame_count = 0
@@ -519,7 +521,9 @@ def capture_process(
         options = {"window_handle": window_handle} if window_handle is not None else {}
         if monitor_target is not None:
             options["monitor_target"] = monitor_target
-        capture = WindowsCaptureMSS(monitor_index=monitor_index, window_name=window_name, **options)
+        capture = WindowsCaptureMSS(
+            monitor_index=monitor_index, window_name=window_name, cursor_capture=draw_cursor_enabled, **options
+        )
     elif backend == "windows_capture":
         try:
             from windows_capture import WindowsCapture
@@ -544,7 +548,7 @@ def capture_process(
             if matches != [window_handle] or win32gui.FindWindow(None, window_name) != window_handle:
                 raise RuntimeError("Capture title no longer identifies the fixed window")
         capture = WindowsCapture(
-            cursor_capture=None,
+            cursor_capture=None if draw_cursor_enabled else False,
             draw_border=None,
             monitor_index=monitor_index,
             window_name=window_name,
@@ -790,6 +794,7 @@ class ScreenshotProcess(threading.Thread):
                 self.fit_window,
                 self.process_frame_mapping,
                 self.monitor_target,
+                self.draw_cursor_enabled,
             ),
         )
         self.process.start()

@@ -107,6 +107,8 @@ class QuestServer:
         self._menu: Any = None
         self._screen: QuestScreen | None = None
         self._last_input: float | None = None
+        self._pointer: dict[str, Any] | None = None
+        self._pointer_tick = -math.inf
         self._recenter_requested = threading.Event()
         self._sent_layers: dict[str, Any] = self._layers()
         self._sent_quad = {key: self._main_video(self._sent_layers)[key].copy() for key in ("pos", "rot", "tam")}
@@ -247,7 +249,7 @@ class QuestServer:
             with self._condition:
                 if self._shutdown.is_set():
                     raise RuntimeError("Quest服务尚未启动")
-                remove_ambient = video and self._ambient_visible
+                remove_layers = video and (self._ambient_visible or self._pointer is not None)
                 if video:
                     self._generation += 1
                     self._pending = None
@@ -258,12 +260,16 @@ class QuestServer:
                     self._audio_request = request
                 connection = self._connection
                 self._condition.notify_all()
-            if remove_ambient and connection is not None:
+            if video:
                 with self._layer_lock:
-                    try:
-                        self._send_layers(connection)
-                    except OSError:
-                        self._disconnect(connection)
+                    if connection is not None:
+                        remove_layers = remove_layers or self._pointer is not None
+                        self._control(connection, "reset")
+                        if remove_layers:
+                            try:
+                                self._send_layers(connection)
+                            except OSError:
+                                self._disconnect(connection)
             # 不持condition等待：owner必须取得同一锁来完成命令。
             if not request.done.wait(5):
                 with self._condition:
@@ -423,6 +429,9 @@ class QuestServer:
 
     def set_controller_factory(self, factory: Callable[[], QuestController] | None) -> None:
         with self._layer_lock:
+            had_pointer = self._pointer is not None
+            self._pointer = None
+            self._pointer_tick = -math.inf
             with self._condition:
                 connection = self._connection
                 self._controller_factory = factory
@@ -435,14 +444,26 @@ class QuestServer:
                     self._controller = replacement
                 elif replacement is not None:
                     replacement.reset()
+            if had_pointer and connection is not None:
+                try:
+                    self._send_layers(connection)
+                except OSError:
+                    self._disconnect(connection)
 
     def recenter(self) -> None:
         self._recenter_requested.set()
-        with self._condition:
-            connection = self._connection
-        self._reset_input()
-        if connection is not None:
-            self._control(connection, "reset")
+        with self._layer_lock:
+            with self._condition:
+                connection = self._connection
+            had_pointer = self._pointer is not None
+            self._reset_input()
+            if connection is not None:
+                self._control(connection, "reset")
+                if had_pointer:
+                    try:
+                        self._send_layers(connection)
+                    except OSError:
+                        self._disconnect(connection)
 
     def exit_fullscreen(self) -> bool:
         with self._layer_lock:
@@ -535,7 +556,20 @@ class QuestServer:
         with self._condition:
             if connection is self._connection and self._controller is not None:
                 try:
-                    return getattr(self._controller, action)(*args)
+                    if action in ("reset", "exit_fullscreen"):
+                        self._pointer = None
+                        self._pointer_tick = -math.inf
+                    if action == "update" and (not self._video_enabled or self._suspended):
+                        return None
+                    result = getattr(self._controller, action)(*args)
+                    if action == "update":
+                        now = time.monotonic()
+                        if result is None:
+                            self._pointer = None
+                            self._pointer_tick = -math.inf
+                        elif result != self._pointer and now - self._pointer_tick >= 1 / 30:
+                            self._pointer, self._pointer_tick = result, now
+                    return result
                 except Exception as error:
                     raise RuntimeError(f"Quest手柄控制失败：{error}") from error
         return None
@@ -606,11 +640,21 @@ class QuestServer:
                     "rect": [0, 0, AmbientBackground.WIDTH, AmbientBackground.HEIGHT],
                 },
             )
+        if (
+            self._pointer is not None
+            and self._video_enabled
+            and not self._suspended
+            and not (self._screen is not None and self._screen.active)
+            and not (self._menu is not None and self._menu.visible)
+        ):
+            layers["camadas"].append(self._pointer)
         return layers
 
     def _reset_input(self) -> None:
         with self._layer_lock:
             self._last_input = None
+            self._pointer = None
+            self._pointer_tick = -math.inf
             if self._screen is not None:
                 self._screen.reset()
             if self._menu is not None:
@@ -761,7 +805,7 @@ class QuestServer:
             if self._last_input is not None:
                 menu_remaining = 0.5 - (time.monotonic() - self._last_input)
                 if menu_remaining <= 0:
-                    visible = self._menu is not None and self._menu.visible
+                    visible = (self._menu is not None and self._menu.visible) or self._pointer is not None
                     self._reset_input()
                     self._control(connection, "reset")
                     if visible:
@@ -847,7 +891,7 @@ class QuestServer:
                             with self._condition:
                                 if connection is not self._connection:
                                     return
-                            visible = self._menu is not None and self._menu.visible
+                            visible = (self._menu is not None and self._menu.visible) or self._pointer is not None
                             self._reset_input()
                             self._control(connection, "reset")
                             if visible:
@@ -898,10 +942,11 @@ class QuestServer:
                             self._menu.reset()
                         suppress_pc = self._menu.update(data, video_quad) if self._menu is not None else False
                         if suppress_pc:
-                            self._control(connection, "reset")
                             screen.reset()
                         else:
                             suppress_pc = screen.update(data, self._main_video(self._sent_layers))
+                        if suppress_pc:
+                            self._control(connection, "reset")
                         quad = screen.quad
                         layers = self._layers((quad["pos"], quad["rot"]), quad["tam"])
                         if self._menu is not None:
@@ -912,15 +957,23 @@ class QuestServer:
                             texture = self._menu.texture()
                             if texture is not None:
                                 self._send(connection, 0x10, texture)
-                        if recentered or (
-                            layers != self._sent_layers and (not screen.active or now - sent_at >= 1 / 30)
+                        geometry_sent = False
+                        if self._main_video(layers) != self._main_video(self._sent_layers) and (
+                            recentered or not screen.active or now - sent_at >= 1 / 30
                         ):
+                            self._pointer = None
+                            self._pointer_tick = -math.inf
                             self._send_layers(connection, quad)
                             sent_at = now
-                        if suppress_pc:
-                            self._control(connection, "reset")
-                        else:
+                            geometry_sent = True
+                        if not suppress_pc:
                             self._control(connection, "update", data, self._main_video(self._sent_layers))
+                        # 几何先发成功，再用该表面计算PC坐标与射线；清除不受位置更新限频。
+                        layers = self._layers((self._sent_quad["pos"], self._sent_quad["rot"]), self._sent_quad["tam"])
+                        if self._menu is not None:
+                            layers["camadas"].extend(self._menu.layers())
+                        if layers != self._sent_layers or (recentered and not geometry_sent):
+                            self._send_layers(connection)
         except (OSError, ValueError):
             pass
         except Exception as error:
@@ -1034,11 +1087,12 @@ class QuestServer:
                 encoder = None
                 with self._layer_lock:
                     with self._condition:
-                        remove_ambient = self._ambient_visible
+                        remove_layers = self._ambient_visible or self._pointer is not None
                         self._video_enabled = False
                         self._pending = None
                         self._reset_ambient()
-                    if remove_ambient:
+                    self._control(connection, "reset")
+                    if remove_layers:
                         try:
                             self._send_layers(connection)
                         except OSError:
