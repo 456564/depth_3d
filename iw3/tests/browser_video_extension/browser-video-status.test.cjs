@@ -325,7 +325,7 @@ test('an authentication rejection stays visible during automatic pairing retry',
 
 test('manifest opens a local status popup without adding permissions', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(directory,'manifest.json'),'utf8'));
-  assert.equal(manifest.version,'1.1.4');
+  assert.equal(manifest.version,'1.2.0');
   assert.equal(manifest.action?.default_popup,'popup.html');
   assert.equal(manifest.permissions,undefined);
   assert.deepEqual(manifest.host_permissions,['http://127.0.0.1/*']);
@@ -437,4 +437,33 @@ test('popup distinguishes current MAIN media from stale relay video snapshots', 
   const live=popup(status); await settle();
   assert.match(live.element('input').textContent,/MediaStream/);
   assert.equal(live.element('size').textContent,'540 × 960');
+});
+
+test('background exposes only the current fullscreen request and its own acknowledgement', async () => {
+  const b=background(); await b.send({kind:'diagnostics',diagnostics:diagnostics()});
+  await b.send({kind:'state',state:{...state(),fullscreen:true},focused:true});
+  const full=await b.send({kind:'status'},popupSender);
+  assert.equal(full.page.fullscreen,true); assert.equal(full.playback.fullscreen,true);
+  assert.equal(full.page.controllable,true);
+  b.advance(1100);
+  const stale=await b.send({kind:'status'},popupSender);
+  assert.equal(stale.page.fullscreen,null); assert.equal(stale.page.source,false);
+});
+
+test('popup reports fullscreen request delivery without claiming the runtime switched', async () => {
+  const status=connectedStatus(); Object.assign(status.page,{fullscreen:true,controllable:true});
+  const full=popup(status); await settle();
+  assert.match(full.element('fullscreen').textContent,/全屏/);
+  assert.match(full.element('route-request').textContent,/本机桥.*视频流/);
+  assert.match(full.element('route-request').textContent,/实际来源.*iw3/);
+  status.page.fullscreen=false;
+  const desktop=popup(status); await settle();
+  assert.match(desktop.element('fullscreen').textContent,/非全屏/);
+  assert.match(desktop.element('route-request').textContent,/请求桌面/);
+  status.page.controllable=false;
+  const pending=popup(status); await settle();
+  assert.match(pending.element('route-request').textContent,/等待.*确认/);
+  status.page.source=false; status.page.fullscreen=null;
+  const missing=popup(status); await settle();
+  assert.match(missing.element('fullscreen').textContent,/等待/);
 });

@@ -38,6 +38,7 @@ def _validate_state(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BridgeRequestError(400, "Invalid playback state")
     media_available = value.get("media_available", True)
+    fullscreen = value.get("fullscreen", False)
     dimensions = (value.get("width"), value.get("height"))
     valid_dimensions = all(type(size) is int and 0 < size <= 8192 for size in dimensions) or (
         media_available is False and all(type(size) is int and size == 0 for size in dimensions)
@@ -51,6 +52,7 @@ def _validate_state(value: Any) -> dict[str, Any]:
         or type(value.get("paused")) is not bool
         or not _number(value.get("playback_rate"), 0.05, 16)
         or type(media_available) is not bool
+        or type(fullscreen) is not bool
         or not valid_dimensions
         or (value.get("duration") is not None and not _number(value["duration"], 0, 604800))
     ):
@@ -70,6 +72,7 @@ def _validate_state(value: Any) -> dict[str, Any]:
         )
     }
     validated["media_available"] = media_available
+    validated["fullscreen"] = fullscreen
     return validated
 
 
@@ -338,6 +341,7 @@ class BrowserVideoBridge:
                 "state": status,
                 "status": status,
                 "fresh": fresh,
+                "fullscreen": state["fullscreen"] if state is not None else False,
                 "media_available": media_available,
                 "generation": state["generation"] if state is not None else None,
                 "width": state["width"] if state is not None else 0,

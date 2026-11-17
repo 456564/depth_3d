@@ -249,6 +249,18 @@ FIELDS = (
         choices=("pil", "mss", "wc_mp", "wc_cuda", "kwcapture", "obs", "browser_video"),
     ),
     Field(
+        "quest_auto_browser",
+        "抖音全屏自动视频流",
+        PAGES[3],
+        "bool",
+        help=(
+            "开：平时使用所选桌面来源，抖音当前视频进入H/Y网页全屏或原生全屏时切换为压缩视频/NVDEC，"
+            "明确退出全屏或网页失焦后回到桌面。全屏无受支持视频源、解码失败或心跳过期时显示等待，"
+            "不会悄悄用录屏冒充视频流。需新版扩展；手选browser_video仍固定纯视频，不受全屏限制。"
+            "自动模式须关闭补边、IPD偏移和旋转；桌面裁剪只作用于桌面。修改后应用并重新加载。"
+        ),
+    ),
+    Field(
         "monitor_index",
         "显示器编号",
         PAGES[3],
@@ -431,6 +443,8 @@ def validate_patch(
     if not check_constraints:
         return copy.deepcopy(patch)
     merged = {**(current or {}), **patch}
+    if merged.get("quest_auto_browser") and merged.get("pad_mode") not in {None, "tblr"}:
+        raise ValueError("抖音全屏自动视频流须关闭补边")
     if merged.get("screenshot") == "browser_video":
         if merged.get("pad_mode") not in {None, "tblr"}:
             raise ValueError("网页视频源须关闭补边")

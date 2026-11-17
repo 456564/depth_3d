@@ -568,19 +568,24 @@ class QuestMenu:
             "握柄抓住画面并移动：平移屏幕；同手摇杆：上下调远近、左右调大小。",
             "调整屏幕位置只改变观看大小，不增加源像素，也不是AI会聚。",
         ]
-        if values.get("screenshot") == "browser_video":
+        browser = values.get("source_kind") == "browser" or (
+            values.get("source_kind") is None and values.get("screenshot") == "browser_video"
+        )
+        if browser:
             decode_status = "NVDEC 已硬解" if values.get("hardware_active") else "NVDEC 等待有效帧"
             lines = [
                 "来源：网页压缩视频；无源时等待，不回退录屏。",
                 f"解码：{decode_status}；源尺寸：{values.get('source_size') or '等待'}。",
-                "声音沿用网页采音，视频跟随网页时间；尚无严格音画同步保证。",
+                "声音沿用 Windows 回环采音，视频跟随网页时间；尚无严格音画同步保证。",
             ]
+        elif values.get("quest_auto_browser"):
+            lines[0] = "来源：桌面捕获；抖音进入全屏后自动切压缩视频，退出恢复桌面。"
         for key, label in (
             ("depth_model", "当前模型"),
             ("method", "合成方法"),
             ("output_size", "输出尺寸"),
             ("estimated_fps", "电脑处理 FPS"),
-            ("screenshot_fps", "解码 FPS" if values.get("screenshot") == "browser_video" else "捕获 FPS"),
+            ("screenshot_fps", "解码 FPS" if browser else "捕获 FPS"),
             ("streaming_fps", "电脑发送 FPS"),
             ("bind_addr", "当前连接地址"),
             ("screen_surface", "当前屏幕形状"),
@@ -593,9 +598,7 @@ class QuestMenu:
         self._text(
             draw,
             (1020, 798),
-            "需开启控制、当前网页桥在线"
-            if values.get("screenshot") == "browser_video"
-            else "需开启电脑控制、目标位于前台",
+            "需开启控制、当前网页桥在线" if browser else "需开启电脑控制、目标位于前台",
             476,
             22,
         )

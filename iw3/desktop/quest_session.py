@@ -59,7 +59,12 @@ class QuestSession:
 
     def set_stats(self, **values: Any) -> None:
         with self._lock:
+            changed_source = values.get("source_kind") in {"desktop", "browser"} and values.get(
+                "source_kind"
+            ) != self._stats.get("source_kind")
             self._stats.update(copy.deepcopy(values))
+        if changed_source and self._fps_event is not None and hasattr(self._fps_event, "set_source_kind"):
+            self._fps_event.set_source_kind(values["source_kind"])
 
     def status(self, status: str, message: str) -> None:
         with self._lock:
@@ -155,14 +160,17 @@ class QuestSession:
             if self.server is not None:
                 self.server.check_error()
             self.apply_live()
+            if hasattr(capture, "poll_route"):
+                capture.poll_route()
             if hasattr(capture, "get_status"):
                 source = capture.get_status()
                 self.set_stats(
-                    input_source="网页压缩视频（不录屏）",
+                    source_kind=source.get("source_kind", "browser"),
+                    input_source=source.get("input_source", "网页压缩视频（不录屏）"),
                     decoder=source.get("decoder", "NVDEC"),
                     hardware_active=source.get("hardware_active", False),
                     source_size=source.get("source_size"),
-                    audio_path="网页音频采集；视频跟随网页时钟",
+                    audio_path=source.get("audio_path", "Windows 回环采音；网页视频跟随播放时钟"),
                 )
                 if hasattr(capture, "get_fps"):
                     self.set_stats(screenshot_fps=capture.get_fps())

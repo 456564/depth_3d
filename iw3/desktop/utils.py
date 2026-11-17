@@ -162,6 +162,9 @@ def create_parser():
     viewer = parser.add_mutually_exclusive_group()
     viewer.add_argument("--local-viewer", action="store_true", help="Use Local Viewer instead of Web Streaming")
     viewer.add_argument("--quest", action="store_true", help="HEVC LAN streaming to the Pop3D Quest app")
+    parser.add_argument(
+        "--quest-auto-browser", action="store_true", help="Automatically use compressed webpage video during fullscreen"
+    )
     parser.add_argument("--quest-bitrate", type=int, default=35, help="Quest HEVC bitrate in Mbps (5-100)")
     parser.add_argument("--quest-no-audio", action="store_true", help="Disable PC speaker audio in Quest mode")
     parser.add_argument("--quest-audio-source", choices=["process", "speaker"], default="process")
@@ -241,6 +244,18 @@ def create_parser():
 
 def prepare_quest_args(args: Namespace) -> None:
     browser_video = args.screenshot == "browser_video"
+    auto_browser = getattr(args, "quest_auto_browser", False)
+    if auto_browser:
+        if not args.quest:
+            raise ValueError("抖音全屏自动视频流需要 Quest 模式")
+        if (
+            args.pad is not None
+            or args.pad_mode not in {None, "tblr"}
+            or args.ipd_offset != 0
+            or args.rotate_left
+            or args.rotate_right
+        ):
+            raise ValueError("抖音全屏自动视频流需要关闭补边、IPD偏移和旋转；桌面窗口裁剪仍可使用")
     if browser_video:
         if not args.quest:
             raise ValueError("Browser video source requires Quest mode")
@@ -395,9 +410,13 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
             )
 
     browser_video = args.screenshot == "browser_video"
-    if browser_video:
+    auto_browser = bool(args.quest and getattr(args, "quest_auto_browser", False) and not browser_video)
+    versioned_source = browser_video or auto_browser
+    if versioned_source:
         from .browser_video_bridge import BrowserVideoBridge
         from .media_video_source import MediaVideoSource
+    if browser_video:
+        pass
     elif args.screenshot == "pil":
         screenshot_factory = ScreenshotThreadPIL
     elif args.screenshot == "mss":
@@ -447,9 +466,10 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
     browser_bridge = None
     server = None
     try:
-        if browser_video:
+        if versioned_source:
             browser_bridge = BrowserVideoBridge()
             browser_bridge.start()
+        if browser_video:
             screenshot_thread = MediaVideoSource(browser_bridge.snapshot, device, fps=args.stream_fps)
             screen_width, screen_height = 1920, 1080
         elif args.screenshot == "obs":
@@ -512,6 +532,8 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
         if args.quest:
             frame_height -= frame_height % 2
             frame_width -= frame_width % 2
+        desktop_frame_size = (frame_width, frame_height)
+        desktop_screen_size = screen_size
 
         if screenshot_thread is not None and not browser_video:
             screenshot_thread.set_frame_size(frame_width, frame_height)
@@ -603,11 +625,18 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 fit_window=args.fit_window,
             )
 
-        if screenshot_thread is None:
-            screenshot_thread = screenshot_factory(
+        desktop_backend = backend if args.quest_control and not browser_video else None
+        initial_capture = screenshot_thread if not browser_video else None
+
+        def create_desktop_capture():
+            nonlocal initial_capture
+            if initial_capture is not None:
+                capture, initial_capture = initial_capture, None
+                return capture
+            capture = screenshot_factory(
                 fps=args.stream_fps,
-                frame_width=frame_width,
-                frame_height=frame_height,
+                frame_width=desktop_frame_size[0],
+                frame_height=desktop_frame_size[1],
                 monitor_index=args.monitor_index,
                 window_name=args.window_name,
                 device=device,
@@ -617,11 +646,71 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 crop_bottom=args.crop_bottom,
                 draw_cursor_enabled=not (args.disable_draw_cursor or (args.quest and args.quest_control)),
                 **(
-                    {"window_handle": backend.hwnd, "monitor_target": backend.monitor_target, "fit_window": True}
+                    {
+                        "window_handle": desktop_backend.hwnd,
+                        "monitor_target": desktop_backend.monitor_target,
+                        "fit_window": True,
+                    }
                     if args.quest_control
                     else {}
                 ),
             )
+            if args.screenshot == "obs":
+                try:
+                    capture.init_capture(stop_event=args.state["stop_event"])
+                    capture.set_frame_size(*desktop_frame_size)
+                except Exception:
+                    capture.stop()
+                    raise
+            return capture
+
+        count = last_status_time = 0
+        fps_counter = deque(maxlen=120)
+        prev_divergence = args.divergence
+        browser_blanked = False
+        processed_source_generation = None
+
+        def blank_browser_frame():
+            nonlocal browser_blanked
+            if not browser_blanked:
+                server.discard_video_frames()
+                black = torch.zeros((3, output_frame_height, output_frame_width), device=device)
+                server.set_frame_data((black, time.perf_counter()))
+                browser_blanked = True
+
+        def switch_source(kind, epoch):
+            nonlocal browser_video, browser_blanked, frame_width, frame_height, screen_size
+            browser_video = kind == "browser"
+            # 同一连接/音频 owner 保持；先释放旧输入，再屏障旧 SBS 与环境光。
+            server.set_controller_factory(None)
+            browser_blanked = False
+            blank_browser_frame()
+            server.set_reference_aspect(16 / 9 if browser_video else None)
+            if not browser_video:
+                frame_width, frame_height = desktop_frame_size
+                screen_size = desktop_screen_size
+            if args.quest_control:
+                from .browser_input import BrowserInput
+                from .quest_input import QuestController
+
+                selected_backend = BrowserInput(browser_bridge) if browser_video else desktop_backend
+                server.set_controller_factory(lambda: QuestController(selected_backend))
+            if session is not None:
+                session.set_stats(source_kind=kind)
+            elif args.state["fps_event"] is not None and hasattr(args.state["fps_event"], "set_source_kind"):
+                args.state["fps_event"].set_source_kind(kind)
+
+        if auto_browser:
+            from .source_router import SourceRouter
+
+            screenshot_thread = SourceRouter(
+                browser_bridge,
+                create_desktop_capture,
+                lambda: MediaVideoSource(browser_bridge.snapshot, device, fps=args.stream_fps),
+                switch_source,
+            )
+        elif screenshot_thread is None:
+            screenshot_thread = create_desktop_capture()
 
         if args.compile:
             depth_model.compile()
@@ -648,30 +737,22 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
             if args.state["fps_event"] is not None:
                 args.state["fps_event"].set_url(None)
 
-        count = last_status_time = 0
-        fps_counter = deque(maxlen=120)
-        prev_divergence = args.divergence
-        browser_blanked = False
-        processed_source_generation = None
-
-        def blank_browser_frame():
-            nonlocal browser_blanked
-            if not browser_blanked:
-                server.discard_video_frames()
-                black = torch.zeros((3, output_frame_height, output_frame_width), device=device)
-                server.set_frame_data((black, time.perf_counter()))
-                browser_blanked = True
-
-        if browser_video:
+        if browser_video and not auto_browser:
             blank_browser_frame()
 
         while True:
-            if browser_video and session is None and not screenshot_thread.frame_set_event.wait(0.1):
+            if args.state["stop_event"] and args.state["stop_event"].is_set():
+                break
+            if auto_browser:
+                screenshot_thread.poll_route()
+            if versioned_source and session is None and not screenshot_thread.frame_set_event.wait(0.1):
                 frame = None
             else:
                 frame = session.read_frame(screenshot_thread) if session is not None else screenshot_thread.get_frame()
+            if auto_browser:
+                browser_video = screenshot_thread.source_kind == "browser"
             if frame is None:
-                if browser_video and screenshot_thread.is_alive():
+                if versioned_source and screenshot_thread.is_alive():
                     generation = screenshot_thread.get_frame_generation()
                     if not screenshot_thread.is_current_generation(generation):
                         blank_browser_frame()
@@ -679,11 +760,12 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                         server.refresh_ambient_frame()
                     continue
                 break
-            source_generation = screenshot_thread.get_frame_generation() if browser_video else None
-            if browser_video:
+            source_generation = screenshot_thread.get_frame_generation() if versioned_source else None
+            if versioned_source:
                 if not screenshot_thread.is_current_generation(source_generation):
                     blank_browser_frame()
                     continue
+            if browser_video:
                 # 实测源 RGB 为 CUDA float32[3,H,W]；按原比例缩放，不回填桌面 canvas。
                 screen_height, screen_width = frame.shape[-2:]
                 screen_size = (screen_width, screen_height)
@@ -714,7 +796,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     if args.method in {"mlbw_l2", "mlbw_l4", "mlbw_l2s", "mlbw_l4s"}:
                         side_model = try_switch_mlbw_model(prev_divergence, args.divergence, side_model, args)
                     prev_divergence = args.divergence
-                if browser_video and source_generation != processed_source_generation:
+                if versioned_source and source_generation != processed_source_generation:
                     blank_browser_frame()
                     # 换条清空深度/会聚时序，不重载权重；reset 保留现有 EMA decay 和 buffer_size。
                     depth_model.reset()
@@ -723,7 +805,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     processed_source_generation = source_generation
                 sbs = IW3U.process_image(frame, args, depth_model, side_model, autocrop_uncrop=True)
 
-            if browser_video:
+            if versioned_source:
                 if not screenshot_thread.is_current_generation(source_generation):
                     blank_browser_frame()
                     continue
@@ -742,7 +824,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 server.set_ambient_frame(frame, content_rect=content_rect, sbs=sbs)
             with args.state["args_lock"]:
                 if args.quest:
-                    if browser_video and not screenshot_thread.is_current_generation(source_generation):
+                    if versioned_source and not screenshot_thread.is_current_generation(source_generation):
                         blank_browser_frame()
                         continue
                     server.set_frame_data((sbs, tick))

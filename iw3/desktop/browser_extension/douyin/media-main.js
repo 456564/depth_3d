@@ -2,9 +2,9 @@
 (() => {
   'use strict';
   const channel = 'iw3-browser-video-v1';
-  const diagnostics = {version: '1.1.4', stage: 'starting', ticks: 0, mse_urls: 0, blob_urls: 0, other_urls: 0,
+  const diagnostics = {version: '1.2.0', stage: 'starting', ticks: 0, mse_urls: 0, blob_urls: 0, other_urls: 0,
     video_tracks: 0, audio_tracks: 0, other_tracks: 0, appends: 0, bytes: 0, chunks: 0, states: 0, current: 'none',
-    src_object_type: 'none', width: 0, height: 0, current_rtc: false, rtc_video_tracks: 0, rtc_transform_supported: false};
+    src_object_type: 'none', width: 0, height: 0, current_rtc: false, rtc_video_tracks: 0, rtc_transform_supported: false, fullscreen:false};
   function publishDiagnostics() {
     if (document.documentElement) document.documentElement.dataset.iw3VideoMain = JSON.stringify(diagnostics);
   }
@@ -34,7 +34,7 @@
       };
     }
   } catch {}
-  let serial = 0, target;
+  let serial = 0, target, fullscreenRoot;
   function sourceRecord(source) {
     if (!sources.has(source)) sources.set(source, { id: crypto.randomUUID(), tracks: [] });
     return sources.get(source);
@@ -108,30 +108,53 @@
     }
     return result;
   };
+  function validFullscreenRoot(root) {
+    const native = document.fullscreenElement;
+    return !!root?.isConnected && (native ? native === root : root.classList?.contains('isCssFullScreen') === true);
+  }
+  function videoFullscreenRoot(video) {
+    const native = document.fullscreenElement;
+    if (native && (native === video || native.contains(video))) return native;
+    const css = video.closest('.isCssFullScreen');
+    return validFullscreenRoot(css) ? css : undefined;
+  }
   function activeVideo() {
-    let selected, area = 0;
+    let selected, selectedRoot, area = 0;
+    const bound = validFullscreenRoot(fullscreenRoot) ? fullscreenRoot : undefined;
     for (const video of document.querySelectorAll('video')) {
+      const native = document.fullscreenElement;
+      if (native && native !== video && !native.contains(video)) continue;
+      const root = videoFullscreenRoot(video);
+      // 切条移除video时仍绑定原全屏容器，不让页面预览抢走目标。
+      if (bound && bound !== video && !bound.contains(video) && !root) continue;
       const r = video.getBoundingClientRect();
       const visible = Math.max(0, Math.min(r.right, innerWidth) - Math.max(0, r.left)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(0, r.top));
-      if (visible > area) { selected = video; area = visible; }
+      if (visible > 0 && (root && !selectedRoot || !!root === !!selectedRoot && visible > area)) {
+        selected = video; selectedRoot = root; area = visible;
+      }
     }
-    return selected;
+    return {video:selected,root:selectedRoot};
   }
   function current() {
-    const video = activeVideo();
-    if (!video) { target = undefined; return {}; }
-    const src = video.currentSrc, object = video.srcObject;
-    const source = !object && video.videoWidth && video.videoHeight ? blobs.get(src) : undefined;
+    const {video,root} = activeVideo();
+    if (root) fullscreenRoot = root;
+    else if (!validFullscreenRoot(fullscreenRoot)) fullscreenRoot = undefined;
+    const fullscreen = !!fullscreenRoot && document.visibilityState !== 'hidden' && document.hasFocus();
+    if (!video && !target && !fullscreen) return {};
+    const src = video?.currentSrc, object = video?.srcObject;
+    const source = !object && video?.videoWidth && video.videoHeight ? blobs.get(src) : undefined;
     const track = source?.tracks.find(t => /^video\//i.test(t.mime) && t.sequence > 0 && !t.failed);
-    // 操作代次随连续目标身份改变；压缩缓存键只在页面与relay之间复用。
-    if (!target || target.video !== video || target.src !== src || target.object !== object || target.media_generation !== track?.generation)
-      target = {video,src,object,media_generation:track?.generation,generation:`${session}:${crypto.randomUUID()}`};
-    return { video, track, generation:target.generation };
+    // 操作代次隔离全屏/前台切换；压缩缓存键不随路由变化，回切可重放初始化。
+    if (!target || target.video !== video || target.src !== src || target.object !== object || target.media_generation !== track?.generation ||
+      target.fullscreen !== fullscreen || target.root !== fullscreenRoot)
+      target = {video,src,object,media_generation:track?.generation,fullscreen,root:fullscreenRoot,generation:`${session}:${crypto.randomUUID()}`};
+    return { video, track, fullscreen, generation:target.generation };
   }
-  setInterval(() => {
-    const { video, track, generation } = current();
+  function publishState() {
+    const { video, track, fullscreen, generation } = current();
     const object = video?.srcObject;
     diagnostics.ticks++;
+    diagnostics.fullscreen = fullscreen === true;
     diagnostics.width = video?.videoWidth || 0; diagnostics.height = video?.videoHeight || 0;
     diagnostics.src_object_type = !object ? 'none' : typeof MediaStream === 'function' && object instanceof MediaStream ? 'media_stream' :
       typeof MediaSourceHandle === 'function' && object instanceof MediaSourceHandle ? 'media_source_handle' : 'other';
@@ -141,24 +164,29 @@
     } catch {}
     diagnostics.current = !video ? 'none' : object ? 'srcObject' : !video.currentSrc ? 'empty' :
       video.currentSrc.startsWith('blob:') ? (blobs.has(video.currentSrc) ? 'blob_mapped' : 'blob_unmapped') : 'url';
-    if (!video) { publishDiagnostics(); return; }
+    if (!generation) { publishDiagnostics(); return; }
     const offset = track?.offset || 0;
     emit({ kind: 'state', state: {
-      session, generation, serial: ++serial, media_available:!!track,
+      session, generation, serial: ++serial, media_available:!!track, fullscreen:fullscreen === true,
       ...(track ? {media_generation:track.generation} : {}),
-      media_time: Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime - offset) : 0,
-      paused: video.paused, playback_rate: video.playbackRate,
-      duration: Number.isFinite(video.duration) ? Math.max(0, video.duration - offset) : null,
-      width: video.videoWidth, height: video.videoHeight,
+      media_time: Number.isFinite(video?.currentTime) ? Math.max(0, video.currentTime - offset) : 0,
+      paused: video?.paused ?? true, playback_rate: video?.playbackRate ?? 1,
+      duration: Number.isFinite(video?.duration) ? Math.max(0, video.duration - offset) : null,
+      width: video?.videoWidth || 0, height: video?.videoHeight || 0,
     } });
     diagnostics.states++;
     publishDiagnostics();
-  }, 150);
+  }
+  setInterval(publishState, 150);
+  document.addEventListener('fullscreenchange', publishState);
+  document.addEventListener('visibilitychange', publishState);
+  window.addEventListener('focus', publishState);
+  window.addEventListener('blur', publishState);
   window.addEventListener('message', event => {
     if (event.source !== window || event.data?.channel !== channel || event.data.kind !== 'commands') return;
     for (const command of event.data.commands || []) {
       const { video, track, generation } = current();
-      if (!video || generation !== event.data.generation) break;
+      if ((!video && !validFullscreenRoot(fullscreenRoot)) || generation !== event.data.generation) break;
       if (command.generation !== generation) continue;
       if (command.name === 'pause_toggle') {
         if (!track) continue;
@@ -168,9 +196,9 @@
         document.querySelector(`[data-e2e="video-switch-${direction}-arrow"]`)?.click();
         break;
       } else if (command.name === 'exit_fullscreen') {
-        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-        else if (document.querySelector('.isCssFullScreen')) {
-          const player = video.closest('.xgplayer');
+        if (fullscreenRoot && document.fullscreenElement === fullscreenRoot) document.exitFullscreen().catch(() => {});
+        else if (validFullscreenRoot(fullscreenRoot)) {
+          const player = video?.closest('.xgplayer') || fullscreenRoot.querySelector('.xgplayer') || fullscreenRoot;
           const native = player?.querySelector('.xgplayer-fullscreen');
           const control = /退出全屏/.test(native?.textContent || '') ? native : player?.querySelector('[data-e2e="xgplayer-page-full-screen"]');
           control?.click();

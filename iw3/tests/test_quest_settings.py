@@ -33,6 +33,7 @@ def test_schema_covers_quest_fields_with_chinese_help() -> None:
         "quest_audio_source",
         "quest_audio_gain",
         "screenshot",
+        "quest_auto_browser",
         "monitor_index",
         "window_name",
         "crop_top",

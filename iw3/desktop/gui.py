@@ -110,6 +110,7 @@ class FPSEvent(wx.PyCommandEvent):
         session=None,
         settings=None,
         restart_path=None,
+        source_kind=None,
     ):
         super(FPSEvent, self).__init__(etype, eid)
         self.estimated_fps = estimated_fps
@@ -120,6 +121,7 @@ class FPSEvent(wx.PyCommandEvent):
         self.session = session
         self.settings = settings
         self.restart_path = restart_path
+        self.source_kind = source_kind
 
     def GetValue(self):
         return (self.estimated_fps, self.screenshot_fps, self.streaming_fps, self.screen_size, self.url)
@@ -128,6 +130,10 @@ class FPSEvent(wx.PyCommandEvent):
 class FPSGUI:
     def __init__(self, parent, **kwargs):
         self.parent = parent
+        self.source_kind = None
+
+    def set_source_kind(self, kind):
+        self.source_kind = kind
 
     def set_url(self, url):
         wx.PostEvent(self.parent, FPSEvent(myEVT_FPS, -1, url=url, session=self))
@@ -135,7 +141,16 @@ class FPSGUI:
     def update(self, estimated_fps, screenshot_fps, streaming_fps, screen_size):
         wx.PostEvent(
             self.parent,
-            FPSEvent(myEVT_FPS, -1, estimated_fps, screenshot_fps, streaming_fps, screen_size, session=self),
+            FPSEvent(
+                myEVT_FPS,
+                -1,
+                estimated_fps,
+                screenshot_fps,
+                streaming_fps,
+                screen_size,
+                session=self,
+                source_kind=self.source_kind,
+            ),
         )
 
     def settings_applied(self, values: dict[str, Any]) -> None:
@@ -474,6 +489,11 @@ class MainFrame(wx.Frame):
             "支持Windows的wc_mp/mss/wc_cuda。捕获窗口选整个桌面时控制所选显示器，四边裁剪须为0；"
             "切视频须指向该屏幕的前台窗口。调屏时暂停电脑操作，松开握柄后先松扳机和A键、摇杆回中。"
         )
+        self.chk_quest_auto_browser = wx.CheckBox(
+            self.grp_network, label="抖音全屏自动视频流", name="chk_quest_auto_browser"
+        )
+        self.chk_quest_auto_browser.SetValue(True)
+        self.chk_quest_auto_browser.SetToolTip(FIELD_MAP["quest_auto_browser"].help)
         self.sep_network1 = wx.StaticLine(self.grp_network, style=wx.LI_HORIZONTAL)
 
         self.chk_auth = wx.CheckBox(self.grp_network, label=T("Basic Authentication"), name="chk_auth")
@@ -510,13 +530,14 @@ class MainFrame(wx.Frame):
         layout.Add(self.chk_quest_control, (13, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.lbl_quest_audio_source, (14, 0), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.cbo_quest_audio_source, (14, 1), flag=wx.EXPAND)
-        layout.Add(self.sep_network1, (15, 0), (0, 3), flag=wx.EXPAND | wx.ALL)
+        layout.Add(self.chk_quest_auto_browser, (15, 0), (1, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.sep_network1, (16, 0), (0, 3), flag=wx.EXPAND | wx.ALL)
 
-        layout.Add(self.chk_auth, (16, 0), (0, 3), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.lbl_auth_username, (17, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.txt_auth_username, (17, 1), flag=wx.EXPAND)
-        layout.Add(self.lbl_auth_password, (18, 0), flag=wx.ALIGN_CENTER_VERTICAL)
-        layout.Add(self.txt_auth_password, (18, 1), flag=wx.EXPAND)
+        layout.Add(self.chk_auth, (17, 0), (0, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.lbl_auth_username, (18, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.txt_auth_username, (18, 1), flag=wx.EXPAND)
+        layout.Add(self.lbl_auth_password, (19, 0), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.txt_auth_password, (19, 1), flag=wx.EXPAND)
 
         sizer_network = wx.StaticBoxSizer(self.grp_network, wx.VERTICAL)
         sizer_network.Add(layout, 1, wx.ALL | wx.EXPAND, 4)
@@ -1336,6 +1357,7 @@ class MainFrame(wx.Frame):
                 quest_audio_source="process" if self.cbo_quest_audio_source.GetSelection() == 0 else "speaker",
                 quest_audio_gain=self.sld_quest_audio_gain.GetValue() / 100,
                 quest_control=self.chk_quest_control.GetValue(),
+                quest_auto_browser=self.chk_quest_auto_browser.GetValue(),
                 quest_screen_curvature=self.sld_quest_screen_curvature.GetValue(),
                 quest_ambient=self.chk_quest_ambient.GetValue(),
                 quest_ambient_style=AMBIENT_STYLES[max(0, self.cbo_quest_ambient_style.GetSelection())],
@@ -1472,7 +1494,7 @@ class MainFrame(wx.Frame):
                 if key in values:
                     getattr(self, "sld_" + key).SetValue(round(values[key] * scale))
             self.on_quest_ambient(None)
-            for key in ("preserve_screen_border", "ema_normalize", "compile", "quest_control"):
+            for key in ("preserve_screen_border", "ema_normalize", "compile", "quest_control", "quest_auto_browser"):
                 if key in values:
                     getattr(self, "chk_" + key).SetValue(values[key])
             for side in ("top", "bottom", "left", "right"):
@@ -1533,7 +1555,11 @@ class MainFrame(wx.Frame):
             self._finish_quest_restart()
         estimated_fps, screenshot_fps, streaming_fps, screen_size, url = event.GetValue()
         if estimated_fps is not None and screenshot_fps is not None and streaming_fps is not None:
-            source_label = "NVDEC" if getattr(self.args, "screenshot", None) == "browser_video" else "Screenshot"
+            source_kind = getattr(event, "source_kind", None)
+            browser = source_kind == "browser" or (
+                source_kind is None and getattr(self.args, "screenshot", None) == "browser_video"
+            )
+            source_label = "NVDEC" if browser else "Screenshot"
             self.SetStatusText(
                 f"Estimated FPS: {estimated_fps:.02f},"
                 f" {source_label} FPS: {screenshot_fps:.02f},"
@@ -1662,6 +1688,7 @@ class MainFrame(wx.Frame):
 
     def load_preset(self, name=None, exclude_names=set()):
         self.cbo_quest_ambient_style.SetSelection(0)
+        self.chk_quest_auto_browser.SetValue(True)
         exclude_names.add("cbo_language")  # ignore language
         if not name:
             name = ""
@@ -1837,6 +1864,7 @@ class MainFrame(wx.Frame):
             self.cbo_quest_bitrate,
             self.chk_quest_audio,
             self.chk_quest_control,
+            self.chk_quest_auto_browser,
             self.lbl_quest_audio_source,
             self.cbo_quest_audio_source,
             self.lbl_quest_audio_gain,

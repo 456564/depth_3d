@@ -27,13 +27,14 @@ function browser() {
     currentSrc: '', videoWidth: 1080, videoHeight: 1920, currentTime: 2,
     duration: 10, paused: false, playbackRate: 1,
     getBoundingClientRect: () => ({ left: 0, top: 0, right: 1080, bottom: 1920 }),
+    closest:()=>null,
   };
   const context = {
     MediaSource, SourceBuffer, ArrayBuffer, Uint8Array,
     crypto: { randomUUID: () => `id${++uuid}` },
     URL: { createObjectURL: () => `blob:${++uuid}`, revokeObjectURL() {} },
     innerWidth: 1080, innerHeight: 1920,
-    document: { querySelectorAll: () => [video] },
+    document: { querySelectorAll: () => [video],hasFocus:()=>true,visibilityState:'visible',addEventListener() {} },
     setInterval: callback => timers.push(callback), addEventListener() {},
     postMessage: data => events.push(data),
   };

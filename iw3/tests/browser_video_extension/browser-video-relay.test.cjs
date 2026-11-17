@@ -133,7 +133,7 @@ test('relay has a loading heartbeat before the first media event', () => {
   const b = relay();
   b.advance(250);
   const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay || '{}');
-  assert.equal(stats.version, '1.1.4');
+  assert.equal(stats.version, '1.2.0');
   assert.equal(stats.events, 0);
   assert.equal(stats.chunks, 0);
   assert.equal(b.calls.length, 0);
@@ -394,4 +394,77 @@ test('background re-pairs once after 403 but does not expose raw fetch errors',a
   const result=await bad.send({kind:'state',state:state(),focused:true});
   assert.equal(result.ok,false);
   assert.equal(JSON.stringify(result).includes('sensitive'),false);
+});
+
+test('relay normalizes legacy fullscreen and rejects every non-boolean fullscreen value',async()=>{
+  const b=relay();
+  for(const fullscreen of [null,0,1,'true',[],{}]) b.emit({kind:'state',state:{...state(),fullscreen}});
+  await tick(); assert.equal(b.calls.length,0);
+  b.emit({kind:'state',state:state()}); await tick();
+  assert.equal(b.calls[0].state.fullscreen,false);
+  b.emit({kind:'state',state:{...state(2),fullscreen:true}}); await tick();
+  assert.equal(b.calls.at(-1).state.fullscreen,true);
+});
+
+test('a pending fullscreen true reply cannot deliver commands after explicit false',async()=>{
+  let release;
+  const b=relay(message=>message.state.fullscreen ? new Promise(resolve=>{release=resolve;}) : Promise.resolve({ok:true,next_sequence:0,commands:[]}));
+  b.emit({kind:'state',state:{...state(),fullscreen:true}}); await tick();
+  b.emit({kind:'state',state:{...state(2),fullscreen:false}});
+  release({ok:true,next_sequence:0,commands:[{name:'next',generation:'g'}]}); await tick();
+  assert.equal(b.posted.length,0); assert.equal(b.calls.at(-1).state.fullscreen,false);
+});
+
+test('background clamps fullscreen to an active focused tab and preserves legacy false',async()=>{
+  const b=background();
+  for(const [active,focused,want] of [[true,true,true],[false,true,false],[true,false,false],[true,undefined,false]]) {
+    const sender={url:'https://www.douyin.com/',frameId:0,tab:{id:5,active}};
+    await b.send({kind:'state',state:{...state(),fullscreen:true},focused},sender);
+    assert.equal(JSON.parse(b.calls.at(-1).options.body).fullscreen,want);
+  }
+  await b.send({kind:'state',state:state(),focused:true});
+  assert.equal(JSON.parse(b.calls.at(-1).options.body).fullscreen,false);
+  const before=b.calls.length;
+  for(const fullscreen of [null,0,1,'true',[],{}]) assert.equal((await b.send({kind:'state',state:{...state(),fullscreen},focused:true})).ok,false);
+  assert.equal(b.calls.length,before);
+});
+
+test('background serializes cross-session states and skips a superseded queued target',async()=>{
+  let release;
+  const b=background(async(url,options)=>{
+    if(url.endsWith('/hello')) return {ok:true,status:200,json:async()=>({token:'local-token'})};
+    if(JSON.parse(options.body).session==='old') await new Promise(resolve=>{release=resolve;});
+    return {ok:true,status:200,json:async()=>({commands:[{name:'next',generation:'g'}],next_sequence:0})};
+  });
+  const old=b.send({kind:'state',state:{...state(),session:'old',fullscreen:true},focused:true}); await tick();
+  const queued=b.send({kind:'state',state:{...state(),session:'queued',fullscreen:true},focused:true},{url:'https://www.douyin.com/',frameId:0,tab:{id:6,active:true}});
+  const newest=b.send({kind:'state',state:{...state(),session:'newest',fullscreen:false},focused:true},{url:'https://www.douyin.com/',frameId:0,tab:{id:7,active:true}});
+  await tick(); assert.equal(b.calls.filter(call=>call.url.endsWith('/state')).length,1);
+  release(); const replies=await Promise.all([old,queued,newest]);
+  assert.deepEqual(replies.map(reply=>reply.ok),[false,false,true]);
+  const sent=b.calls.filter(call=>call.url.endsWith('/state')).map(call=>JSON.parse(call.options.body));
+  assert.deepEqual(sent.map(value=>[value.session,value.fullscreen]),[['old',true],['newest',false]]);
+});
+
+test('a state superseded during pairing is rechecked before any state fetch',async()=>{
+  let release;
+  const b=background(async(url)=>{
+    if(url.endsWith('/hello')) await new Promise(resolve=>{release=resolve;});
+    return {ok:true,status:200,json:async()=>url.endsWith('/hello')?{token:'local-token'}:{commands:[],next_sequence:0}};
+  });
+  const old=b.send({kind:'state',state:{...state(),session:'old',fullscreen:true},focused:true}); await tick();
+  const newest=b.send({kind:'state',state:{...state(2),session:'new',fullscreen:false},focused:true});
+  release(); const replies=await Promise.all([old,newest]);
+  assert.deepEqual(replies.map(reply=>reply.ok),[false,true]);
+  assert.deepEqual(b.calls.filter(call=>call.url.endsWith('/state')).map(call=>JSON.parse(call.options.body).session),['new']);
+});
+
+test('fullscreen operation changes replay one cached init under each fresh operation generation',async()=>{
+  const b=relay(); b.emit({kind:'chunk',generation:'cache',sequence:0,data:new Uint8Array([7,8]).buffer});
+  for(const [serial,generation,fullscreen] of [[1,'ordinary',false],[2,'entered',true],[3,'exited',false]]) {
+    b.emit({kind:'state',state:{...state(serial,generation),media_available:true,media_generation:'cache',fullscreen}}); await tick();
+  }
+  assert.deepEqual(b.calls.filter(call=>call.kind==='chunk').map(call=>[call.generation,call.sequence,call.data]),[
+    ['ordinary',0,'Bwg='],['entered',0,'Bwg='],['exited',0,'Bwg='],
+  ]);
 });

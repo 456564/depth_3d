@@ -430,3 +430,53 @@ def test_real_quest_controller_can_navigate_unavailable_live_media_once_without_
     assert request(bridge, "/state", playback, token=token)[1]["commands"] == [
         {"name": "exit_fullscreen", "generation": "live-target"}
     ]
+
+
+@pytest.mark.parametrize("fullscreen", [None, 0, 1, "true", [], {}])
+def test_fullscreen_rejects_non_boolean_values(bridge, fullscreen):
+    token = pair(bridge)
+    assert request(bridge, "/state", state(fullscreen=fullscreen), token=token)[0] == 400
+    assert not bridge.status()["fresh"]
+
+
+def test_legacy_fullscreen_defaults_false_without_disabling_manual_media(bridge):
+    assert bridge.status().get("fullscreen") is False
+    token = pair(bridge)
+    assert request(bridge, "/state", state(), token=token)[0] == 200
+    assert bridge.status()["fullscreen"] is False
+    assert chunk(bridge, token, b"manual-nonfullscreen")[0] == 200
+    assert bridge.snapshot().data == b"manual-nonfullscreen"
+
+
+def test_fullscreen_waiting_is_independent_of_media_and_ttl(bridge, monkeypatch):
+    module = importlib.import_module("iw3.desktop.browser_video_bridge")
+    clock = [time.monotonic()]
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    token = pair(bridge)
+    waiting = state(fullscreen=True, media_available=False, width=0, height=0)
+    assert request(bridge, "/state", waiting, token=token)[0] == 200
+    status = bridge.status()
+    assert status["fullscreen"] is True and status["fresh"] is True
+    assert status["media_available"] is False and bridge.snapshot() is None
+    clock[0] += 2
+    status = bridge.status()
+    assert status["fullscreen"] is True and status["fresh"] is False
+    assert request(bridge, "/state", state(serial=1, fullscreen=False), token=token)[0] == 200
+    assert bridge.status()["fullscreen"] is False and bridge.status()["fresh"] is True
+    assert request(bridge, "/state", waiting, token=token)[0] == 409
+    assert bridge.status()["fullscreen"] is False
+
+
+def test_fullscreen_operation_transition_rejects_old_bytes_and_commands(bridge):
+    token = pair(bridge)
+    assert request(bridge, "/state", state(fullscreen=True), token=token)[0] == 200
+    assert chunk(bridge, token, b"old")[0] == 200
+    assert bridge.queue_command("next")
+    code, reply, _ = request(bridge, "/state", state(serial=1, generation="exited", fullscreen=False), token=token)
+    assert code == 200 and reply["commands"] == []
+    assert bridge.status()["fullscreen"] is False
+    assert bridge.snapshot() is None
+    assert chunk(bridge, token, b"late", sequence=1)[0] == 409
+    assert not bridge.queue_command("next", "tab:video:track")
+    assert chunk(bridge, token, b"manual", generation="exited")[0] == 200
+    assert bridge.snapshot().data == b"manual"

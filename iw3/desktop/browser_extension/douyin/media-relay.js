@@ -6,7 +6,7 @@
   const caches = new Map();
   const names = new Set(['pause_toggle', 'next', 'previous', 'exit_fullscreen']);
   let cachedBytes = 0, latestState, activeState, transfer, pumping = false, ready = false, lastStateAt = 0;
-  const diagnostics = {version: '1.1.4', events: 0, states: 0, chunks: 0, bytes: 0, ticks: 0, window_seen: 0,
+  const diagnostics = {version: '1.2.0', events: 0, states: 0, chunks: 0, bytes: 0, ticks: 0, window_seen: 0,
     rejected_source: 0, rejected_channel: 0, rejected_session: 0, rejected_kind: 0, rejected_state: 0, rejected_chunk: 0,
     report_sent: 0, report_ok: 0, report_rejected: 0, report_pending: 0, last_error: 'none'};
   const bridgeDiagnostics = {state: 'waiting', bytes: 0, next_sequence: 0};
@@ -53,6 +53,7 @@
   function validState(value, session) {
     return value && value.session === session && identifier(session) && identifier(value.generation) &&
       (value.media_available === undefined || typeof value.media_available === 'boolean') &&
+      (value.fullscreen === undefined || typeof value.fullscreen === 'boolean') &&
       (value.media_available === false ? value.media_generation === undefined :
         value.media_available === undefined && value.media_generation === undefined || identifier(value.media_generation)) &&
       Number.isSafeInteger(value.serial) && value.serial >= 0 &&
@@ -64,7 +65,7 @@
   }
   const mediaKey = state => state?.media_available === false ? undefined : state?.media_generation || state?.generation;
   const sameTarget = (a, b) => a && b && a.session === b.session && a.generation === b.generation &&
-    (a.media_available !== false) === (b.media_available !== false) && mediaKey(a) === mediaKey(b);
+    (a.media_available !== false) === (b.media_available !== false) && a.fullscreen === b.fullscreen && mediaKey(a) === mediaKey(b);
   function summary(state, message = '') {
     const record = caches.get(mediaKey(activeState));
     Object.assign(bridgeDiagnostics, {state, bytes: record?.bytes || 0, next_sequence: transfer?.next || 0});
@@ -160,7 +161,7 @@
       if (diagnostics.chunks === accepted) diagnostics.rejected_chunk++;
     } else if (message.kind === 'state' && validState(message.state, message.session)) {
       diagnostics.states++;
-      latestState = message.state; lastStateAt = Date.now();
+      latestState = {...message.state,fullscreen:message.state.fullscreen === true}; lastStateAt = Date.now();
     } else if (message.kind === 'error') summary('error', '网页未提供可用压缩视频；不会回退录屏。');
     else { diagnostics[message.kind === 'state' ? 'rejected_state' : 'rejected_kind']++; return; }
     void pump();
