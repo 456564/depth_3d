@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iw3 视频源状态</title>
+  <link rel="stylesheet" href="popup.css">
+  <script src="popup.js" defer></script>
+</head>
+<body>
+  <header><h1>iw3 视频源状态</h1><span id="version"></span></header>
+  <p id="summary" role="status">正在读取状态…</p>
+  <p id="hint">状态每秒刷新。</p>
+  <h2>网页取源（MAIN 当前观测）</h2>
+  <dl>
+    <dt>页面心跳</dt><dd id="heartbeat">等待</dd>
+    <dt>媒体观察脚本</dt><dd id="main">等待</dd>
+    <dt>转发脚本</dt><dd id="relay">等待</dd>
+    <dt>视频输入</dt><dd id="input">等待</dd>
+    <dt>视频尺寸</dt><dd id="size">等待</dd>
+    <dt>转发层视频快照</dt><dd id="relay-video">等待</dd>
+    <dt>转发层播放快照</dt><dd id="playback">等待</dd>
+    <dt>观察到的媒体对象</dt><dd id="objects">等待</dd>
+    <dt>轨道 / 追加调用</dt><dd id="tracks">等待</dd>
+    <dt>压缩字节</dt><dd id="observed">等待</dd>
+    <dt>转发累计字节</dt><dd id="cached">等待</dd>
+  </dl>
+  <h2>诊断心跳</h2>
+  <dl>
+    <dt>窗口消息</dt><dd id="window-events">等待</dd>
+    <dt>分层过滤次数</dt><dd id="window-rejected">等待</dd>
+    <dt>诊断报告</dt><dd id="diagnostic-reports">等待</dd>
+    <dt>最后诊断错误</dt><dd id="diagnostic-error">等待</dd>
+  </dl>
+  <h2>发送至电脑（本次后台累计）</h2>
+  <dl>
+    <dt>本机桥最近请求</dt><dd id="connection">未测试</dd>
+    <dt>最后请求</dt><dd id="request">尚无请求</dd>
+    <dt>请求次数</dt><dd id="requests">0</dd>
+    <dt>本次后台累计送达</dt><dd id="sent">0 B</dd>
+    <dt>当前视频已确认片段</dt><dd id="sequence">等待</dd>
+  </dl>
+  <p class="note">显示当前取源标签；尚未取源时显示最近活动的抖音标签。这里仅确认网页取源和送达电脑；NVDEC 硬解、AI 和 Quest 接收状态请看 iw3。</p>
+  <p class="note">过滤次数包含网页的其他正常消息，不代表视频故障。心跳过期后展示历史快照；此面板不自动重启串流。</p>
+  <p class="note">统计只含类型、次数、尺寸和字节数。后台重启会清零；不保存视频、网址或凭据。</p>
+</body>
+</html>

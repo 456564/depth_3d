@@ -1,0 +1,14 @@
+:root { color-scheme: dark light; font: 13px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif; }
+body { box-sizing: border-box; width: 390px; margin: 0; padding: 16px; background: #151923; color: #e7ecf5; }
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+h1 { font-size: 17px; margin: 0; }
+h2 { font-size: 13px; margin: 18px 0 8px; color: #a6bbd9; }
+#version, .note { color: #aebbd0; font-size: 11px; }
+#summary { padding: 10px; border-radius: 6px; background: #263448; font-weight: 600; margin-bottom: 6px; }
+#summary[data-state="ok"] { background: #173e32; }
+#summary[data-state="waiting"] { background: #493d25; }
+#hint { margin: 0; font-size: 12px; }
+dl { margin: 0; display: grid; grid-template-columns: 138px 1fr; gap: 6px 10px; }
+dt { color: #aebbd0; }
+dd { margin: 0; overflow-wrap: anywhere; }
+.note { margin-bottom: 0; }

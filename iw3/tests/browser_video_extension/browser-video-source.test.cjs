@@ -12,6 +12,8 @@ function browser() {
     appendBuffer(data) { if (this.fail) throw new Error('append failed'); this.last = data; }
   }
   class MediaSource { addSourceBuffer() { return new SourceBuffer(); } }
+  class MediaStream { getTracks() { throw new Error('must not inspect tracks'); } }
+  class MediaSourceHandle {}
   const video = {
     currentSrc: '', videoWidth: 1080, videoHeight: 1920, currentTime: 2,
     duration: 10, paused: false, playbackRate: 1,
@@ -20,7 +22,7 @@ function browser() {
     pause() { this.paused = true; },
   };
   const context = {
-    console, MediaSource, SourceBuffer, ArrayBuffer, Uint8Array,
+    console, MediaSource, SourceBuffer, MediaStream, MediaSourceHandle, ArrayBuffer, Uint8Array, Blob,
     crypto: { randomUUID: () => `id${++uuid}` },
     URL: { createObjectURL: () => `blob:${++uuid}`, revokeObjectURL() {} },
     innerWidth: 1080, innerHeight: 1920,
@@ -74,6 +76,79 @@ test('reinitializing one SourceBuffer changes generation and resets sequence', (
 test('unrelated blob or invisible video does not fabricate media state', () => {
   const b=browser(); b.video.currentSrc='blob:unrelated'; b.timers.forEach(f=>f());
   assert.equal(b.events.filter(e=>e.kind==='state').length,0);
+});
+
+test('diagnostics report a ready observer even without a mapped video track', () => {
+  const b = browser();
+  b.video.currentSrc = 'blob:private-source';
+  b.timers.forEach(f => f());
+  const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoMain || '{}');
+  assert.equal(stats.stage, 'ready');
+  assert.equal(stats.current, 'blob_unmapped');
+  assert.equal(stats.ticks, 1);
+  assert.equal(stats.appends, 0);
+  assert.equal(stats.bytes, 0);
+  assert.ok(!JSON.stringify(stats).includes('private-source'));
+});
+
+test('diagnostics count successful media calls without including payload or MIME text', () => {
+  const b = browser(), source = new b.context.MediaSource();
+  b.video.currentSrc = b.context.URL.createObjectURL(source);
+  const sb = source.addSourceBuffer('video/mp4; codecs="private-codec"');
+  source.addSourceBuffer('audio/mp4');
+  b.context.URL.createObjectURL({});
+  sb.appendBuffer(init());
+  sb.fail = true;
+  assert.throws(() => sb.appendBuffer(init()), /append failed/);
+  b.timers.forEach(f => f());
+  const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoMain || '{}');
+  assert.equal(stats.current, 'blob_mapped');
+  assert.equal(stats.mse_urls, 1);
+  assert.equal(stats.other_urls, 1);
+  assert.equal(stats.video_tracks, 1);
+  assert.equal(stats.audio_tracks, 1);
+  assert.equal(stats.appends, 1);
+  assert.equal(stats.bytes, init().byteLength);
+  assert.equal(stats.chunks, 1);
+  assert.equal(stats.states, 1);
+  assert.ok(!JSON.stringify(stats).includes('private-codec'));
+});
+
+test('ordinary Blob inputs are identified without inventing a MediaSource track', () => {
+  const b = browser();
+  b.video.currentSrc = b.context.URL.createObjectURL(new Blob([init()], {type:'video/mp4'}));
+  b.timers.forEach(f => f());
+  const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoMain);
+  assert.equal(stats.blob_urls, 1);
+  assert.equal(stats.mse_urls, 0);
+  assert.equal(stats.current, 'blob_unmapped');
+  assert.equal(stats.appends, 0);
+  assert.equal(b.events.filter(e => e.kind === 'state').length, 0);
+});
+
+test('current srcObject diagnostics classify native types without reading frames or tracks', () => {
+  const b = browser();
+  for (const [object, type] of [[new b.context.MediaStream(),'media_stream'],[new b.context.MediaSourceHandle(),'media_source_handle'],[{},'other'],[null,'none']]) {
+    b.video.srcObject = object;
+    b.timers.forEach(f=>f());
+    const stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoMain);
+    assert.equal(stats.src_object_type,type);
+    assert.equal(stats.width,1080);
+    assert.equal(stats.height,1920);
+  }
+  assert.equal(b.events.filter(e=>e.kind==='chunk'||e.kind==='state').length,0);
+});
+
+test('current media dimensions reset when no video is visible', () => {
+  const b = browser();
+  b.timers.forEach(f=>f());
+  b.video.getBoundingClientRect=()=>({left:2000,top:0,right:3080,bottom:1920});
+  b.timers.forEach(f=>f());
+  const stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoMain);
+  assert.equal(stats.current,'none');
+  assert.equal(stats.src_object_type,'none');
+  assert.equal(stats.width,0);
+  assert.equal(stats.height,0);
 });
 
 test('exit command uses the webpage fullscreen control for Y mode', () => {

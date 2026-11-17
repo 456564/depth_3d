@@ -2,6 +2,14 @@
 (() => {
   'use strict';
   const channel = 'iw3-browser-video-v1';
+  const diagnostics = {version: '1.1.2', stage: 'starting', ticks: 0, mse_urls: 0, blob_urls: 0, other_urls: 0,
+    video_tracks: 0, audio_tracks: 0, other_tracks: 0, appends: 0, bytes: 0, chunks: 0, states: 0, current: 'none',
+    src_object_type: 'none', width: 0, height: 0};
+  function publishDiagnostics() {
+    if (document.documentElement) document.documentElement.dataset.iw3VideoMain = JSON.stringify(diagnostics);
+  }
+  setInterval(publishDiagnostics, 500);
+  publishDiagnostics();
   const session = crypto.randomUUID();
   const sources = new WeakMap(), buffers = new WeakMap(), blobs = new Map();
   let serial = 0;
@@ -14,9 +22,11 @@
   URL.createObjectURL = function (object) {
     const url = Reflect.apply(createURL, this, arguments);
     if (object instanceof MediaSource) {
+      diagnostics.mse_urls++;
       blobs.set(url, sourceRecord(object));
       if (blobs.size > 16) blobs.delete(blobs.keys().next().value);
-    }
+    } else if (typeof Blob !== 'undefined' && object instanceof Blob) diagnostics.blob_urls++;
+    else diagnostics.other_urls++;
     return url;
   };
   const revokeURL = URL.revokeObjectURL;
@@ -27,6 +37,9 @@
   const addBuffer = MediaSource.prototype.addSourceBuffer;
   MediaSource.prototype.addSourceBuffer = function (mime) {
     const buffer = Reflect.apply(addBuffer, this, arguments);
+    if (/^video\//i.test(mime)) diagnostics.video_tracks++;
+    else if (/^audio\//i.test(mime)) diagnostics.audio_tracks++;
+    else diagnostics.other_tracks++;
     const record = sourceRecord(this);
     const track = { buffer, mime, generation: `${session}:${record.id}:${crypto.randomUUID()}`, sequence: 0, bytes: 0, offset: null, failed: false };
     record.tracks.push(track); buffers.set(buffer, track);
@@ -49,6 +62,8 @@
       if (bytes.byteLength <= 256 * 1024 * 1024) copy = bytes.slice();
     }
     const result = Reflect.apply(append, this, arguments);
+    diagnostics.appends++;
+    diagnostics.bytes += data.byteLength;
     if (copy) {
       const isInit = copy.length >= 8 && String.fromCharCode(...copy.subarray(4,8)) === 'ftyp';
       if (isInit && track.sequence) {
@@ -62,6 +77,7 @@
         for (let offset = 0; offset < copy.byteLength; offset += 8 * 1024 * 1024) {
           const piece = copy.slice(offset, offset + 8 * 1024 * 1024);
           emit({ kind: 'chunk', generation: track.generation, sequence: track.sequence++, data: piece.buffer });
+          diagnostics.chunks++;
         }
       } else emit({ kind: 'error', message: '视频缓存过大或时间轴已改变；等待下一条视频。' });
     } else if (track && /^video\//i.test(track.mime)) {
@@ -87,7 +103,14 @@
   }
   setInterval(() => {
     const { video, track } = current();
-    if (!track) return;
+    const object = video?.srcObject;
+    diagnostics.ticks++;
+    diagnostics.width = video?.videoWidth || 0; diagnostics.height = video?.videoHeight || 0;
+    diagnostics.src_object_type = !object ? 'none' : typeof MediaStream === 'function' && object instanceof MediaStream ? 'media_stream' :
+      typeof MediaSourceHandle === 'function' && object instanceof MediaSourceHandle ? 'media_source_handle' : 'other';
+    diagnostics.current = !video ? 'none' : object ? 'srcObject' : !video.currentSrc ? 'empty' :
+      video.currentSrc.startsWith('blob:') ? (blobs.has(video.currentSrc) ? 'blob_mapped' : 'blob_unmapped') : 'url';
+    if (!track) { publishDiagnostics(); return; }
     emit({ kind: 'state', state: {
       session, generation: track.generation, serial: ++serial,
       media_time: Math.max(0, video.currentTime - track.offset),
@@ -95,6 +118,8 @@
       duration: Number.isFinite(video.duration) ? Math.max(0, video.duration - track.offset) : null,
       width: video.videoWidth, height: video.videoHeight,
     } });
+    diagnostics.states++;
+    publishDiagnostics();
   }, 150);
   window.addEventListener('message', event => {
     if (event.source !== window || event.data?.channel !== channel || event.data.kind !== 'commands') return;
@@ -118,4 +143,6 @@
       }
     }
   });
+  diagnostics.stage = 'ready';
+  publishDiagnostics();
 })();

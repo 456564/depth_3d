@@ -14,7 +14,7 @@ function relay(sendMessage = async message => ({ok:true,commands:[],next_sequenc
   const context={
     console, ArrayBuffer, Uint8Array, Map, Date:{now:()=>now},
     btoa:s=>Buffer.from(s,'binary').toString('base64'),
-    document:{documentElement:{dataset:{}},hasFocus:()=>true},
+    document:{documentElement:{dataset:{}},hasFocus:()=>true,querySelectorAll:()=>[]},
     chrome:{runtime:{sendMessage:async message=>{calls.push(message);return sendMessage(message);}}},
     setInterval:f=>timers.push(f),
     addEventListener:(name,fn)=>(listeners[name] ||= []).push(fn),
@@ -38,7 +38,7 @@ function background(handler = async (url, options) => ({status:200,ok:true,json:
   const context={
     console, URL, Uint8Array, ArrayBuffer, AbortSignal,
     atob:s=>Buffer.from(s,'base64').toString('binary'), Date:{now:()=>now},
-    chrome:{runtime:{onMessage:{addListener:fn=>listener=fn}}},
+    chrome:{runtime:{id:'a'.repeat(32),getURL:p=>`chrome-extension://${'a'.repeat(32)}/${p}`,onMessage:{addListener:fn=>listener=fn}}},
     fetch:async(url,options)=>{calls.push({url,options});return handler(url,options);},
   };
   const file=path.join(directory,'media-background.js');
@@ -58,6 +58,164 @@ test('relay forwards actual compressed bytes through JSON runtime boundary after
   assert.deepEqual(Array.from(Buffer.from(b.calls[1].data,'base64')),[0,1,2,255]);
   assert.equal(b.calls[1].generation,'g');
   assert.equal(b.calls[1].sequence,0);
+});
+
+test('relay has a loading heartbeat before the first media event', () => {
+  const b = relay();
+  b.advance(250);
+  const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay || '{}');
+  assert.equal(stats.version, '1.1.2');
+  assert.equal(stats.events, 0);
+  assert.equal(stats.chunks, 0);
+  assert.equal(b.calls.length, 0);
+});
+
+test('relay diagnostics count only accepted chunk bytes', async () => {
+  const b = relay();
+  b.emit({kind:'chunk',generation:'g',sequence:0,data:new Uint8Array([1,2,3]).buffer});
+  b.emit({kind:'chunk',generation:'g',sequence:0,data:new Uint8Array([1,2,3]).buffer});
+  b.emit({kind:'state',state:state()});
+  await tick();
+  b.advance(250);
+  const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay || '{}');
+  assert.equal(stats.events, 3);
+  assert.equal(stats.states, 1);
+  assert.equal(stats.chunks, 1);
+  assert.equal(stats.bytes, 3);
+});
+
+test('relay separates timer heartbeat and each window-message rejection layer', async () => {
+  const b=relay();
+  b.context.messageForTest={channel,session:'s',kind:'state',state:state()};
+  vm.runInContext('listenersForTest.forEach(fn=>fn({source:{},data:messageForTest}))',b.context);
+  b.emit({channel:'foreign'});
+  b.emit({session:''});
+  b.emit({kind:'unknown'});
+  b.emit({kind:'state',state:{...state(),paused:'false'}});
+  b.emit({kind:'chunk',generation:'g',sequence:1,data:new Uint8Array([1]).buffer});
+  b.emit({kind:'state',state:state()});
+  await tick();
+  b.advance(250);
+  const stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.ticks,1);
+  assert.equal(stats.window_seen,7);
+  assert.equal(stats.rejected_source,1);
+  assert.equal(stats.rejected_channel,1);
+  assert.equal(stats.rejected_session,1);
+  assert.equal(stats.rejected_kind,1);
+  assert.equal(stats.rejected_state,1);
+  assert.equal(stats.rejected_chunk,1);
+  assert.equal(stats.states,1);
+});
+
+test('relay exposes pending, accepted, rejected and failed diagnostic reports without raw errors', async () => {
+  let release, mode='pending';
+  const b=relay(message=>{
+    if (message.kind!=='diagnostics') return Promise.resolve({ok:true,next_sequence:0});
+    if(mode==='pending') return new Promise(resolve=>{release=resolve;});
+    if(mode==='rejected') return Promise.resolve({ok:false,message:'private rejection text'});
+    return Promise.reject(new Error('private URL and token'));
+  });
+  b.advance(1000); await tick();
+  b.advance(250);
+  let stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.report_sent,1);
+  assert.equal(stats.report_pending,1);
+  assert.equal(stats.report_ok,0);
+  release({ok:true}); await tick();
+  stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.report_pending,0);
+  assert.equal(stats.report_ok,1);
+  mode='rejected'; b.advance(1000); await tick();
+  stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.report_rejected,1);
+  assert.equal(stats.last_error,'report_rejected');
+  mode='failed'; b.advance(1000); await tick();
+  stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.report_rejected,2);
+  assert.equal(stats.last_error,'runtime_error');
+  assert.ok(!JSON.stringify(stats).includes('private'));
+});
+
+test('a diagnostic report that never returns remains pending while timer heartbeat advances', async () => {
+  const b=relay(()=>new Promise(()=>{}));
+  b.advance(1000); await tick();
+  b.advance(5000); await tick();
+  const stats=JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.ticks,2);
+  assert.equal(stats.report_pending,1);
+  assert.equal(stats.report_sent,1);
+  assert.equal(stats.report_ok,0);
+  assert.equal(stats.report_rejected,0);
+  assert.equal(b.calls.length,1);
+});
+
+test('diagnostics distinguish construction failure and synchronous runtime exceptions', async () => {
+  const broken=relay();
+  broken.context.document.querySelectorAll=()=>{throw new Error('private page detail');};
+  broken.advance(1000); await tick();
+  let stats=JSON.parse(broken.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.last_error,'diagnostic_build_error');
+  assert.equal(stats.report_sent,0);
+  assert.equal(stats.report_pending,0);
+  const sync=relay();
+  sync.context.chrome.runtime.sendMessage=()=>{throw new Error('private context detail');};
+  sync.advance(1000); await tick();
+  stats=JSON.parse(sync.context.document.documentElement.dataset.iw3VideoRelay);
+  assert.equal(stats.last_error,'runtime_sync_error');
+  assert.equal(stats.report_sent,1);
+  assert.equal(stats.report_pending,0);
+  assert.ok(!JSON.stringify(stats).includes('private'));
+});
+
+test('relay reports script diagnostics before media without exposing marker URLs', async () => {
+  const b = relay();
+  b.context.document.documentElement.dataset.iw3VideoMain = '{"stage":"ready"}';
+  b.context.document.documentElement.dataset.iw3VideoBridge = '{"state":"waiting","bytes":0,"next_sequence":0,"generation":"private"}';
+  b.advance(1000);
+  await tick();
+  const report = b.calls.find(message => message.kind === 'diagnostics');
+  assert.equal(report.diagnostics.main.stage, 'ready');
+  assert.equal(report.diagnostics.video.kind, 'none');
+  assert.equal(report.diagnostics.bridge.state, 'waiting');
+  assert.ok(!JSON.stringify(report).includes('private'));
+  assert.equal(b.calls.filter(message => message.kind !== 'diagnostics').length, 0);
+});
+
+test('relay diagnostics tolerate document_start without an element and malformed markers', async () => {
+  const b = relay();
+  b.context.document.documentElement = null;
+  b.advance(1000);
+  await tick();
+  assert.equal(b.calls.at(-1).diagnostics.main, null);
+  b.context.document.documentElement = {dataset: {iw3VideoMain: '{not json'}};
+  b.advance(1000);
+  await tick();
+  assert.equal(b.calls.at(-1).diagnostics.main, null);
+});
+
+test('actual relay startup diagnostics reach background before any media is available', async () => {
+  const worker = background();
+  const b = relay(message => worker.send(message));
+  b.advance(1000);
+  await tick();
+  const status = await worker.send({kind:'status'}, {id:'a'.repeat(32),url:`chrome-extension://${'a'.repeat(32)}/popup.html`});
+  assert.equal(status.page?.fresh, true);
+  assert.equal(status.page.diagnostics.main, null);
+  assert.equal(status.page.diagnostics.video.kind, 'none');
+  assert.equal(status.page.diagnostics.bridge.state, 'waiting');
+  assert.equal(worker.calls.length, 0);
+});
+
+test('page-writable bridge marker cannot replace relay acknowledgement statistics', async () => {
+  const b = relay();
+  b.context.document.documentElement.dataset.iw3VideoBridge = '{"state":"source","bytes":999,"next_sequence":5}';
+  b.advance(1000);
+  await tick();
+  const report = b.calls.find(message => message.kind === 'diagnostics');
+  assert.equal(report.diagnostics.bridge.state, 'waiting');
+  assert.equal(report.diagnostics.bridge.bytes, 0);
+  assert.equal(report.diagnostics.bridge.next_sequence, 0);
 });
 
 test('relay ignores forged source, unknown channel and invalid metadata',async()=>{
@@ -108,7 +266,7 @@ test('relay does not fabricate missing init or retry endlessly on a stopped brid
   assert.equal(b.calls.length,1);
   assert.match(b.context.document.documentElement.dataset.iw3VideoBridge,/waiting/);
   b.advance(2000);
-  assert.equal(b.calls.length,1);
+  assert.equal(b.calls.filter(message => message.kind !== 'diagnostics').length,1);
 });
 
 test('background rejects non-Douyin and subframe senders before any network',async()=>{
