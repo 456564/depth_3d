@@ -52,12 +52,13 @@ class AmbientBackground:
         self._source_window = _ContentWindow()
         self._display_window = _ContentWindow()
 
-    def reset(self) -> None:
+    def reset(self, preserve_content: bool = False) -> None:
         self._colors = None
         self._last_tick = None
-        self._signature = None
-        self._source_window = _ContentWindow()
-        self._display_window = _ContentWindow()
+        if not preserve_content:
+            self._signature = None
+            self._source_window = _ContentWindow()
+            self._display_window = _ContentWindow()
 
     @staticmethod
     def _validate_frame(frame: torch.Tensor) -> None:
@@ -177,7 +178,7 @@ class AmbientBackground:
                 protected[axis + 2] = rect[axis + 2] + padding
         return protected[0], protected[1], protected[2], protected[3]
 
-    def _alpha(self, rect: _Rect, scale: tuple[float, float], feather: float) -> Image.Image:
+    def _alpha(self, rect: _Rect, scale: tuple[float, float], feather: float, halo: bool = False) -> Image.Image:
         sx, sy = scale
         u, v = (self._x - 0.5) * sx + 0.5, (self._y - 0.5) * sy + 0.5
         left, top, right, bottom = rect
@@ -193,6 +194,9 @@ class AmbientBackground:
         fade_x = (torch.minimum(self._x, 1 - self._x) / max((1 - 1 / sx) / 2, 1e-6)).clamp(0, 1)
         fade_y = (torch.minimum(self._y, 1 - self._y) / max((1 - 1 / sy) / 2, 1e-6)).clamp(0, 1)
         outer = fade_x.square() * (3 - 2 * fade_x) * fade_y.square() * (3 - 2 * fade_y)
+        if halo:
+            # 只加快参考幕面外衰减；竖屏两侧空区仍保持完整填光。
+            outer = outer.pow(3)
         return Image.fromarray((alpha * outer * 255).round().byte().numpy())
 
     @torch.inference_mode()
@@ -208,8 +212,11 @@ class AmbientBackground:
         fill_borders: bool = True,
         feather: float = 0.03,
         video_rect: _Rect = _FULL,
+        style: str = "edge",
     ) -> bytes | None:
         self._validate_frame(frame)
+        if type(style) is not str or style not in {"edge", "blur", "halo", "cinema"}:
+            raise ValueError("ambient style must be edge, blur, halo or cinema")
         if sbs is not None:
             self._validate_frame(sbs)
             if sbs.shape[-1] % 2:
@@ -247,6 +254,10 @@ class AmbientBackground:
             left, top, right, bottom = content_rect
             if not 0 <= left < right <= frame.shape[2] or not 0 <= top < bottom <= frame.shape[1]:
                 raise ValueError("ambient content_rect must be inside the frame")
+        if self._signature is not None and self._signature[-1] != style:
+            # 暂停只重建一次，不能丢弃已稳定的黑条范围再等待后续帧。
+            self.reset(preserve_content=True)
+            self._signature = (*self._signature[:-1], style)
         if self._last_tick is not None and now < math.nextafter(self._last_tick + 0.1, -math.inf):
             return None
         signature = (
@@ -255,6 +266,7 @@ class AmbientBackground:
             None if sbs is None else tuple(sbs.shape),
             fill_borders,
             video_rect,
+            style,
         )
         if signature != self._signature:
             self.reset()
@@ -300,22 +312,27 @@ class AmbientBackground:
             video_left + display_rect[2] * video_width,
             video_top + display_rect[3] * video_height,
         )
-        edges = (
-            reduced[:, :, :2].mean(dim=2, keepdim=True),
-            reduced[:, :, -2:].mean(dim=2, keepdim=True),
-            reduced[:, :2, :].mean(dim=1, keepdim=True),
-            reduced[:, -2:, :].mean(dim=1, keepdim=True),
-        )
-        colors = sum((edge * weight for edge, weight in zip(edges, self._weights)), torch.zeros_like(reduced))
-        colors = colors / self._weight_sum
+        if style == "blur":
+            colors = reduced
+        elif style == "cinema":
+            colors = reduced.mean(dim=(1, 2), keepdim=True).expand_as(reduced) * 0.35
+        else:
+            edges = (
+                reduced[:, :, :2].mean(dim=2, keepdim=True),
+                reduced[:, :, -2:].mean(dim=2, keepdim=True),
+                reduced[:, :2, :].mean(dim=1, keepdim=True),
+                reduced[:, -2:, :].mean(dim=1, keepdim=True),
+            )
+            colors = sum((edge * weight for edge, weight in zip(edges, self._weights)), torch.zeros_like(reduced))
+            colors = colors / self._weight_sum
         if self._colors is not None and self._last_tick is not None:
             blend = -math.expm1(-(now - self._last_tick) / 0.25)
             colors = self._colors.lerp(colors, blend)
         # CPU float[3,18,32] → uint8 ndarray[18,32,3] → PIL RGBA(320,180) → zlib bytes。
         rgb = (colors.permute(1, 2, 0) * (255 * brightness)).round().clamp(0, 255).byte()
         image = Image.fromarray(rgb.numpy()).resize((self.WIDTH, self.HEIGHT), Image.Resampling.BILINEAR)
-        image = image.filter(ImageFilter.BoxBlur(24)).convert("RGBA")
-        image.putalpha(self._alpha(display_rect, scale, feather))
+        image = image.filter(ImageFilter.BoxBlur(40 if style == "blur" else 24)).convert("RGBA")
+        image.putalpha(self._alpha(display_rect, scale, feather, halo=style == "halo"))
         identifier = self.TEXTURE_ID.encode("ascii")
         payload = bytes([len(identifier)]) + identifier + struct.pack("!HHB", self.WIDTH, self.HEIGHT, 1)
         payload += zlib.compress(image.tobytes(), level=3)

@@ -42,7 +42,9 @@ class QuestSession:
 
     @staticmethod
     def values(args: Namespace) -> dict[str, Any]:
-        return {key: copy.deepcopy(getattr(args, key)) for key in FIELD_MAP if hasattr(args, key)}
+        values = {key: copy.deepcopy(getattr(args, key)) for key in FIELD_MAP if hasattr(args, key)}
+        values.setdefault("quest_ambient_style", "edge")
+        return values
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -215,6 +217,7 @@ class QuestSession:
                     args.quest_ambient_spread,
                     args.quest_ambient_fill_borders,
                     args.quest_ambient_feather,
+                    getattr(args, "quest_ambient_style", "edge"),
                 )
         self.publish(args, patch)
 
@@ -246,6 +249,7 @@ class QuestSession:
             settings.get("ambient_spread", 2.0),
             settings.get("ambient_fill_borders", True),
             settings.get("ambient_feather", 0.03),
+            settings.get("ambient_style", "edge"),
         )
         self.server.set_controller_factory(settings.get("controller_factory"))
         return self.server
@@ -272,6 +276,7 @@ class QuestSession:
             ambient_spread=getattr(args, "quest_ambient_spread", 2.0),
             ambient_fill_borders=getattr(args, "quest_ambient_fill_borders", True),
             ambient_feather=getattr(args, "quest_ambient_feather", 0.03),
+            ambient_style=getattr(args, "quest_ambient_style", "edge"),
             reference_aspect=16 / 9 if args.screenshot == "browser_video" else None,
         )
         self.server.set_menu(QuestMenu(self.snapshot, self.submit))

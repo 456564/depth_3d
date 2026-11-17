@@ -22,6 +22,7 @@ from nunif.utils.video import pyav_init_cuda_primary_context
 from .. import models  # noqa
 from .. import utils as IW3U
 from ..stereo_model_factory import get_mlbw_divergence_level
+from .quest_settings import AMBIENT_STYLES
 from .screenshot_process import (  # noqa
     ScreenshotProcess,
     enum_window_names,
@@ -175,8 +176,9 @@ def create_parser():
         help="Quest horizontal screen arc in degrees (0-120; 0=flat)",
     )
     parser.add_argument("--port", type=int, default=1303, help="HTTP listen port")
+    parser.add_argument("--quest-ambient", action="store_true", help="Enable ambient light around the Quest screen")
     parser.add_argument(
-        "--quest-ambient", action="store_true", help="Enable video-edge ambient light around the Quest screen"
+        "--quest-ambient-style", choices=AMBIENT_STYLES, default="edge", help="Quest ambient light style"
     )
     parser.add_argument("--quest-ambient-brightness", type=float, default=0.25, help="Ambient brightness (0-1)")
     parser.add_argument("--quest-ambient-spread", type=float, default=2.0, help="Ambient coverage multiplier (1.2-4)")
@@ -272,6 +274,7 @@ def prepare_quest_args(args: Namespace) -> None:
             for key in (
                 "quest_screen_curvature",
                 "quest_ambient",
+                "quest_ambient_style",
                 "quest_ambient_brightness",
                 "quest_ambient_spread",
                 "quest_ambient_fill_borders",
@@ -565,6 +568,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 ambient_spread=args.quest_ambient_spread,
                 ambient_fill_borders=args.quest_ambient_fill_borders,
                 ambient_feather=args.quest_ambient_feather,
+                ambient_style=args.quest_ambient_style,
                 reference_aspect=16 / 9 if browser_video else None,
             )
         elif not args.local_viewer:

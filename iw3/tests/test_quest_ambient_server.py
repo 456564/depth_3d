@@ -13,6 +13,7 @@ import torch
 from iw3.desktop import quest_server
 from iw3.desktop.quest_input import QuestController
 
+from .test_quest_ambient import pixels
 from .test_quest_control_server import RecordedInput, entrada
 from .test_quest_server import EncoderDouble, connect, initial_messages, read_message, send_json
 
@@ -225,13 +226,19 @@ def test_disabling_removes_background_immediately_and_clears_history(server: Any
     with connect(server) as client:
         initial_messages(client)
         publish(server, client)
-        previous = server._ambient_background
         server.configure_ambient(False, 0.25, 2.0)
         assert len(read_layers(client)) == 2
-        assert server._ambient_pending is None and server._ambient_background is not previous
+        assert server._ambient_pending is None and not server._ambient_visible
         server.configure_ambient(True, 0.25, 2.0)
         assert len(read_layers(client)) == 2
-        publish(server, client)
+        blue = torch.zeros(3, 64, 64)
+        blue[2] = 1
+        server.set_ambient_frame(blue)
+        server.set_frame_data((blue.repeat(1, 1, 2), 2))
+        assert read_message(client)[0] == 0x02
+        kind, payload = read_message(client)
+        assert kind == 0x10 and pixels(payload)[90, 40, :3].tolist() == [0, 0, 64]
+        assert len(read_layers(client)) == 3
 
 
 def test_reconfigure_and_reconnect_do_not_reuse_background(server: Any) -> None:

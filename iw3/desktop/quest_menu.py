@@ -13,7 +13,7 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from .quest_input import _rotate, _vector, ray_to_uv
-from .quest_settings import FIELD_MAP, PAGES, get_fields, validate_patch
+from .quest_settings import AMBIENT_STYLE_LABELS, FIELD_MAP, PAGES, get_fields, validate_patch
 
 
 class QuestMenu:
@@ -409,6 +409,8 @@ class QuestMenu:
 
     @staticmethod
     def _value(key: str, value: Any) -> str:
+        if key == "quest_ambient_style":
+            return AMBIENT_STYLE_LABELS.get(value, str(value))
         if key == "window_name" and not value:
             return "整个桌面（所选显示器）"
         if key == "quest_screen_curvature":

@@ -48,12 +48,12 @@ def test_ambient_live_update_applies_all_current_values_without_media_restart() 
     owner.server = Namespace(configure_ambient=lambda *values: applied.append(values))
     owner.submit("set", {"quest_ambient_brightness": 0.4, "quest_ambient_spread": 3.0})
     owner.apply_live()
-    assert applied == [(True, 0.4, 3.0, True, 0.03)]
+    assert applied == [(True, 0.4, 3.0, True, 0.03, "edge")]
     assert owner.snapshot()["values"]["quest_ambient_brightness"] == 0.4
     assert not owner.run_stop.is_set()
     owner.submit("set", {"quest_ambient": False})
     owner.apply_live()
-    assert applied[-1] == (False, 0.4, 3.0, True, 0.03)
+    assert applied[-1] == (False, 0.4, 3.0, True, 0.03, "edge")
 
 
 def test_ambient_menu_controls_and_restart_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -105,7 +105,7 @@ def test_media_reconfiguration_passes_ambient_values(reference_aspect) -> None:
         ambient_feather=0.07,
         reference_aspect=reference_aspect,
     )
-    assert applied == [(True, 0.3, 2.2, False, 0.07)]
+    assert applied == [(True, 0.3, 2.2, False, 0.07, "edge")]
     assert layouts == [reference_aspect]
 
 
@@ -114,6 +114,7 @@ def test_capture_roi_and_final_sbs_reach_ambient_together_without_args_lock(monk
     from iw3.desktop import quest_server
 
     args = utils.create_parser().parse_args(["--quest", "--quest-ambient", "--bind-addr", "127.0.0.1"])
+    args.quest_ambient_style = "halo"
     utils.prepare_quest_args(args)
     depth = Namespace(
         loaded=lambda: True,
@@ -174,6 +175,11 @@ def test_capture_roi_and_final_sbs_reach_ambient_together_without_args_lock(monk
     monkeypatch.setattr(utils, "test_output_size", lambda *a: (1080, 3840))
     monkeypatch.setattr(utils.IW3U, "create_stereo_model", lambda *a, **kw: None)
     monkeypatch.setattr(utils.IW3U, "process_image", stereo)
-    monkeypatch.setattr(quest_server, "QuestServer", lambda **kw: server)
+
+    def create_server(**settings):
+        assert settings["ambient_style"] == "halo"
+        return server
+
+    monkeypatch.setattr(quest_server, "QuestServer", create_server)
     utils._iw3_desktop_main_once(args, init_wxapp=False)
     assert calls == ["stereo", "ambient", "video"]

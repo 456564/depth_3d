@@ -44,6 +44,7 @@ def test_schema_covers_quest_fields_with_chinese_help() -> None:
         "quest_control",
         "quest_screen_curvature",
         "quest_ambient",
+        "quest_ambient_style",
         "quest_ambient_brightness",
         "quest_ambient_spread",
         "quest_ambient_fill_borders",

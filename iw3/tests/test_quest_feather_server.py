@@ -7,6 +7,7 @@ import torch
 
 from iw3.desktop import quest_server
 
+from .test_quest_ambient import pixels
 from .test_quest_ambient_server import publish, read_layers
 from .test_quest_ambient_server import server as server
 from .test_quest_server import connect, initial_messages, send_json
@@ -79,9 +80,10 @@ def test_fill_and_feather_change_discard_visible_and_pending_masks(server: Any) 
         server.configure_ambient(True, 0.25, 2, False, 0)
         assert len(read_layers(client)) == 2
         assert server._ambient_generation > previous
-        assert server._ambient_pending is None and server._ambient_background is None
-        _, layers = publish(server, client)
+        assert server._ambient_pending is None and not server._ambient_visible
+        payload, layers = publish(server, client)
         assert layers[-1]["tex"] == "iw3_ambient"
+        assert pixels(payload)[90, 80, 3] == 0
 
 
 @pytest.mark.parametrize("degrees", [30, 120])

@@ -43,7 +43,7 @@ from nunif.gui import (
 from ..base_depth_model import BaseDepthModel
 from ..locales import LOCALES, load_language_setting, save_language_setting
 from .quest_restart import add_resume_argument, load_resume, restart_process
-from .quest_settings import FIELD_MAP
+from .quest_settings import AMBIENT_STYLE_LABELS, AMBIENT_STYLES, FIELD_MAP
 from .utils import (
     get_local_address,
     is_private_address,
@@ -775,6 +775,11 @@ class MainFrame(wx.Frame):
         self.chk_quest_ambient_fill_borders.SetToolTip(
             "用视频边缘颜色填充连续黑条，保留比例和完整画面；暗场可能与黑边相似，识别误判时可关。不提高分辨率。"
         )
+        self.cbo_quest_ambient_style = wx.Choice(
+            self.pnl_process, choices=list(AMBIENT_STYLE_LABELS.values()), name="cbo_quest_ambient_style"
+        )
+        self.cbo_quest_ambient_style.SetSelection(0)
+        self.cbo_quest_ambient_style.SetToolTip(FIELD_MAP["quest_ambient_style"].help)
         self.lbl_quest_ambient_feather = wx.StaticText(self.pnl_process, label="边缘渐隐 10.00%")
         self.lbl_quest_ambient_feather.SetMinSize(self.lbl_quest_ambient_feather.GetBestSize())
         self.lbl_quest_ambient_feather.SetLabel("边缘渐隐 3%")
@@ -788,6 +793,7 @@ class MainFrame(wx.Frame):
         self.sld_quest_ambient_brightness.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
         self.sld_quest_ambient_spread.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
         self.chk_quest_ambient_fill_borders.Bind(wx.EVT_CHECKBOX, self.on_quest_ambient)
+        self.cbo_quest_ambient_style.Bind(wx.EVT_CHOICE, self.on_quest_ambient)
         self.sld_quest_ambient_feather.Bind(wx.EVT_SLIDER, self.on_quest_ambient)
 
         layout = wx.GridBagSizer(vgap=5, hgap=4)
@@ -804,7 +810,8 @@ class MainFrame(wx.Frame):
         layout.Add(self.sld_quest_ambient_brightness, (4, 2), (1, 2), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_ambient_spread, (5, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_ambient_spread, (5, 2), (1, 2), flag=wx.EXPAND)
-        layout.Add(self.chk_quest_ambient_fill_borders, (6, 0), (1, 4), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.chk_quest_ambient_fill_borders, (6, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        layout.Add(self.cbo_quest_ambient_style, (6, 2), (1, 2), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_ambient_feather, (7, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_ambient_feather, (7, 2), (1, 2), flag=wx.EXPAND)
         self.pnl_process.SetSizer(layout)
@@ -1031,6 +1038,11 @@ class MainFrame(wx.Frame):
             control = event.GetEventObject()
             for key, widget, value in (
                 ("quest_ambient", self.chk_quest_ambient, self.chk_quest_ambient.GetValue()),
+                (
+                    "quest_ambient_style",
+                    self.cbo_quest_ambient_style,
+                    AMBIENT_STYLES[max(0, self.cbo_quest_ambient_style.GetSelection())],
+                ),
                 ("quest_ambient_brightness", self.sld_quest_ambient_brightness, brightness / 100),
                 ("quest_ambient_spread", self.sld_quest_ambient_spread, spread),
                 (
@@ -1326,6 +1338,7 @@ class MainFrame(wx.Frame):
                 quest_control=self.chk_quest_control.GetValue(),
                 quest_screen_curvature=self.sld_quest_screen_curvature.GetValue(),
                 quest_ambient=self.chk_quest_ambient.GetValue(),
+                quest_ambient_style=AMBIENT_STYLES[max(0, self.cbo_quest_ambient_style.GetSelection())],
                 quest_ambient_brightness=self.sld_quest_ambient_brightness.GetValue() / 100,
                 quest_ambient_spread=self.sld_quest_ambient_spread.GetValue() / 100,
                 quest_ambient_fill_borders=self.chk_quest_ambient_fill_borders.GetValue(),
@@ -1447,6 +1460,8 @@ class MainFrame(wx.Frame):
                 self.on_quest_screen_curvature(None)
             if "quest_ambient" in values:
                 self.chk_quest_ambient.SetValue(values["quest_ambient"])
+            if "quest_ambient_style" in values:
+                self.cbo_quest_ambient_style.SetSelection(AMBIENT_STYLES.index(values["quest_ambient_style"]))
             if "quest_ambient_fill_borders" in values:
                 self.chk_quest_ambient_fill_borders.SetValue(values["quest_ambient_fill_borders"])
             for key, scale in (
@@ -1646,6 +1661,7 @@ class MainFrame(wx.Frame):
         manager.SaveAndUnregister()
 
     def load_preset(self, name=None, exclude_names=set()):
+        self.cbo_quest_ambient_style.SetSelection(0)
         exclude_names.add("cbo_language")  # ignore language
         if not name:
             name = ""
@@ -1829,6 +1845,7 @@ class MainFrame(wx.Frame):
             self.lbl_quest_screen_curvature,
             self.sld_quest_screen_curvature,
             self.chk_quest_ambient,
+            self.cbo_quest_ambient_style,
             self.sld_quest_ambient_brightness,
             self.lbl_quest_ambient_spread,
             self.sld_quest_ambient_spread,

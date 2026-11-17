@@ -13,6 +13,138 @@ from .test_quest_ambient_server import main_video, read_layers
 from .test_quest_server import EncoderDouble, connect, initial_messages, read_message, send_json
 
 
+@pytest.mark.parametrize("style", [None, [], True, "unknown", "EDGE"])
+def test_ambient_style_rejects_invalid_values_before_changing_configuration(style):
+    with pytest.raises(ValueError, match="ambient style"):
+        quest_server.QuestServer("127.0.0.1", 128, 64, 30, 35, ambient_style=style)
+    server = quest_server.QuestServer("127.0.0.1", 128, 64, 30, 35)
+    with pytest.raises(ValueError, match="ambient style"):
+        server.configure_ambient(True, 0.5, 3, style=style)
+    assert server._ambient_style == "edge" and not server._ambient_enabled
+
+
+def test_paused_style_switch_sends_distinct_rgba_without_encoding_or_consuming_idr(monkeypatch):
+    calls = []
+
+    class Encoder(EncoderDouble):
+        def encode(self, frame, pts, force_idr=False):
+            calls.append(force_idr)
+            return super().encode(frame, pts, force_idr)
+
+    monkeypatch.setattr(quest_server, "QuestEncoder", Encoder)
+    server = quest_server.QuestServer(
+        "127.0.0.1",
+        72,
+        64,
+        30,
+        35,
+        audio=False,
+        port=0,
+        discovery_port=0,
+        ambient_enabled=True,
+        reference_aspect=16 / 9,
+        ambient_style="cinema",
+    )
+    server.start()
+    try:
+        with connect(server) as client:
+            assert read_message(client)[0] == 0x01
+            main = main_video(read_layers(client))
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._connection is not None, timeout=1)
+            frame = torch.zeros(3, 64, 36)
+            frame[0, :32] = 1
+            frame[1, 32:] = 1
+            frame[2, :, :18] = 1
+            stereo = frame.repeat(1, 1, 2)
+            server.set_ambient_frame(frame, sbs=stereo)
+            server.set_frame_data((stereo, 1))
+            assert read_message(client)[0] == 0x02
+            kind, first = read_message(client)
+            assert kind == 0x10
+            assert main_video(read_layers(client)) == main
+            textures = [pixels(first)]
+            with server._condition:
+                server._need_idr = True
+            for style in ("edge", "blur", "halo", "cinema"):
+                server.configure_ambient(True, 0.25, 2, style=style)
+                assert main_video(read_layers(client)) == main
+                server.refresh_ambient_frame()
+                kind, payload = read_message(client)
+                assert kind == 0x10
+                textures.append(pixels(payload))
+                assert main_video(read_layers(client)) == main
+                assert len(calls) == 1 and server._need_idr
+            assert all(not torch.equal(textures[i], textures[j]) for i in range(4) for j in range(i))
+            assert torch.equal(textures[0], textures[-1])
+            server.refresh_ambient_frame()
+            client.settimeout(0.1)
+            with pytest.raises(socket.timeout):
+                read_message(client)
+            server.check_error()
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("style,brightness", [("blur", 0.25), ("edge", 0.8)], ids=["style", "brightness"])
+def test_paused_ambient_change_preserves_settled_embedded_black_border_fill(monkeypatch, style, brightness):
+    from types import SimpleNamespace
+
+    from iw3.desktop import quest_ambient
+
+    from .test_quest_feather import alpha_at, frame, pixels
+
+    calls = []
+    clock = [0.0]
+
+    class Encoder(EncoderDouble):
+        def encode(self, image, pts, force_idr=False):
+            calls.append(force_idr)
+            return super().encode(image, pts, force_idr)
+
+    monkeypatch.setattr(quest_server, "QuestEncoder", Encoder)
+    monkeypatch.setattr(quest_ambient, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    server = quest_server.QuestServer(
+        "127.0.0.1", 768, 216, 30, 35, audio=False, port=0, discovery_port=0, ambient_enabled=True
+    )
+    server.start()
+    try:
+        with connect(server) as client:
+            assert read_message(client)[0] == 0x01
+            read_layers(client)
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._connection is not None, timeout=1)
+            image = frame()
+            stereo = torch.cat((image, image), 2)
+            for index, tick in enumerate((0.0, 0.11, 0.33)):
+                clock[0] = tick
+                server.set_ambient_frame(image, sbs=stereo)
+                server.set_frame_data((stereo, index + 1))
+                assert read_message(client)[0] == 0x02
+                kind, payload = read_message(client)
+                assert kind == 0x10
+                if index == 0:
+                    read_layers(client)
+            assert alpha_at(pixels(payload), 0.1) == 255
+            with server._condition:
+                server._need_idr = True
+            server.configure_ambient(True, brightness, 2, style=style)
+            read_layers(client)
+            server.refresh_ambient_frame()
+            kind, payload = read_message(client)
+            assert kind == 0x10
+            read_layers(client)
+            assert alpha_at(pixels(payload), 0.1) == 255
+            assert len(calls) == 3 and server._need_idr
+            server.refresh_ambient_frame()
+            client.settimeout(0.1)
+            with pytest.raises(socket.timeout):
+                read_message(client)
+            server.check_error()
+    finally:
+        server.stop()
+
+
 @pytest.mark.parametrize("width,height,size", [(128, 36, (3.6, 2.025)), (72, 64, (1.1390625, 2.025))])
 def test_browser_reference_keeps_viewing_height_without_padding_video(width, height, size):
     server = quest_server.QuestServer("127.0.0.1", width, height, 30, 35, reference_aspect=16 / 9)

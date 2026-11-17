@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 PAGES = ("画面与立体", "模型与性能", "串流与声音", "捕获与控制", "屏幕与状态", "环境光")
+AMBIENT_STYLES = ("edge", "blur", "halo", "cinema")
+AMBIENT_STYLE_LABELS = dict(zip(AMBIENT_STYLES, ("方向柔光", "画面模糊延展", "四边光晕", "影院暗光")))
 COMMANDS = frozenset(
     {"set", "apply", "restart_stream", "restart_app", "restore", "refresh_windows", "recenter", "exit_fullscreen"}
 )
@@ -318,7 +320,20 @@ FIELDS = (
         PAGES[5],
         "bool",
         immediate=True,
-        help="作用：把当前捕获画面的四边颜色扩散到主屏周围，左右上下保持对应。开：前方柔光随视频变化；关：恢复黑色背景。网页白边、工具栏也会参与，建议视频全屏；不自动识别播放器，不增加AI立体强度。",
+        help="作用：按所选样式扩散当前视频颜色，详见环境光样式。开：前方柔光随视频变化；关：恢复黑色背景。截图来源的网页白边、工具栏也会参与；不增加AI立体强度。",
+    ),
+    Field(
+        "quest_ambient_style",
+        "环境光样式",
+        PAGES[5],
+        "enum",
+        immediate=True,
+        help=(
+            "方向柔光：保持上下左右的边缘对应颜色。画面模糊延展：把视频内容大幅模糊后铺向周围。"
+            "四边光晕：光更靠近屏幕边缘，向外更快变暗。影院暗光：用视频平均色生成低亮背景。"
+            "四种都保留中央清晰画面；亮度、扩散、填光与渐隐仍可调，暂停时切换也即时生效。"
+        ),
+        choices=AMBIENT_STYLES,
     ),
     Field(
         "quest_ambient_brightness",
