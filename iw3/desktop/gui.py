@@ -23,6 +23,7 @@ from nunif.device import mps_is_available, xpu_is_available, create_device
 from nunif.models.utils import check_compile_support
 from nunif.utils.filename import sanitize_filename
 from nunif.utils.home_dir import ensure_home_dir
+from nunif.utils.video import pyav_init_cuda_primary_context
 from nunif.gui import (
     IpAddrCtrl,
     EditableComboBox,
@@ -1964,6 +1965,8 @@ def main():
 
     sys.argv = [sys.argv[0]]  # clear command arguments
 
+    # 查询显卡属性前保留 NVDEC 的 primary context，避免 AI 分配显存后标志冲突。
+    pyav_init_cuda_primary_context()
     app = IW3DesktopApp(resume_values=resume_values)
     app.MainLoop()
     if app.quest_restart_path is not None:
