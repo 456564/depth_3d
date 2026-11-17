@@ -575,13 +575,17 @@ class QuestMenu:
         )
         if browser:
             decode_status = "NVDEC 已硬解" if values.get("hardware_active") else "NVDEC 等待有效帧"
+            available = " / ".join(f"{height}p" for height in values.get("available_quality") or [])
             lines = [
                 "来源：网页原压缩视频；全部档位取源失败会提示并回录屏。",
+                f"可用档位（来源标注，未逐档验证）：{available}"
+                if available
+                else "可用档位：来源画质表未取得或尺寸未标注；实际以 NVDEC 为准。",
                 f"解码：{decode_status}；源尺寸：{values.get('source_size') or '等待'}。",
-                "声音沿用 Windows 回环采音，视频跟随网页时间；尚无严格音画同步保证。",
             ]
             if values.get("selected_quality"):
                 lines.append(f"实际档位：{values['selected_quality']}；编码：{values.get('codec') or '等待'}")
+            lines.append("声音沿用 Windows 回环采音，视频跟随网页时间；尚无严格音画同步保证。")
         elif values.get("quest_auto_browser"):
             lines[0] = "来源：桌面捕获；抖音进入全屏后自动切压缩视频，退出恢复桌面。"
         if values.get("fallback_reason"):
@@ -590,12 +594,21 @@ class QuestMenu:
             ("depth_model", "当前模型"),
             ("method", "合成方法"),
             ("output_size", "输出尺寸"),
-            ("estimated_fps", "电脑处理 FPS"),
-            ("screenshot_fps", "解码 FPS" if browser else "捕获 FPS"),
-            ("streaming_fps", "电脑发送 FPS"),
-            ("bind_addr", "当前连接地址"),
-            ("screen_surface", "当前屏幕形状"),
         ):
+            if key in values:
+                lines.append(f"{label}：{values[key]}")
+        fps = " / ".join(
+            f"{label} {values[key]}"
+            for key, label in (
+                ("estimated_fps", "处理"),
+                ("screenshot_fps", "解码" if browser else "捕获"),
+                ("streaming_fps", "发送"),
+            )
+            if key in values
+        )
+        if fps:
+            lines.append(f"电脑 FPS：{fps}")
+        for key, label in (("bind_addr", "当前连接地址"), ("screen_surface", "当前屏幕形状")):
             if key in values:
                 lines.append(f"{label}：{values[key]}")
         self._wrap(draw, "\n".join(lines), 40, 418, 1450, 26, lines=10)

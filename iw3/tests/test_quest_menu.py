@@ -429,6 +429,60 @@ def test_small_model_filter_uses_factory_candidates(menu: Any) -> None:
     assert state._available("depth_model") == ["Any_V2_S", "Any_L"]
 
 
+@pytest.mark.parametrize(
+    "available, selected, source_size",
+    [([2160, 1440, 1080, 720], "1440p", (1440, 2560)), ([], None, None), ([], "1088p", (1088, 1920))],
+)
+def test_status_keeps_reported_quality_and_actual_decode_visible(
+    menu: Any, monkeypatch, available, selected, source_size
+):
+    state, snapshot, _ = menu
+    snapshot["values"].update(
+        source_kind="browser",
+        hardware_active=selected is not None,
+        available_quality=available,
+        selected_quality=selected,
+        source_size=source_size,
+        codec="hevc",
+        fallback_reason="媒体 HTTP 403",
+        output_size=(2560, 1440),
+        estimated_fps=27,
+        screenshot_fps=30,
+        streaming_fps=28,
+        screen_surface="平面",
+    )
+    rendered = []
+    monkeypatch.setattr(state, "_text", lambda draw, xy, text, *args, **kwargs: rendered.append((xy, str(text))))
+    opened(state)
+    click(state, "page", 4)
+    rendered.clear()
+    state._render()
+    visible = "".join(text for (_, y), text in rendered if 418 <= y < 796)
+    assert "可用档位" in visible
+    if available:
+        assert "来源标注，未逐档验证" in visible
+        assert "2160p / 1440p / 1080p / 720p" in visible
+    else:
+        assert "来源画质表未取得或尺寸未标注" in visible
+        assert "实际以 NVDEC 为准" in visible
+    if selected is not None:
+        assert f"实际档位：{selected}；编码：hevc" in visible
+    assert "电脑 FPS：处理 27 / 解码 30 / 发送 28" in visible
+
+
+def test_desktop_status_keeps_processing_capture_and_send_fps_visible(menu: Any, monkeypatch):
+    state, snapshot, _ = menu
+    snapshot["values"].update(source_kind="desktop", estimated_fps=27, screenshot_fps=30, streaming_fps=28)
+    rendered = []
+    monkeypatch.setattr(state, "_text", lambda draw, xy, text, *args, **kwargs: rendered.append((xy, str(text))))
+    opened(state)
+    click(state, "page", 4)
+    rendered.clear()
+    state._render()
+    visible = "".join(text for (_, y), text in rendered if 418 <= y < 796)
+    assert "电脑 FPS：处理 27 / 捕获 30 / 发送 28" in visible
+
+
 def test_fine_step_updates_real_patch(menu: Any) -> None:
     state, _, commands = menu
     opened(state)
