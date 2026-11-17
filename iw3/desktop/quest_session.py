@@ -236,6 +236,7 @@ class QuestSession:
 
     def configure(self, **settings: Any) -> Any:
         self.server.pause_media()
+        self.server.set_reference_aspect(settings.get("reference_aspect"))
         self.server.configure_video(settings["width"], settings["height"], settings["fps"], settings["bitrate"])
         self.server.configure_audio(settings["audio"], settings["audio_source"], settings["audio_gain"])
         self.server.set_screen_curvature(settings.get("screen_curvature", 0.0))
@@ -271,6 +272,7 @@ class QuestSession:
             ambient_spread=getattr(args, "quest_ambient_spread", 2.0),
             ambient_fill_borders=getattr(args, "quest_ambient_fill_borders", True),
             ambient_feather=getattr(args, "quest_ambient_feather", 0.03),
+            reference_aspect=16 / 9 if args.screenshot == "browser_video" else None,
         )
         self.server.set_menu(QuestMenu(self.snapshot, self.submit))
         self.server.start()

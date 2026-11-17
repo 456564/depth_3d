@@ -60,11 +60,80 @@ test('relay forwards actual compressed bytes through JSON runtime boundary after
   assert.equal(b.calls[1].sequence,0);
 });
 
+test('relay forwards control-only heartbeats and navigation but no pause or compressed bytes',async()=>{
+  const b=relay(async message=>({ok:true,next_sequence:0,need_media:false,commands:['pause_toggle','next','exit_fullscreen'].map(name=>({name,generation:message.state.generation}))}));
+  b.emit({kind:'chunk',generation:'control',sequence:0,data:new Uint8Array([1]).buffer});
+  b.emit({kind:'state',state:{...state(1,'control'),media_available:false,width:0,height:0}});
+  await tick();
+  assert.equal(b.calls.length,1);
+  assert.equal(b.calls[0].state.media_available,false);
+  assert.deepEqual(Array.from(b.posted[0].commands,c=>c.name),['next','exit_fullscreen']);
+  assert.match(b.context.document.documentElement.dataset.iw3VideoBridge,/waiting/);
+});
+
+test('relay maps one compressed cache into fresh operation generations and replays its init',async()=>{
+  const b=relay();
+  b.emit({kind:'chunk',generation:'cache',sequence:0,data:new Uint8Array([7,8]).buffer});
+  b.emit({kind:'state',state:{...state(1,'first'),media_available:true,media_generation:'cache'}});
+  await tick();
+  b.emit({kind:'state',state:{...state(2,'live'),media_available:false}}); await tick();
+  b.emit({kind:'state',state:{...state(3,'returned'),media_available:true,media_generation:'cache'}}); await tick();
+  const chunks=b.calls.filter(message=>message.kind==='chunk');
+  assert.deepEqual(chunks.map(message=>[message.generation,message.sequence,message.data]),[['first',0,'Bwg='],['returned',0,'Bwg=']]);
+});
+
+test('relay rejects invalid availability and cache-key combinations before the runtime boundary',async()=>{
+  const b=relay();
+  for(const extra of [{media_available:'false'},{media_available:true},{media_available:false,media_generation:'old'},{media_available:true,media_generation:''}]) {
+    b.emit({kind:'state',state:{...state(),...extra}});
+  }
+  await tick(); assert.equal(b.calls.length,0);
+});
+
+test('relay drops a late old state reply after a new control target arrives',async()=>{
+  let release;
+  const b=relay(message=>message.state.generation==='old'?new Promise(resolve=>{release=resolve;}):Promise.resolve({ok:true,next_sequence:0,need_media:false,commands:[]}));
+  b.emit({kind:'chunk',generation:'cache',sequence:0,data:new Uint8Array([1]).buffer});
+  b.emit({kind:'state',state:{...state(1,'old'),media_available:true,media_generation:'cache'}}); await tick();
+  b.emit({kind:'state',state:{...state(2,'live'),media_available:false}});
+  release({ok:true,next_sequence:0,commands:[{name:'next',generation:'old'}]}); await tick();
+  assert.equal(b.posted.length,0);
+  assert.deepEqual(b.calls.map(message=>message.kind),['state','state']);
+  assert.equal(b.calls.at(-1).state.generation,'live');
+});
+
+test('relay ignores a late media response when the active target became control-only',async()=>{
+  let release;
+  const b=relay(message=>message.kind==='chunk'?new Promise(resolve=>{release=resolve;}):Promise.resolve({ok:true,next_sequence:0,need_media:false,commands:[]}));
+  b.emit({kind:'chunk',generation:'cache',sequence:0,data:new Uint8Array([1]).buffer});
+  b.emit({kind:'state',state:{...state(1,'old'),media_available:true,media_generation:'cache'}}); await tick();
+  b.emit({kind:'state',state:{...state(2,'live'),media_available:false}});
+  release({ok:true,next_sequence:1}); await tick();
+  const bridge=JSON.parse(b.context.document.documentElement.dataset.iw3VideoBridge);
+  assert.equal(bridge.generation,'live'); assert.equal(bridge.state,'waiting'); assert.equal(bridge.next_sequence,0);
+});
+
+test('background preserves strict availability but strips the page-only compressed cache key',async()=>{
+  const b=background();
+  await b.send({kind:'state',state:{...state(),media_available:true,media_generation:'private-cache'},focused:true});
+  const media=JSON.parse(b.calls.at(-1).options.body);
+  assert.equal(media.media_available,true); assert.equal(media.media_generation,undefined);
+  await b.send({kind:'state',state:{...state(2,'live'),media_available:false,width:0,height:0},focused:true});
+  const live=JSON.parse(b.calls.at(-1).options.body);
+  assert.equal(live.media_available,false); assert.equal(live.width,0);
+  const before=b.calls.length;
+  assert.equal((await b.send({kind:'chunk',session:'s',generation:'live',sequence:0,data:'AQ=='})).ok,false);
+  for(const extra of [{media_available:'false'},{media_available:true,width:0,height:0},{media_available:false,width:0,height:10}]) {
+    assert.equal((await b.send({kind:'state',state:{...state(3),...extra},focused:true})).ok,false);
+  }
+  assert.equal(b.calls.length,before);
+});
+
 test('relay has a loading heartbeat before the first media event', () => {
   const b = relay();
   b.advance(250);
   const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay || '{}');
-  assert.equal(stats.version, '1.1.2');
+  assert.equal(stats.version, '1.1.4');
   assert.equal(stats.events, 0);
   assert.equal(stats.chunks, 0);
   assert.equal(b.calls.length, 0);

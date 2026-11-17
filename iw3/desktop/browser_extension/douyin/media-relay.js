@@ -5,8 +5,8 @@
   const maxChunk = 8 * 1024 * 1024, maxCache = 256 * 1024 * 1024;
   const caches = new Map();
   const names = new Set(['pause_toggle', 'next', 'previous', 'exit_fullscreen']);
-  let cachedBytes = 0, latestState, activeState, pumping = false, ready = false, lastStateAt = 0;
-  const diagnostics = {version: '1.1.2', events: 0, states: 0, chunks: 0, bytes: 0, ticks: 0, window_seen: 0,
+  let cachedBytes = 0, latestState, activeState, transfer, pumping = false, ready = false, lastStateAt = 0;
+  const diagnostics = {version: '1.1.4', events: 0, states: 0, chunks: 0, bytes: 0, ticks: 0, window_seen: 0,
     rejected_source: 0, rejected_channel: 0, rejected_session: 0, rejected_kind: 0, rejected_state: 0, rejected_chunk: 0,
     report_sent: 0, report_ok: 0, report_rejected: 0, report_pending: 0, last_error: 'none'};
   const bridgeDiagnostics = {state: 'waiting', bytes: 0, next_sequence: 0};
@@ -52,19 +52,26 @@
   const identifier = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && /^[\x21-\x7e]+$/.test(value);
   function validState(value, session) {
     return value && value.session === session && identifier(session) && identifier(value.generation) &&
+      (value.media_available === undefined || typeof value.media_available === 'boolean') &&
+      (value.media_available === false ? value.media_generation === undefined :
+        value.media_available === undefined && value.media_generation === undefined || identifier(value.media_generation)) &&
       Number.isSafeInteger(value.serial) && value.serial >= 0 &&
       Number.isFinite(value.media_time) && value.media_time >= 0 && value.media_time <= 604800 &&
       typeof value.paused === 'boolean' && Number.isFinite(value.playback_rate) && value.playback_rate >= 0.05 && value.playback_rate <= 16 &&
-      [value.width, value.height].every(size => Number.isInteger(size) && size > 0 && size <= 8192) &&
+      ([value.width, value.height].every(size => Number.isInteger(size) && size > 0 && size <= 8192) ||
+        value.media_available === false && value.width === 0 && value.height === 0) &&
       (value.duration === null || Number.isFinite(value.duration) && value.duration >= 0 && value.duration <= 604800);
   }
+  const mediaKey = state => state?.media_available === false ? undefined : state?.media_generation || state?.generation;
+  const sameTarget = (a, b) => a && b && a.session === b.session && a.generation === b.generation &&
+    (a.media_available !== false) === (b.media_available !== false) && mediaKey(a) === mediaKey(b);
   function summary(state, message = '') {
-    const record = activeState && caches.get(activeState.generation);
-    Object.assign(bridgeDiagnostics, {state, bytes: record?.bytes || 0, next_sequence: record?.next || 0});
+    const record = caches.get(mediaKey(activeState));
+    Object.assign(bridgeDiagnostics, {state, bytes: record?.bytes || 0, next_sequence: transfer?.next || 0});
     if (!document.documentElement) return;
     document.documentElement.dataset.iw3VideoBridge = JSON.stringify({
       state, message, generation: activeState?.generation || null,
-      bytes: record?.bytes || 0, next_sequence: record?.next || 0,
+      bytes: record?.bytes || 0, next_sequence: transfer?.next || 0,
     });
   }
   function discard(generation) {
@@ -79,16 +86,16 @@
     if (!record) {
       if (message.sequence !== 0) return;
       while (caches.size >= 3) {
-        const candidate = [...caches.keys()].find(key => key !== activeState?.generation);
+        const candidate = [...caches.keys()].find(key => key !== mediaKey(activeState));
         if (!candidate) return;
         discard(candidate);
       }
-      record = {chunks: [], bytes: 0, next: 0, session: message.session};
+      record = {chunks: [], bytes: 0, session: message.session};
       caches.set(message.generation, record);
     }
     if (record.session !== message.session || message.sequence !== record.chunks.length) return;
     while (cachedBytes + message.data.byteLength > maxCache) {
-      const candidate = [...caches.keys()].find(key => key !== activeState?.generation && key !== message.generation);
+      const candidate = [...caches.keys()].find(key => key !== mediaKey(activeState) && key !== message.generation);
       if (!candidate) { summary('error', '压缩视频缓存已满；请切换视频。'); return; }
       discard(candidate);
     }
@@ -108,31 +115,32 @@
     try {
       while (true) {
         if (latestState) {
+          if (!sameTarget(activeState, latestState)) transfer = {next:0};
           activeState = latestState; latestState = undefined; ready = false;
           const reply = await chrome.runtime.sendMessage({kind: 'state', state: activeState, focused: document.hasFocus()});
+          if (latestState && !sameTarget(latestState, activeState)) continue;
           if (!reply?.ok) { summary('waiting', '本机视频桥暂不可用；等待重连。'); break; }
-          ready = true;
-          const record = caches.get(activeState.generation);
-          if (record && Number.isSafeInteger(reply.next_sequence) && reply.next_sequence >= 0) record.next = reply.next_sequence;
-          if (!latestState || latestState.generation === activeState.generation) {
-            const commands = Array.isArray(reply.commands) ? reply.commands.filter(command =>
-              names.has(command?.name) && command.generation === activeState.generation) : [];
-            if (commands.length) window.postMessage({channel, session: activeState.session, kind: 'commands', generation: activeState.generation, commands}, '*');
-          }
-          summary(record?.next > 0 ? 'source' : 'waiting', record ? '' : '等待当前视频的初始化字节。');
+          ready = activeState.media_available !== false;
+          const record = caches.get(mediaKey(activeState));
+          if (ready && record && Number.isSafeInteger(reply.next_sequence) && reply.next_sequence >= 0) transfer.next = reply.next_sequence;
+          const commands = Array.isArray(reply.commands) ? reply.commands.filter(command =>
+            names.has(command?.name) && command.generation === activeState.generation && (ready || command.name !== 'pause_toggle')) : [];
+          if (commands.length) window.postMessage({channel, session: activeState.session, kind: 'commands', generation: activeState.generation, commands}, '*');
+          summary(ready && transfer.next > 0 ? 'source' : 'waiting', record ? '' : '等待当前视频的初始化字节。');
           continue;
         }
-        const record = activeState && caches.get(activeState.generation);
-        if (!ready || !record || record.next >= record.chunks.length) break;
-        const sequence = record.next;
+        const record = caches.get(mediaKey(activeState));
+        if (!ready || !record || record.session !== activeState.session || transfer.next >= record.chunks.length) break;
+        const sequence = transfer.next;
         const reply = await chrome.runtime.sendMessage({
           kind: 'chunk', session: activeState.session, generation: activeState.generation,
           sequence, data: base64(record.chunks[sequence]),
         });
+        if (latestState && !sameTarget(latestState, activeState)) continue;
         if (!reply?.ok || !Number.isSafeInteger(reply.next_sequence) || reply.next_sequence <= sequence) {
           ready = false; summary('waiting', '压缩视频发送中断；等待重连。'); break;
         }
-        record.next = reply.next_sequence;
+        transfer.next = reply.next_sequence;
         summary('source');
       }
     } catch {

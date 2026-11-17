@@ -1,4 +1,4 @@
-"""头显操作只投递给当前网页视频，不向 Windows 注入坐标。"""
+"""头显操作只投递给当前网页目标，不向 Windows 注入坐标。"""
 
 import math
 from typing import Any
@@ -26,7 +26,7 @@ class BrowserInput:
         return bool(self._generation is not None and state.get("fresh") and state.get("generation") == self._generation)
 
     def mouse_down(self) -> bool:
-        if not self._current():
+        if not self._current() or not self.bridge.status().get("media_available", True):
             self._pressed = False
             return False
         if not self._pressed:

@@ -57,7 +57,7 @@ test('removed SourceBuffer never remains the current video track', () => {
   b.timers.forEach(callback => callback());
   const chunks = b.events.filter(event => event.kind === 'chunk');
   const current = b.events.find(event => event.kind === 'state');
-  assert.equal(current?.state.generation, chunks.at(-1).generation);
+  assert.equal(current?.state.media_generation, chunks.at(-1).generation);
 });
 
 test('accepted append larger than transport chunk limit loses no compressed bytes', () => {
@@ -82,7 +82,7 @@ test('revoking an already attached media blob preserves video source identity', 
   b.timers.forEach(callback => callback());
   const chunk = b.events.find(event => event.kind === 'chunk');
   const state = b.events.find(event => event.kind === 'state');
-  assert.equal(state?.state.generation, chunk.generation);
+  assert.equal(state?.state.media_generation, chunk.generation);
 });
 
 test('negative timestamp offset adjusts media time and duration onto the same raw timeline', () => {

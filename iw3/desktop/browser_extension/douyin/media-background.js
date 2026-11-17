@@ -22,7 +22,7 @@
     const relay = counts(value.relay, ['events','states','chunks','bytes']);
     const video = counts(value.video, ['width','height','ready_state']);
     const bridge = counts(value.bridge, ['bytes','next_sequence']);
-    if (!relay || !['1.1.1','1.1.2'].includes(value.relay.version) || !video || video.width > 8192 || video.height > 8192 || video.ready_state > 4 ||
+    if (!relay || !['1.1.1','1.1.2','1.1.3','1.1.4'].includes(value.relay.version) || !video || video.width > 8192 || video.height > 8192 || video.ready_state > 4 ||
       !['none','empty','url','blob','srcObject'].includes(value.video.kind) || typeof value.video.paused !== 'boolean' ||
       !bridge || bridge.bytes > 256 * 1024 * 1024 || !['waiting','source','error'].includes(value.bridge.state)) return null;
     for (const key of ['ticks','window_seen','rejected_source','rejected_channel','rejected_session','rejected_kind','rejected_state','rejected_chunk','report_sent','report_ok','report_rejected','report_pending']) {
@@ -37,11 +37,21 @@
     let main = null;
     if (value.main !== null && value.main !== undefined) {
       main = counts(value.main, ['ticks','mse_urls','blob_urls','other_urls','video_tracks','audio_tracks','other_tracks','appends','bytes','chunks','states']);
-      if (!main || !['1.1.1','1.1.2'].includes(value.main.version) || !['starting','ready'].includes(value.main.stage) ||
+      if (!main || !['1.1.1','1.1.2','1.1.3','1.1.4'].includes(value.main.version) || !['starting','ready'].includes(value.main.stage) ||
         !['none','empty','url','blob_mapped','blob_unmapped','srcObject'].includes(value.main.current)) return null;
       if (value.main.src_object_type !== undefined) {
         if (!['none','media_stream','media_source_handle','other'].includes(value.main.src_object_type)) return null;
         main.src_object_type = value.main.src_object_type;
+      }
+      for (const key of ['current_rtc','rtc_transform_supported']) {
+        if (value.main[key] === undefined) continue;
+        if (typeof value.main[key] !== 'boolean') return null;
+        main[key] = value.main[key];
+      }
+      if (value.main.rtc_video_tracks !== undefined) {
+        const rtc = counts(value.main,['rtc_video_tracks']);
+        if (!rtc) return null;
+        Object.assign(main,rtc);
       }
       if (value.main.width !== undefined || value.main.height !== undefined) {
         const dimensions = counts(value.main,['width','height']);
@@ -54,10 +64,12 @@
   }
   function validState(value) {
     return value && identifier(value.session) && identifier(value.generation) &&
+      (value.media_available === undefined || typeof value.media_available === 'boolean') &&
       Number.isSafeInteger(value.serial) && value.serial >= 0 &&
       Number.isFinite(value.media_time) && value.media_time >= 0 && value.media_time <= 604800 &&
       typeof value.paused === 'boolean' && Number.isFinite(value.playback_rate) && value.playback_rate >= 0.05 && value.playback_rate <= 16 &&
-      [value.width, value.height].every(size => Number.isInteger(size) && size > 0 && size <= 8192) &&
+      ([value.width, value.height].every(size => Number.isInteger(size) && size > 0 && size <= 8192) ||
+        value.media_available === false && value.width === 0 && value.height === 0) &&
       (value.duration === null || Number.isFinite(value.duration) && value.duration >= 0 && value.duration <= 604800);
   }
   async function pair() {
@@ -106,14 +118,16 @@
         return {
           ok:true,
           page:record ? {diagnostics:record.diagnostics,age_ms:Math.max(0,now-record.received_at),fresh:now-record.received_at<=3000,
-            source,delivered:!!confirmed && confirmed.bytes > 0 && confirmed.sequence > 0 && transport.ok && now-transport.updated_at<=3000,
+            source,media_available:source ? lease.media_available : null,
+            controllable:!!confirmed && confirmed.state_confirmed_at !== null && transport.ok && now-confirmed.state_confirmed_at<=3000,
+            delivered:!!confirmed && lease.media_available && confirmed.bytes > 0 && confirmed.sequence > 0 && transport.ok && now-transport.updated_at<=3000,
             confirmed_bytes:confirmed?.bytes || 0,confirmed_sequence:confirmed?.sequence || 0} : null,
           pages:pages.size,
           transport:{...transport,age_ms:transport.updated_at === null ? null : Math.max(0,now-transport.updated_at)},
           playback,
         };
       }
-      if (sender.frameId !== 0 || !Number.isInteger(sender.tab?.id) || new URL(sender.url).origin !== 'https://www.douyin.com')
+      if (sender.frameId !== 0 || !Number.isInteger(sender.tab?.id) || !['https://www.douyin.com','https://live.douyin.com'].includes(new URL(sender.url).origin))
         return {ok: false, message: '仅允许抖音顶层页面'};
       const now = Date.now();
       if (message?.kind === 'diagnostics') {
@@ -129,18 +143,21 @@
           return {ok: false, message: '另一个抖音标签正在提供视频'};
         const state = {};
         for (const key of ['session','generation','serial','media_time','paused','playback_rate','duration','width','height']) state[key] = message.state[key];
-        lease = {tab: sender.tab.id, session: state.session, generation: state.generation, until: now + 1000};
-        if (!delivery || delivery.tab !== lease.tab || delivery.session !== lease.session || delivery.generation !== lease.generation)
-          delivery = {tab:lease.tab,session:lease.session,generation:lease.generation,bytes:0,sequence:0};
+        state.media_available = message.state.media_available !== false;
+        lease = {tab: sender.tab.id, session: state.session, generation: state.generation, media_available:state.media_available, until: now + 1000};
+        if (!delivery || delivery.tab !== lease.tab || delivery.session !== lease.session || delivery.generation !== lease.generation || delivery.media_available !== lease.media_available)
+          delivery = {tab:lease.tab,session:lease.session,generation:lease.generation,media_available:lease.media_available,bytes:0,sequence:0,state_confirmed_at:null};
         const currentDelivery = delivery;
-        playback = {width:state.width,height:state.height,media_time:state.media_time,paused:state.paused,playback_rate:state.playback_rate};
+        playback = {width:state.width,height:state.height,media_time:state.media_time,paused:state.paused,playback_rate:state.playback_rate,media_available:state.media_available};
         const reply = await post('/state', JSON.stringify(state), {'Content-Type': 'application/json'});
+        if (currentDelivery !== delivery) return {ok:false,message:'当前页面目标已改变'};
+        if (reply.ok) currentDelivery.state_confirmed_at = Date.now();
         // 桥重启会清空同一视频的序号；换对象可阻断旧请求的迟到确认。
         if (currentDelivery === delivery && reply.ok && reply.next_sequence === 0)
           delivery = {...currentDelivery,bytes:0,sequence:0};
         return reply;
       }
-      if (message?.kind !== 'chunk' || !lease || lease.tab !== sender.tab.id || now > lease.until ||
+      if (message?.kind !== 'chunk' || !lease || !lease.media_available || lease.tab !== sender.tab.id || now > lease.until ||
         message.session !== lease.session || message.generation !== lease.generation ||
         !Number.isSafeInteger(message.sequence) || message.sequence < 0 ||
         typeof message.data !== 'string' || !message.data.length || message.data.length > 4 * Math.ceil(maxChunk / 3) ||

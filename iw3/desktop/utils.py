@@ -565,6 +565,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 ambient_spread=args.quest_ambient_spread,
                 ambient_fill_borders=args.quest_ambient_fill_borders,
                 ambient_feather=args.quest_ambient_feather,
+                reference_aspect=16 / 9 if browser_video else None,
             )
         elif not args.local_viewer:
             # Web Streaming
@@ -652,6 +653,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
         def blank_browser_frame():
             nonlocal browser_blanked
             if not browser_blanked:
+                server.discard_video_frames()
                 black = torch.zeros((3, output_frame_height, output_frame_width), device=device)
                 server.set_frame_data((black, time.perf_counter()))
                 browser_blanked = True
@@ -669,6 +671,8 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     generation = screenshot_thread.get_frame_generation()
                     if not screenshot_thread.is_current_generation(generation):
                         blank_browser_frame()
+                    else:
+                        server.refresh_ambient_frame()
                     continue
                 break
             source_generation = screenshot_thread.get_frame_generation() if browser_video else None
@@ -693,7 +697,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 ambient_enabled = args.quest and args.quest_ambient
             content_rect = (
                 (0, 0, frame_width, frame_height)
-                if browser_video and ambient_enabled
+                if browser_video
                 else screenshot_thread.get_content_rect()
                 if ambient_enabled and hasattr(screenshot_thread, "get_content_rect")
                 else None
@@ -707,6 +711,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                         side_model = try_switch_mlbw_model(prev_divergence, args.divergence, side_model, args)
                     prev_divergence = args.divergence
                 if browser_video and source_generation != processed_source_generation:
+                    blank_browser_frame()
                     # 换条清空深度/会聚时序，不重载权重；reset 保留现有 EMA decay 和 buffer_size。
                     depth_model.reset()
                     if args.state["convergence_model"] is not None:
@@ -728,7 +733,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     blank_browser_frame()
                     continue
                 browser_blanked = False
-            if ambient_enabled:
+            if ambient_enabled or browser_video:
                 # 原单目[3,H,W]负责取色，最终FullSBS[3,H2,2W2]负责遮罩，同一包提交且不持设置锁。
                 server.set_ambient_frame(frame, content_rect=content_rect, sbs=sbs)
             with args.state["args_lock"]:

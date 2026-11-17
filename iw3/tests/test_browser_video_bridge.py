@@ -286,3 +286,147 @@ def test_preflight_allows_extension_only_and_expected_headers(bridge):
         assert response.read() == b""
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("width,height", [(0, 0), (540, 960)])
+def test_unavailable_media_heartbeat_keeps_navigation_without_requesting_bytes(bridge, width, height):
+    token = pair(bridge)
+    playback = state(generation="live-target", media_available=False, width=width, height=height)
+    code, body, _ = request(bridge, "/state", playback, token=token)
+    assert code == 200
+    assert body == {"commands": [], "need_media": False, "next_sequence": 0}
+    status = bridge.status()
+    assert status["fresh"] and status["status"] == "waiting"
+    assert status.get("media_available") is False
+    assert bridge.snapshot() is None
+    for command in ("next", "previous", "exit_fullscreen"):
+        assert bridge.queue_command(command, "live-target")
+    assert not bridge.queue_command("pause_toggle", "live-target")
+    playback["serial"] = 1
+    reply = request(bridge, "/state", playback, token=token)[1]
+    assert reply["commands"] == [
+        {"name": "next", "generation": "live-target"},
+        {"name": "previous", "generation": "live-target"},
+        {"name": "exit_fullscreen", "generation": "live-target"},
+    ]
+    playback["serial"] = 2
+    assert request(bridge, "/state", playback, token=token)[1]["commands"] == []
+
+
+@pytest.mark.parametrize("available", [None, 0, 1, "false", [], {}])
+def test_media_availability_rejects_non_boolean_values(bridge, available):
+    token = pair(bridge)
+    assert request(bridge, "/state", state(media_available=available), token=token)[0] == 400
+    assert not bridge.status()["fresh"]
+
+
+@pytest.mark.parametrize("width,height", [(0, 960), (540, 0), (-1, 960), (True, 0), (0, False), (8193, 960)])
+def test_unavailable_media_dimensions_require_both_zero_or_valid_positive_sizes(bridge, width, height):
+    token = pair(bridge)
+    playback = state(media_available=False, width=width, height=height)
+    assert request(bridge, "/state", playback, token=token)[0] == 400
+    assert not bridge.status()["fresh"]
+
+
+@pytest.mark.parametrize("endpoint", ["/chunk", "/media"])
+def test_unavailable_media_rejects_bytes_even_with_current_generation(bridge, endpoint):
+    token = pair(bridge)
+    assert request(bridge, "/state", state(media_available=False), token=token)[0] == 200
+    code, _, _ = request(
+        bridge,
+        endpoint,
+        b"stale-init",
+        token=token,
+        headers={"X-IW3-Session": "tab", "X-IW3-Generation": "tab:video:track", "X-IW3-Sequence": "0"},
+    )
+    assert code == 409
+    assert bridge.status()["bytes"] == 0
+    assert bridge.snapshot() is None
+
+
+def test_availability_changes_clear_old_media_and_commands_even_with_same_generation(bridge):
+    token = pair(bridge)
+    assert request(bridge, "/state", state(), token=token)[0] == 200
+    assert bridge.status().get("media_available") is True
+    assert chunk(bridge, token, b"old-init")[0] == 200
+    old = bridge.snapshot()
+    assert bridge.queue_command("pause_toggle") and bridge.queue_command("next")
+    unavailable = state(serial=1, media_available=False)
+    code, reply, _ = request(bridge, "/state", unavailable, token=token)
+    assert code == 200 and reply == {"commands": [], "need_media": False, "next_sequence": 0}
+    assert bridge.snapshot() is None
+    assert bridge.status()["bytes"] == 0 and bridge.status()["revision"] > old.revision
+    assert chunk(bridge, token, b"late", sequence=1)[0] == 409
+    assert chunk(bridge, token, b"forged-init")[0] == 409
+    assert request(bridge, "/state", state(), token=token)[0] == 409
+    assert request(bridge, "/state", state(serial=1), token=token)[0] == 409
+    assert bridge.queue_command("next")
+    code, reply, _ = request(bridge, "/state", state(serial=2), token=token)
+    assert code == 200 and reply == {"commands": [], "need_media": True, "next_sequence": 0}
+    assert bridge.snapshot() is None
+    assert chunk(bridge, token, b"new-init")[0] == 200
+    assert bridge.snapshot().data == b"new-init"
+    assert old.data == b"old-init"
+
+
+def test_expired_state_rejects_late_media_before_heartbeat_can_revive_it(bridge, monkeypatch):
+    module = importlib.import_module("iw3.desktop.browser_video_bridge")
+    clock = [time.monotonic()]
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    token = pair(bridge)
+    assert request(bridge, "/state", state(), token=token)[0] == 200
+    assert chunk(bridge, token, b"current")[0] == 200
+    clock[0] += 2
+    assert chunk(bridge, token, b"late", sequence=1)[0] == 409
+    assert request(bridge, "/state", state(serial=1), token=token)[0] == 200
+    assert bridge.snapshot().data == b"current"
+
+
+def test_unavailable_media_navigation_expires_and_never_crosses_target(bridge, monkeypatch):
+    module = importlib.import_module("iw3.desktop.browser_video_bridge")
+    clock = [time.monotonic()]
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    token = pair(bridge)
+    playback = state(generation="live-one", media_available=False)
+    assert request(bridge, "/state", playback, token=token)[0] == 200
+    assert bridge.queue_command("next", "live-one")
+    clock[0] += 2
+    assert not bridge.status()["fresh"]
+    assert not bridge.queue_command("next", "live-one")
+    playback["serial"] = 1
+    assert request(bridge, "/state", playback, token=token)[1]["commands"] == []
+    assert bridge.queue_command("next", "live-one")
+    playback.update(serial=2, generation="live-two")
+    assert request(bridge, "/state", playback, token=token)[1]["commands"] == []
+    assert not bridge.queue_command("next", "live-one")
+
+
+def test_real_quest_controller_can_navigate_unavailable_live_media_once_without_losing_ray(bridge):
+    token = pair(bridge)
+    playback = state(generation="live-target", media_available=False, width=540, height=960)
+    assert request(bridge, "/state", playback, token=token)[0] == 200
+    BrowserInput = importlib.import_module("iw3.desktop.browser_input").BrowserInput
+    QuestController = importlib.import_module("iw3.desktop.quest_input").QuestController
+    backend = BrowserInput(bridge)
+    controller = QuestController(backend)
+    screen = {"pos": [0, 0, -3], "rot": [0, 0, 0, 1], "tam": [4, 2]}
+    hand = {"pos": [0, 0, 0], "rot": [0, 0, 0, 1], "analogico": [0, 0], "gatilho": False, "a": False}
+    data = {"estado": "focado", "maos": {"dir": hand}}
+    assert controller.update(data, screen)["tipo"] == "laser"
+    hand["analogico"] = [0, -1]
+    for _ in range(4):
+        assert controller.update(data, screen)["tipo"] == "laser"
+    playback["serial"] = 1
+    assert request(bridge, "/state", playback, token=token)[1]["commands"] == [
+        {"name": "next", "generation": "live-target"}
+    ]
+    playback["serial"] = 2
+    assert request(bridge, "/state", playback, token=token)[1]["commands"] == []
+    assert not backend.mouse_down()
+    hand["analogico"] = [0, 0]
+    assert controller.update(data, screen)["tipo"] == "laser"
+    assert controller.exit_fullscreen()
+    playback["serial"] = 3
+    assert request(bridge, "/state", playback, token=token)[1]["commands"] == [
+        {"name": "exit_fullscreen", "generation": "live-target"}
+    ]

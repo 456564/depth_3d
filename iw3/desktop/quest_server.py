@@ -48,6 +48,7 @@ class QuestServer:
         ambient_spread: float = 2.0,
         ambient_fill_borders: bool = True,
         ambient_feather: float = 0.03,
+        reference_aspect: float | None = None,
     ) -> None:
         address = ipaddress.IPv4Address(host)
         private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
@@ -72,6 +73,8 @@ class QuestServer:
         self.audio_source = audio_source
         self.audio_gain = audio_gain
         self._screen_curvature = float(screen_curvature)
+        self._validate_reference_aspect(reference_aspect)
+        self._reference_aspect = reference_aspect
         self._cylinder_supported: bool | None = None
         self._ambient_enabled = ambient_enabled
         self._ambient_brightness = float(ambient_brightness)
@@ -82,6 +85,11 @@ class QuestServer:
         self._ambient_generation = 0
         self._ambient_pending: tuple[bytes, int] | None = None
         self._ambient_visible = False
+        self._ambient_frame: (
+            tuple[torch.Tensor, tuple[int, int, int, int] | None, torch.Tensor | None, int, socket.socket] | None
+        ) = None
+        self._ambient_frame_revision = -1
+        self._ambient_refresh_pending = False
         self._controller_factory = controller_factory
         self._controller: QuestController | None = None
         self._condition = threading.Condition()
@@ -110,8 +118,8 @@ class QuestServer:
         self._pointer: dict[str, Any] | None = None
         self._pointer_tick = -math.inf
         self._recenter_requested = threading.Event()
+        self._sent_quad = self._default_quad()
         self._sent_layers: dict[str, Any] = self._layers()
-        self._sent_quad = {key: self._main_video(self._sent_layers)[key].copy() for key in ("pos", "rot", "tam")}
         self._threads: list[threading.Thread] = []
         self._sent: deque[float] = deque(maxlen=120)
         self._error: Exception | None = None
@@ -290,6 +298,47 @@ class QuestServer:
             raise ValueError("Quest requires Full SBS dimensions, positive FPS and 5-100 Mbps")
         self._request_media(True, (width, height, fps, bitrate))
 
+    @staticmethod
+    def _validate_reference_aspect(aspect: float | None) -> None:
+        if aspect is not None and (type(aspect) not in (int, float) or not math.isfinite(aspect) or aspect <= 0):
+            raise ValueError("Quest reference aspect must be finite and positive")
+
+    def set_reference_aspect(self, aspect: float | None) -> None:
+        self._validate_reference_aspect(aspect)
+        with self._layer_lock:
+            if aspect == self._reference_aspect:
+                return
+            with self._condition:
+                self._reference_aspect = aspect
+                self._reset_ambient()
+            self._sent_quad["tam"][1] = self._sent_quad["tam"][0] * self._screen_aspect()
+            if self._screen is not None:
+                self._screen.set_aspect(self._screen_aspect())
+            if self._connection is not None:
+                try:
+                    self._send_layers(self._connection)
+                except OSError:
+                    self._disconnect(self._connection)
+
+    def discard_video_frames(self) -> None:
+        # 与发送锁建立屏障：函数返回后，旧代次的在途编码包不能再写入连接。
+        with self._layer_lock:
+            with self._write_lock:
+                with self._condition:
+                    remove_layer = self._ambient_visible
+                    self._generation += 1
+                    self._pending = None
+                    self._need_idr = True
+                    self._reset_ambient()
+                    self._sent.clear()
+                    connection = self._connection
+                    self._condition.notify_all()
+            if remove_layer and connection is not None:
+                try:
+                    self._send_layers(connection)
+                except OSError:
+                    self._disconnect(connection)
+
     def configure_audio(self, enabled: bool, source: str, gain: float) -> None:
         if type(enabled) is not bool or source not in {"speaker", "process"}:
             raise ValueError("Invalid Quest audio configuration")
@@ -321,12 +370,16 @@ class QuestServer:
             horizontal = min(math.radians(170), angle * horizontal) / angle
         return horizontal, self._ambient_spread
 
-    def _reset_ambient(self) -> None:
+    def _reset_ambient(self, clear_frame: bool = True) -> None:
         # 只丢弃历史；持server锁时不构造含Torch运算的生成器。
         self._ambient_background = None
         self._ambient_generation += 1
         self._ambient_pending = None
         self._ambient_visible = False
+        self._ambient_refresh_pending = False
+        if clear_frame:
+            self._ambient_frame = None
+            self._ambient_frame_revision = -1
 
     def configure_ambient(
         self, enabled: bool, brightness: float, spread: float, fill_borders: bool = True, feather: float = 0.03
@@ -347,7 +400,7 @@ class QuestServer:
                 self._ambient_spread = float(spread)
                 self._ambient_fill_borders = fill_borders
                 self._ambient_feather = float(feather)
-                self._reset_ambient()
+                self._reset_ambient(clear_frame=False)
                 connection = self._connection
                 self._condition.notify_all()
             if connection is not None:
@@ -362,14 +415,39 @@ class QuestServer:
         content_rect: tuple[int, int, int, int] | None = None,
         sbs: torch.Tensor | None = None,
     ) -> None:
+        # RGB[3,H,W]/SBS[3,H,2W]只读引用由生产线程持有；暂停重建也在同一线程，不跨CUDA流。
+        with self._layer_lock:
+            with self._condition:
+                if self._shutdown.is_set() or not self._video_enabled or self._suspended or self._connection is None:
+                    return
+                cached = (frame, content_rect, sbs, self._generation, self._connection)
+                self._ambient_frame = cached
+        self._update_ambient_frame(cached)
+
+    def refresh_ambient_frame(self) -> None:
+        # 只在主生产循环等待新帧时调用；设置未变时不运行Torch、不压缩、不发送。
+        with self._condition:
+            cached = self._ambient_frame
+            if cached is None or self._ambient_frame_revision == self._ambient_generation:
+                return
+        self._update_ambient_frame(cached, refresh=True)
+
+    def _update_ambient_frame(
+        self,
+        cached: tuple[torch.Tensor, tuple[int, int, int, int] | None, torch.Tensor | None, int, socket.socket],
+        refresh: bool = False,
+    ) -> None:
+        frame, content_rect, sbs, video_generation, connection = cached
         with self._layer_lock:
             with self._condition:
                 if (
-                    self._shutdown.is_set()
+                    cached is not self._ambient_frame
+                    or video_generation != self._generation
+                    or connection is not self._connection
+                    or self._shutdown.is_set()
                     or not self._video_enabled
                     or not self._ambient_enabled
                     or self._suspended
-                    or self._connection is None
                 ):
                     return
                 generation = self._ambient_generation
@@ -377,18 +455,35 @@ class QuestServer:
                 brightness = self._ambient_brightness
                 scale = self._ambient_scale()
                 fill_borders, feather = self._ambient_fill_borders, self._ambient_feather
+                video_rect = self._video_rect()
         # 单目RGB取色+最终SBS遮罩→同包RGBA；提色与压缩由媒体owner在锁外完成。
         if background is None:
             background = AmbientBackground()
         payload = background.update(
-            frame, brightness, content_rect, sbs=sbs, scale=scale, fill_borders=fill_borders, feather=feather
+            frame,
+            brightness,
+            content_rect,
+            sbs=sbs,
+            scale=scale,
+            fill_borders=fill_borders,
+            feather=feather,
+            video_rect=video_rect,
         )
         if payload is None:
             return
         with self._condition:
-            if generation == self._ambient_generation and self._video_enabled and not self._shutdown.is_set():
+            if (
+                generation == self._ambient_generation
+                and cached is self._ambient_frame
+                and video_generation == self._generation
+                and connection is self._connection
+                and self._video_enabled
+                and not self._shutdown.is_set()
+            ):
                 self._ambient_background = background
                 self._ambient_pending = payload, generation
+                self._ambient_frame_revision = generation
+                self._ambient_refresh_pending = self._ambient_refresh_pending or refresh
                 self._condition.notify_all()
 
     def set_menu(self, menu: Any) -> None:
@@ -416,7 +511,7 @@ class QuestServer:
                 return
             with self._condition:
                 self._screen_curvature = float(degrees)
-                self._reset_ambient()
+                self._reset_ambient(clear_frame=False)
                 connection = self._connection
             if connection is not None:
                 self._control(connection, "reset")
@@ -590,17 +685,33 @@ class QuestServer:
     def _main_video(layers: dict[str, Any]) -> dict[str, Any]:
         return next(layer for layer in layers["camadas"] if layer.get("tex") == "video" and layer.get("olho") == "esq")
 
+    def _screen_aspect(self) -> float:
+        return 1 / self._reference_aspect if self._reference_aspect is not None else self.height / (self.width // 2)
+
+    def _default_quad(self) -> dict[str, Any]:
+        return {"pos": [0.0, 0.0, -3.0], "rot": [0.0, 0.0, 0.0, 1.0], "tam": [3.6, 3.6 * self._screen_aspect()]}
+
+    def _video_rect(self) -> tuple[float, float, float, float]:
+        if self._reference_aspect is None:
+            return 0.0, 0.0, 1.0, 1.0
+        aspect = (self.width // 2) / self.height
+        width = min(1.0, aspect / self._reference_aspect)
+        height = min(1.0, self._reference_aspect / aspect)
+        return (1 - width) / 2, (1 - height) / 2, (1 + width) / 2, (1 + height) / 2
+
     def _layers(
         self, pose: tuple[list[float], list[float]] | None = None, size: list[float] | None = None
     ) -> dict[str, Any]:
         position, rotation = pose if pose is not None else ([0.0, 0.0, -3.0], [0.0, 0.0, 0.0, 1.0])
         eye_width = self.width // 2
-        size = size if size is not None else [3.6, 3.6 * self.height / eye_width]
+        size = size if size is not None else self._default_quad()["tam"]
+        left, top, right, bottom = self._video_rect()
+        video_size = [size[0] * (right - left), size[1] * (bottom - top)]
         # 实测中面dict(pos[3],rot[4],tam[2]) → 双眼camadas[2]；曲面只换几何，不改SBS rect[4]。
         geometry: dict[str, Any] = {"tipo": "quad", "pos": list(position), "rot": list(rotation), "tam": list(size)}
         angle = math.radians(self._screen_curvature)
-        # 原生层要求角度>0.001rad；未知/不支持能力时与射线一起保留平面。
-        if self._cylinder_supported is True and angle > 0.001:
+        # 原生层要求实际内容弧角>0.001rad；未知能力或过小角度与射线一起保留平面。
+        if self._cylinder_supported is True and angle * (right - left) > 0.001:
             radius = size[0] / angle
             offset = _rotate(rotation, [0.0, 0.0, radius])
             geometry = {
@@ -611,10 +722,16 @@ class QuestServer:
                 "angulo": angle,
                 "aspecto": size[0] / size[1],
             }
+        video_geometry = {**geometry}
+        if geometry["tipo"] == "cilindro":
+            video_geometry["angulo"] = angle * (right - left)
+            video_geometry["aspecto"] = video_size[0] / video_size[1]
+        else:
+            video_geometry["tam"] = video_size
         layers: dict[str, Any] = {
             "camadas": [
                 {
-                    **geometry,
+                    **video_geometry,
                     "tex": "video",
                     "olho": eye,
                     "alpha": False,
@@ -695,6 +812,7 @@ class QuestServer:
                 ):
                     return
                 self._ambient_pending = None
+                self._ambient_refresh_pending = False
             self._send(connection, 0x10, pending[0])
             with self._condition:
                 if pending[1] != self._ambient_generation or not self._video_enabled:
@@ -725,7 +843,7 @@ class QuestServer:
                         self._video_config(connection)
                         with self._condition:
                             self._reset_ambient()
-                        self._send_layers(connection, self._main_video(self._layers()))
+                        self._send_layers(connection, self._default_quad())
                         if self._source is not None:
                             self._send_json(connection, 0x03, {"taxa": self._source.sample_rate, "canais": 2})
                     except OSError:
@@ -852,7 +970,7 @@ class QuestServer:
                 with self._condition:
                     if connection is not self._connection:
                         return
-                screen = QuestScreen(self.height / (self.width // 2))
+                screen = QuestScreen(self._screen_aspect())
                 self._screen = screen
             while not self._shutdown.is_set():
                 self._expire_input(connection)
@@ -877,7 +995,7 @@ class QuestServer:
                             if connection is not self._connection:
                                 return
                             if hello["cilindro"] != self._cylinder_supported:
-                                self._reset_ambient()
+                                self._reset_ambient(clear_frame=False)
                         if hello["cilindro"] != self._cylinder_supported:
                             self._cylinder_supported = hello["cilindro"]
                             self._control(connection, "reset")
@@ -996,7 +1114,7 @@ class QuestServer:
                             self._video_enabled
                             and not self._suspended
                             and self._connection is not None
-                            and self._pending is not None
+                            and (self._pending is not None or self._ambient_refresh_pending)
                         )
                     )
                 )
@@ -1005,7 +1123,9 @@ class QuestServer:
                 request, self._video_request = self._video_request, None
                 connection, pending = self._connection, self._pending
                 self._pending = None
-                force_idr, self._need_idr = self._need_idr, False
+                force_idr = self._need_idr
+                if pending is not None:
+                    self._need_idr = False
             if request is not None:
                 try:
                     encoder = None
@@ -1025,9 +1145,9 @@ class QuestServer:
                             if connection is not None:
                                 try:
                                     quad = self._sent_quad.copy()
-                                    quad["tam"] = [quad["tam"][0], quad["tam"][0] * height / (width // 2)]
+                                    quad["tam"] = [quad["tam"][0], quad["tam"][0] * self._screen_aspect()]
                                     if self._screen is not None:
-                                        self._screen.set_aspect(height / (width // 2))
+                                        self._screen.set_aspect(self._screen_aspect())
                                     self._video_config(connection)
                                     self._send_layers(connection, quad)
                                 except OSError:
@@ -1038,7 +1158,13 @@ class QuestServer:
                 finally:
                     request.done.set()
                 continue
-            assert connection is not None and pending is not None
+            assert connection is not None
+            if pending is None:
+                try:
+                    self._send_ambient(connection)
+                except OSError:
+                    self._disconnect(connection)
+                continue
             frame, tick, ready, generation = pending
             try:
                 if current is not connection:

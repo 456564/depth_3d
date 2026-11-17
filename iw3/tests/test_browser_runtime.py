@@ -84,7 +84,7 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
     args = desktop.create_parser().parse_args(["--quest", "--bind-addr", "127.0.0.1", "--stream-height", "320"])
     args.screenshot = "browser_video"
     desktop.prepare_quest_args(args)
-    cleaned, configured, sent, processed = [], [], [], []
+    cleaned, configured, sent, processed, barriers, refreshes, backgrounds = [], [], [], [], [], [], []
     source = None
     depth = SimpleNamespace(
         loaded=lambda: True,
@@ -183,6 +183,9 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
         stop=lambda: cleaned.append("server"),
         check_error=lambda: None,
         set_audio_gain=lambda gain: None,
+        discard_video_frames=lambda: barriers.append(True),
+        refresh_ambient_frame=lambda: refreshes.append(True),
+        set_ambient_frame=lambda *a, **kw: backgrounds.append(kw),
         configure_video=lambda w, h, fps, bitrate: configured.append((w, h)),
         set_frame_data=send,
         get_fps=lambda: 0,
@@ -199,5 +202,7 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
     desktop._iw3_desktop_main_once(args, init_wxapp=False)
     assert processed == [(3, 320, 180), (3, 320, 568), (3, 320, 568)]
     assert configured == [(360, 320), (1136, 320)]
+    assert len(barriers) == 3 and len(refreshes) == 1
+    assert [value["content_rect"] for value in backgrounds] == [(0, 0, 180, 320), (0, 0, 568, 320)]
     assert [tuple(frame.shape) for frame in sent if frame.any()] == [(3, 320, 360), (3, 320, 1136)]
     assert "bridge" in cleaned and "source" in cleaned and "depth-clear" in cleaned

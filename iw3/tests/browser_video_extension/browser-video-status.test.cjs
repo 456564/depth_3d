@@ -63,6 +63,21 @@ test('only this extension popup can query transport status', async () => {
   assert.equal(b.calls.length,0);
 });
 
+test('live room loads both media scripts and can report only from its HTTPS top level', async () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory,'manifest.json'),'utf8'));
+  for (const script of manifest.content_scripts) {
+    assert.ok(script.matches.includes('https://live.douyin.com/*'));
+  }
+  const b = background();
+  const live = {...pageSender(),url:'https://live.douyin.com/123'};
+  assert.equal((await b.send({kind:'diagnostics',diagnostics:diagnostics()},live)).ok,true);
+  assert.equal((await b.send({kind:'state',state:state(),focused:true},live)).ok,true);
+  for (const url of ['http://live.douyin.com/123','https://evil.douyin.com/123','https://live.douyin.com.evil.example/123']) {
+    assert.equal((await b.send({kind:'diagnostics',diagnostics:diagnostics()},{...live,url})).ok,false);
+  }
+  assert.equal((await b.send({kind:'diagnostics',diagnostics:diagnostics()},{...live,frameId:1})).ok,false);
+});
+
 test('diagnostics accept only top-level Douyin and bounded safe fields', async () => {
   const b = background();
   for (const sender of [{...pageSender(),frameId:1},{...pageSender(),url:'https://evil.example/'}]) {
@@ -100,6 +115,18 @@ test('new diagnostic fields are validated while old 1.1.1 reports stay compatibl
   assert.equal((await b.send({kind:'diagnostics',diagnostics:unsafe})).ok,false);
 });
 
+test('RTC diagnostics allow only safe counts and booleans alongside legacy reports', async () => {
+  const b=background(), report=diagnostics();
+  Object.assign(report.main,{current_rtc:true,rtc_video_tracks:2,rtc_transform_supported:true});
+  assert.equal((await b.send({kind:'diagnostics',diagnostics:report})).ok,true);
+  const clean=(await b.send({kind:'status'},popupSender)).page.diagnostics.main;
+  assert.equal(clean.current_rtc,true); assert.equal(clean.rtc_video_tracks,2); assert.equal(clean.rtc_transform_supported,true);
+  for(const extra of [{current_rtc:'private label'},{rtc_video_tracks:-1},{rtc_transform_supported:1}]) {
+    const bad=diagnostics(); Object.assign(bad.main,extra);
+    assert.equal((await b.send({kind:'diagnostics',diagnostics:bad})).ok,false);
+  }
+});
+
 test('status counts successful compressed sends without exposing credentials or source identifiers', async () => {
   const b = background();
   await b.send({kind:'state',state:state(),focused:true});
@@ -113,6 +140,37 @@ test('status counts successful compressed sends without exposing credentials or 
   assert.equal(status.transport.ok,true);
   assert.equal(status.playback.width,1080);
   assert.ok(!JSON.stringify(status).includes('private'));
+});
+
+test('control-only heartbeat is independently online and cannot retain old delivery', async () => {
+  const b=background();
+  await b.send({kind:'diagnostics',diagnostics:diagnostics()});
+  await b.send({kind:'state',state:state(),focused:true});
+  await b.send({kind:'chunk',session:'private-session',generation:'private-generation',sequence:0,data:'AAEC/w=='});
+  await b.send({kind:'state',state:{...state(),serial:2,media_available:false,width:0,height:0},focused:true});
+  const status=await b.send({kind:'status'},popupSender);
+  assert.equal(status.page.controllable,true);
+  assert.equal(status.page.media_available,false);
+  assert.equal(status.page.delivered,false);
+  assert.equal(status.page.confirmed_bytes,0);
+  const before=b.calls.length;
+  assert.equal((await b.send({kind:'chunk',session:'private-session',generation:'private-generation',sequence:0,data:'AA=='})).ok,false);
+  assert.equal(b.calls.length,before);
+});
+
+test('a new target must confirm its own control heartbeat before being reported online', async () => {
+  let release, hold=false;
+  const b=background(async url=>url.endsWith('/hello') ? {ok:true,status:200,json:async()=>({token:'local'})} : hold ?
+    new Promise(resolve=>{release=resolve;}) : {ok:true,status:200,json:async()=>({next_sequence:0,commands:[]})});
+  await b.send({kind:'diagnostics',diagnostics:diagnostics()});
+  await b.send({kind:'state',state:state(),focused:true});
+  assert.equal((await b.send({kind:'status'},popupSender)).page.controllable,true);
+  hold=true;
+  const pending=b.send({kind:'state',state:{...state(),serial:2,generation:'new-live',media_available:false},focused:true});
+  await settle();
+  assert.equal((await b.send({kind:'status'},popupSender)).page.controllable,false);
+  release({ok:true,status:200,json:async()=>({next_sequence:0,commands:[]})}); await pending;
+  assert.equal((await b.send({kind:'status'},popupSender)).page.controllable,true);
 });
 
 test('page markers and successful playback state never prove compressed media delivery', async () => {
@@ -267,7 +325,7 @@ test('an authentication rejection stays visible during automatic pairing retry',
 
 test('manifest opens a local status popup without adding permissions', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(directory,'manifest.json'),'utf8'));
-  assert.equal(manifest.version,'1.1.2');
+  assert.equal(manifest.version,'1.1.4');
   assert.equal(manifest.action?.default_popup,'popup.html');
   assert.equal(manifest.permissions,undefined);
   assert.deepEqual(manifest.host_permissions,['http://127.0.0.1/*']);
@@ -338,6 +396,31 @@ test('popup delivery summary follows trusted background confirmation rather than
   const b = popup(confirmed); await settle();
   assert.equal(b.element('summary').textContent,'真实视频字节已送达电脑');
   assert.equal(b.element('sequence').textContent,'1 · 4 B');
+});
+
+test('popup distinguishes online page control from unavailable live media', async () => {
+  const status=connectedStatus();
+  Object.assign(status.page,{controllable:true,media_available:false,delivered:false,confirmed_bytes:0,confirmed_sequence:0});
+  const b=popup(status); await settle();
+  assert.equal(b.element('summary').textContent,'页面控制在线，当前视频未提供可解码输入');
+  assert.match(b.element('hint').textContent,/网页.*控件/);
+  assert.equal(b.element('summary').dataset.state,'waiting');
+  const offline=connectedStatus(); Object.assign(offline.page,{controllable:false,media_available:false,delivered:false});
+  const c=popup(offline); await settle();
+  assert.notEqual(c.element('summary').textContent,'页面控制在线，当前视频未提供可解码输入');
+});
+
+test('popup describes RTC association as observed metadata rather than decoded media', async () => {
+  const status=connectedStatus();
+  Object.assign(status.page,{controllable:true,media_available:false,delivered:false});
+  Object.assign(status.page.diagnostics.main,{current:'srcObject',src_object_type:'media_stream',current_rtc:true,rtc_video_tracks:1,rtc_transform_supported:true});
+  const b=popup(status); await settle();
+  assert.match(b.element('input').textContent,/RTC 已关联/);
+  assert.match(b.element('input').textContent,/视频轨道 1/);
+  status.page.diagnostics.main.current_rtc=false;
+  const c=popup(status); await settle();
+  assert.match(c.element('input').textContent,/RTC 尚未观察/);
+  assert.doesNotMatch(c.element('summary').textContent,/字节已送达/);
 });
 
 test('popup distinguishes current MAIN media from stale relay video snapshots', async () => {

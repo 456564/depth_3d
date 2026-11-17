@@ -37,6 +37,11 @@ def _identifier(value: Any) -> TypeGuard[str]:
 def _validate_state(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BridgeRequestError(400, "Invalid playback state")
+    media_available = value.get("media_available", True)
+    dimensions = (value.get("width"), value.get("height"))
+    valid_dimensions = all(type(size) is int and 0 < size <= 8192 for size in dimensions) or (
+        media_available is False and all(type(size) is int and size == 0 for size in dimensions)
+    )
     if (
         not _identifier(value.get("session"))
         or not _identifier(value.get("generation"))
@@ -45,11 +50,12 @@ def _validate_state(value: Any) -> dict[str, Any]:
         or not _number(value.get("media_time"), 0, 604800)
         or type(value.get("paused")) is not bool
         or not _number(value.get("playback_rate"), 0.05, 16)
-        or any(type(value.get(k)) is not int or not 0 < value[k] <= 8192 for k in ("width", "height"))
+        or type(media_available) is not bool
+        or not valid_dimensions
         or (value.get("duration") is not None and not _number(value["duration"], 0, 604800))
     ):
         raise BridgeRequestError(400, "Invalid playback state")
-    return {
+    validated = {
         k: value.get(k)
         for k in (
             "session",
@@ -63,6 +69,8 @@ def _validate_state(value: Any) -> dict[str, Any]:
             "height",
         )
     }
+    validated["media_available"] = media_available
+    return validated
 
 
 class BrowserVideoBridge:
@@ -236,9 +244,15 @@ class BrowserVideoBridge:
                     value["serial"] == previous["serial"] and value != previous
                 ):
                     raise BridgeRequestError(409, "Stale playback state")
-            changed = previous is None or (previous["session"], previous["generation"]) != (
+            # 页面心跳与媒体能力分开；能力切换同样废弃旧字节与待发命令。
+            changed = previous is None or (
+                previous["session"],
+                previous["generation"],
+                previous["media_available"],
+            ) != (
                 value["session"],
                 value["generation"],
+                value["media_available"],
             )
             if changed:
                 self._data.clear()
@@ -251,10 +265,16 @@ class BrowserVideoBridge:
             commands = [
                 {"name": name, "generation": generation}
                 for name, generation, queued_at in self._commands
-                if generation == value["generation"] and now - queued_at <= STATE_TTL
+                if generation == value["generation"]
+                and now - queued_at <= STATE_TTL
+                and (name != "pause_toggle" or value["media_available"])
             ]
             self._commands.clear()
-            return {"commands": commands, "need_media": not self._data, "next_sequence": self._sequence}
+            return {
+                "commands": commands,
+                "need_media": value["media_available"] and not self._data,
+                "next_sequence": self._sequence,
+            }
 
     def _receive_media(
         self, session: str, generation: str, sequence: int, data: bytes, replace: bool
@@ -265,6 +285,8 @@ class BrowserVideoBridge:
             state = self._state
             if (
                 state is None
+                or not state["media_available"]
+                or monotonic() - self._received_at > STATE_TTL
                 or (session, generation) != (state["session"], state["generation"])
                 or sequence != self._sequence
             ):
@@ -286,7 +308,12 @@ class BrowserVideoBridge:
 
         with self._lock:
             state = self._state
-            if state is None or not self._data or monotonic() - self._received_at > STATE_TTL:
+            if (
+                state is None
+                or not state["media_available"]
+                or not self._data
+                or monotonic() - self._received_at > STATE_TTL
+            ):
                 return None
             if not self._immutable_data:
                 self._immutable_data = bytes(self._data)
@@ -305,11 +332,13 @@ class BrowserVideoBridge:
         with self._lock:
             state = self._state
             fresh = state is not None and monotonic() - self._received_at <= STATE_TTL
-            status = "source" if fresh and self._data else "waiting"
+            media_available = state is not None and state["media_available"]
+            status = "source" if fresh and media_available and self._data else "waiting"
             return {
                 "state": status,
                 "status": status,
                 "fresh": fresh,
+                "media_available": media_available,
                 "generation": state["generation"] if state is not None else None,
                 "width": state["width"] if state is not None else 0,
                 "height": state["height"] if state is not None else 0,
@@ -327,6 +356,7 @@ class BrowserVideoBridge:
             if (
                 name not in COMMANDS
                 or state is None
+                or (name == "pause_toggle" and not state["media_available"])
                 or now - self._received_at > STATE_TTL
                 or (generation is not None and generation != state["generation"])
             ):

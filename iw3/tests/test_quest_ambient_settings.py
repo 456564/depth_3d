@@ -77,11 +77,13 @@ def test_ambient_menu_controls_and_restart_values(monkeypatch: pytest.MonkeyPatc
     assert load_resume(resume, gui=False) == values
 
 
-def test_media_reconfiguration_passes_ambient_values() -> None:
+@pytest.mark.parametrize("reference_aspect", [None, 16 / 9])
+def test_media_reconfiguration_passes_ambient_values(reference_aspect) -> None:
     owner = session()
-    applied = []
+    applied, layouts = [], []
     owner.server = Namespace(
         pause_media=lambda: None,
+        set_reference_aspect=layouts.append,
         configure_video=lambda *a: None,
         configure_audio=lambda *a: None,
         set_screen_curvature=lambda *a: None,
@@ -101,8 +103,10 @@ def test_media_reconfiguration_passes_ambient_values() -> None:
         ambient_spread=2.2,
         ambient_fill_borders=False,
         ambient_feather=0.07,
+        reference_aspect=reference_aspect,
     )
     assert applied == [(True, 0.3, 2.2, False, 0.07)]
+    assert layouts == [reference_aspect]
 
 
 @pytest.mark.parametrize("has_content_rect", [True, False])

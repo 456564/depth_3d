@@ -7,10 +7,11 @@ class Bridge:
     def __init__(self):
         self.generation = "video-a"
         self.fresh = True
+        self.media_available = True
         self.commands = []
 
     def status(self):
-        return {"generation": self.generation, "fresh": self.fresh}
+        return {"generation": self.generation, "fresh": self.fresh, "media_available": self.media_available}
 
     def queue_command(self, name, generation=None):
         if not self.fresh or generation != self.generation:
@@ -71,3 +72,13 @@ def test_reset_removes_media_action_target_without_toggling_playback():
     assert not control.tap_key("escape")
     control.mouse_up()
     assert not bridge.commands
+
+
+def test_media_loss_cancels_pressed_pause_target_but_keeps_navigation_available():
+    control, bridge = backend()
+    assert control.move(0.5, 0.5) and control.mouse_down()
+    bridge.commands.clear()
+    bridge.media_available = False
+    assert not control.mouse_down()
+    assert control.move(0.5, 0.5) and control.tap_key("down")
+    assert bridge.commands == [("next", "video-a")]

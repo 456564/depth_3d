@@ -21,13 +21,15 @@
       const history = page && !page.fresh ? '历史：' : '';
       const videoMismatch = main && (main.width !== undefined ? main.width !== video?.width || main.height !== video?.height : main.current === 'none' && video?.width > 0);
       const delivered = page?.fresh && page.delivered === true;
-      text('summary', !page ? '未收到抖音页面心跳' : !page.fresh ? '页面心跳已过期' : delivered ? '真实视频字节已送达电脑' : '等待可用视频源或本机连接');
+      const controlOnly = page?.fresh && page.controllable && page.media_available === false;
+      const rtc = main?.src_object_type === 'media_stream' && main.current_rtc !== undefined ? ` · RTC ${main.current_rtc ? '已关联' : '尚未观察'} / 视频轨道 ${main.rtc_video_tracks} / 编码变换接口${main.rtc_transform_supported ? '可用' : '未检出'}` : '';
+      text('summary', !page ? '未收到抖音页面心跳' : !page.fresh ? '页面心跳已过期' : delivered ? '真实视频字节已送达电脑' : controlOnly ? '页面控制在线，当前视频未提供可解码输入' : '等待可用视频源或本机连接');
       document.getElementById('summary').dataset.state = delivered ? 'ok' : 'waiting';
-      text('hint', !page ? '请重载本扩展，然后刷新抖音并播放普通视频。' : !page.fresh ? '以下为历史统计；诊断心跳过期不等于视频断流。' : !main ? '转发脚本已加载，尚未收到媒体观察脚本状态。' : main.current === 'blob_unmapped' ? '播放器的 blob 尚未关联到可观察的压缩输入。' : delivered ? '取源成功；继续在 iw3 检查硬解和头显串流。' : 'iw3 需选择 browser_video 来源并开始串流。');
+      text('hint', !page ? '请重载本扩展，然后刷新抖音并播放普通视频。' : !page.fresh ? '以下为历史统计；诊断心跳过期不等于视频断流。' : controlOnly ? '此输入尚未取源；切条需网页本身提供上一条／下一条控件。' : !main ? '转发脚本已加载，尚未收到媒体观察脚本状态。' : main.current === 'blob_unmapped' ? '播放器的 blob 尚未关联到可观察的压缩输入。' : delivered ? '取源成功；继续在 iw3 检查硬解和头显串流。' : 'iw3 需选择 browser_video 来源并开始串流。');
       text('heartbeat', page ? `${page.fresh ? '在线' : '已过期'} · ${(page.age_ms / 1000).toFixed(1)} 秒前` : '未收到');
       text('main', main ? `${history}${main.stage === 'ready' ? '已加载' : '启动中'} v${main.version} · 心跳 ${main.ticks}` : '未收到');
       text('relay', relay ? `${history}心跳 ${relay.ticks ?? '旧版未报告'} · 状态 ${relay.states} / 片段 ${relay.chunks}` : '未收到');
-      text('input', history + (main ? sourceNames[main.current] + (main.current === 'srcObject' ? ` · ${objectNames[main.src_object_type] || '旧版未报告类型'}` : '') : 'MAIN 未报告当前输入'));
+      text('input', history + (main ? sourceNames[main.current] + (main.current === 'srcObject' ? ` · ${objectNames[main.src_object_type] || '旧版未报告类型'}${rtc}` : '') : 'MAIN 未报告当前输入'));
       text('size', history + (main?.width > 0 ? `${main.width} × ${main.height}` : main?.current === 'none' || main?.width === 0 ? '尚无当前视频' : video?.width ? `转发快照：${video.width} × ${video.height}` : '尚无当前尺寸'));
       text('relay-video', video?.width ? `${history || videoMismatch ? '历史/不一致快照：' : '转发快照：'}${sourceNames[video.kind]} · ${video.width} × ${video.height}` : `${history}转发层未找到视频`);
       text('playback', video?.width ? `${history || videoMismatch ? '快照：' : ''}${video.paused ? '暂停' : '播放'} · 就绪 ${video.ready_state}/4` : '等待视频');

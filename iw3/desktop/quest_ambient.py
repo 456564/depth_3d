@@ -207,6 +207,7 @@ class AmbientBackground:
         scale: tuple[float, float] = (2.0, 2.0),
         fill_borders: bool = True,
         feather: float = 0.03,
+        video_rect: _Rect = _FULL,
     ) -> bytes | None:
         self._validate_frame(frame)
         if sbs is not None:
@@ -225,6 +226,14 @@ class AmbientBackground:
             or any(type(value) not in (int, float) or not math.isfinite(value) or value < 1 for value in scale)
         ):
             raise ValueError("ambient scale must contain two finite values >= 1")
+        if (
+            not isinstance(video_rect, tuple)
+            or len(video_rect) != 4
+            or any(type(value) not in (int, float) or not math.isfinite(value) for value in video_rect)
+            or not 0 <= video_rect[0] < video_rect[2] <= 1
+            or not 0 <= video_rect[1] < video_rect[3] <= 1
+        ):
+            raise ValueError("ambient video_rect must be normalized bounds inside the reference screen")
         now = time.monotonic() if tick is None else tick
         if type(now) not in (int, float) or not math.isfinite(now):
             raise ValueError("ambient tick must be finite")
@@ -240,7 +249,13 @@ class AmbientBackground:
                 raise ValueError("ambient content_rect must be inside the frame")
         if self._last_tick is not None and now < math.nextafter(self._last_tick + 0.1, -math.inf):
             return None
-        signature = (tuple(frame.shape), content_rect, None if sbs is None else tuple(sbs.shape), fill_borders)
+        signature = (
+            tuple(frame.shape),
+            content_rect,
+            None if sbs is None else tuple(sbs.shape),
+            fill_borders,
+            video_rect,
+        )
         if signature != self._signature:
             self.reset()
             self._signature = signature
@@ -266,15 +281,25 @@ class AmbientBackground:
         reduced = F.interpolate(source_content.unsqueeze(0), size=(18, 32), mode="area").squeeze(0)
         reduced = reduced.to(device="cpu", dtype=torch.float32)
         display_rect = _FULL
+        video_left, video_top, video_right, video_bottom = video_rect
+        video_width, video_height = video_right - video_left, video_bottom - video_top
+        local_scale = scale[0] / video_width, scale[1] / video_height
         if fill_borders:
             if sbs is None:
-                display_rect = self._display_rect(frame, feather, scale)
+                display_rect = self._display_rect(frame, feather, local_scale)
             else:
-                a, b = (self._display_rect(eye, feather, scale) for eye in sbs.chunk(2, dim=2))
+                a, b = (self._display_rect(eye, feather, local_scale) for eye in sbs.chunk(2, dim=2))
                 display_rect = min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
         elif sbs is not None:
             self._check_values(F.adaptive_max_pool2d(sbs.detach().amax(dim=0, keepdim=True), (1, 1)).cpu())
         display_rect = self._display_window.update(display_rect, now)
+        # SBS局部检测/迟滞后映射到可信几何框；首帧即填满参考幕面的竖屏空区。
+        display_rect = (
+            video_left + display_rect[0] * video_width,
+            video_top + display_rect[1] * video_height,
+            video_left + display_rect[2] * video_width,
+            video_top + display_rect[3] * video_height,
+        )
         edges = (
             reduced[:, :, :2].mean(dim=2, keepdim=True),
             reduced[:, :, -2:].mean(dim=2, keepdim=True),

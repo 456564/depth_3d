@@ -2,9 +2,9 @@
 (() => {
   'use strict';
   const channel = 'iw3-browser-video-v1';
-  const diagnostics = {version: '1.1.2', stage: 'starting', ticks: 0, mse_urls: 0, blob_urls: 0, other_urls: 0,
+  const diagnostics = {version: '1.1.4', stage: 'starting', ticks: 0, mse_urls: 0, blob_urls: 0, other_urls: 0,
     video_tracks: 0, audio_tracks: 0, other_tracks: 0, appends: 0, bytes: 0, chunks: 0, states: 0, current: 'none',
-    src_object_type: 'none', width: 0, height: 0};
+    src_object_type: 'none', width: 0, height: 0, current_rtc: false, rtc_video_tracks: 0, rtc_transform_supported: false};
   function publishDiagnostics() {
     if (document.documentElement) document.documentElement.dataset.iw3VideoMain = JSON.stringify(diagnostics);
   }
@@ -12,7 +12,29 @@
   publishDiagnostics();
   const session = crypto.randomUUID();
   const sources = new WeakMap(), buffers = new WeakMap(), blobs = new Map();
-  let serial = 0;
+  const rtcPeers = new WeakSet(), rtcReceivers = new WeakMap();
+  try {
+    diagnostics.rtc_transform_supported = typeof RTCRtpScriptTransform === 'function' && typeof RTCRtpReceiver === 'function' && 'transform' in RTCRtpReceiver.prototype;
+    if (typeof RTCPeerConnection === 'function') {
+      const setRemoteDescription = RTCPeerConnection.prototype.setRemoteDescription;
+      RTCPeerConnection.prototype.setRemoteDescription = function () {
+        try {
+          if (!rtcPeers.has(this)) {
+            this.addEventListener('track', event => {
+              try {
+                if (event.track?.kind === 'video' && event.receiver && !rtcReceivers.has(event.track)) {
+                  rtcReceivers.set(event.track, event.receiver); diagnostics.rtc_video_tracks++;
+                }
+              } catch {}
+            });
+            rtcPeers.add(this);
+          }
+        } catch {}
+        return Reflect.apply(setRemoteDescription, this, arguments);
+      };
+    }
+  } catch {}
+  let serial = 0, target;
   function sourceRecord(source) {
     if (!sources.has(source)) sources.set(source, { id: crypto.randomUUID(), tracks: [] });
     return sources.get(source);
@@ -91,31 +113,42 @@
     for (const video of document.querySelectorAll('video')) {
       const r = video.getBoundingClientRect();
       const visible = Math.max(0, Math.min(r.right, innerWidth) - Math.max(0, r.left)) * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(0, r.top));
-      if (visible > area && video.videoWidth && video.videoHeight) { selected = video; area = visible; }
+      if (visible > area) { selected = video; area = visible; }
     }
     return selected;
   }
   function current() {
     const video = activeVideo();
-    const source = video && blobs.get(video.currentSrc);
+    if (!video) { target = undefined; return {}; }
+    const src = video.currentSrc, object = video.srcObject;
+    const source = !object && video.videoWidth && video.videoHeight ? blobs.get(src) : undefined;
     const track = source?.tracks.find(t => /^video\//i.test(t.mime) && t.sequence > 0 && !t.failed);
-    return { video, track };
+    // 操作代次随连续目标身份改变；压缩缓存键只在页面与relay之间复用。
+    if (!target || target.video !== video || target.src !== src || target.object !== object || target.media_generation !== track?.generation)
+      target = {video,src,object,media_generation:track?.generation,generation:`${session}:${crypto.randomUUID()}`};
+    return { video, track, generation:target.generation };
   }
   setInterval(() => {
-    const { video, track } = current();
+    const { video, track, generation } = current();
     const object = video?.srcObject;
     diagnostics.ticks++;
     diagnostics.width = video?.videoWidth || 0; diagnostics.height = video?.videoHeight || 0;
     diagnostics.src_object_type = !object ? 'none' : typeof MediaStream === 'function' && object instanceof MediaStream ? 'media_stream' :
       typeof MediaSourceHandle === 'function' && object instanceof MediaSourceHandle ? 'media_source_handle' : 'other';
+    diagnostics.current_rtc = false;
+    try {
+      if (diagnostics.src_object_type === 'media_stream') diagnostics.current_rtc = object.getVideoTracks().some(track => rtcReceivers.has(track));
+    } catch {}
     diagnostics.current = !video ? 'none' : object ? 'srcObject' : !video.currentSrc ? 'empty' :
       video.currentSrc.startsWith('blob:') ? (blobs.has(video.currentSrc) ? 'blob_mapped' : 'blob_unmapped') : 'url';
-    if (!track) { publishDiagnostics(); return; }
+    if (!video) { publishDiagnostics(); return; }
+    const offset = track?.offset || 0;
     emit({ kind: 'state', state: {
-      session, generation: track.generation, serial: ++serial,
-      media_time: Math.max(0, video.currentTime - track.offset),
+      session, generation, serial: ++serial, media_available:!!track,
+      ...(track ? {media_generation:track.generation} : {}),
+      media_time: Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime - offset) : 0,
       paused: video.paused, playback_rate: video.playbackRate,
-      duration: Number.isFinite(video.duration) ? Math.max(0, video.duration - track.offset) : null,
+      duration: Number.isFinite(video.duration) ? Math.max(0, video.duration - offset) : null,
       width: video.videoWidth, height: video.videoHeight,
     } });
     diagnostics.states++;
@@ -123,15 +156,17 @@
   }, 150);
   window.addEventListener('message', event => {
     if (event.source !== window || event.data?.channel !== channel || event.data.kind !== 'commands') return;
-    const { video, track } = current();
-    if (!track || track.generation !== event.data.generation) return;
     for (const command of event.data.commands || []) {
-      if (command.generation !== track.generation) continue;
+      const { video, track, generation } = current();
+      if (!video || generation !== event.data.generation) break;
+      if (command.generation !== generation) continue;
       if (command.name === 'pause_toggle') {
+        if (!track) continue;
         if (video.paused) video.play().catch(() => {}); else video.pause();
       } else if (command.name === 'next' || command.name === 'previous') {
         const direction = command.name === 'next' ? 'next' : 'prev';
         document.querySelector(`[data-e2e="video-switch-${direction}-arrow"]`)?.click();
+        break;
       } else if (command.name === 'exit_fullscreen') {
         if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
         else if (document.querySelector('.isCssFullScreen')) {
