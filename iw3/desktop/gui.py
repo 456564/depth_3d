@@ -543,8 +543,8 @@ class MainFrame(wx.Frame):
         self.cbo_device.Append("CPU", -1)
         self.cbo_device.SetSelection(0)
 
-        self.lbl_screenshot = wx.StaticText(self.grp_processor, label=T("Screenshot"))
-        screenshot_backends = ["pil"]
+        self.lbl_screenshot = wx.StaticText(self.grp_processor, label="画面来源")
+        screenshot_backends = ["pil", "browser_video"]
         if is_mss_supported():
             screenshot_backends += ["mss"]
         if HAS_WINDOWS_CAPTURE:
@@ -557,6 +557,10 @@ class MainFrame(wx.Frame):
             screenshot_backends += ["obs"]
         self.cbo_screenshot = wx.ComboBox(self.grp_processor, choices=screenshot_backends, name="cbo_screenshot")
         self.cbo_screenshot.SetEditable(False)
+        self.cbo_screenshot.SetToolTip(
+            "browser_video：当前抖音视频原始压缩数据，经NVDEC硬解，不录屏；需新版本地扩展。"
+            "其余选项继续捕获桌面或窗口。网页视频源按原比例输出，无源时等待。"
+        )
         default_screenshot_index = 0
         if sys.platform == "win32":
             if "wc_cuda" in screenshot_backends:
@@ -1514,9 +1518,10 @@ class MainFrame(wx.Frame):
             self._finish_quest_restart()
         estimated_fps, screenshot_fps, streaming_fps, screen_size, url = event.GetValue()
         if estimated_fps is not None and screenshot_fps is not None and streaming_fps is not None:
+            source_label = "NVDEC" if getattr(self.args, "screenshot", None) == "browser_video" else "Screenshot"
             self.SetStatusText(
                 f"Estimated FPS: {estimated_fps:.02f},"
-                f" Screenshot FPS: {screenshot_fps:.02f},"
+                f" {source_label} FPS: {screenshot_fps:.02f},"
                 f" Streaming FPS: {streaming_fps:.02f},"
                 f" Screen: {screen_size}"
             )

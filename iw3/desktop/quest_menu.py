@@ -439,9 +439,13 @@ class QuestMenu:
             tab_width = (self.WIDTH - 64) // len(PAGES)
             x = 32 + index * tab_width
             self._button(draw, (x, 100, x + tab_width - 12, 158), page, "page", index, active=index == self._page)
-        status = {"loading": "正在加载", "running": "正在串流", "error": "失败 / 可重试", "ready": "已准备"}.get(
-            self._state.get("status", ""), self._state.get("status", "")
-        )
+        status = {
+            "loading": "正在加载",
+            "running": "正在串流",
+            "error": "失败 / 可重试",
+            "ready": "已准备",
+            "waiting": "等待网页视频",
+        }.get(self._state.get("status", ""), self._state.get("status", ""))
         self._text(draw, (34, 174), f"电脑状态：{status}　待应用 {len(self._draft)} 项", 1460)
         message = self._message or self._state.get("message", "")
         self._text(draw, (34, 212), message, 1460, 25, "#ffd28a")
@@ -562,12 +566,19 @@ class QuestMenu:
             "握柄抓住画面并移动：平移屏幕；同手摇杆：上下调远近、左右调大小。",
             "调整屏幕位置只改变观看大小，不增加源像素，也不是AI会聚。",
         ]
+        if values.get("screenshot") == "browser_video":
+            decode_status = "NVDEC 已硬解" if values.get("hardware_active") else "NVDEC 等待有效帧"
+            lines = [
+                "来源：网页压缩视频；无源时等待，不回退录屏。",
+                f"解码：{decode_status}；源尺寸：{values.get('source_size') or '等待'}。",
+                "声音沿用网页采音，视频跟随网页时间；尚无严格音画同步保证。",
+            ]
         for key, label in (
             ("depth_model", "当前模型"),
             ("method", "合成方法"),
             ("output_size", "输出尺寸"),
             ("estimated_fps", "电脑处理 FPS"),
-            ("screenshot_fps", "捕获 FPS"),
+            ("screenshot_fps", "解码 FPS" if values.get("screenshot") == "browser_video" else "捕获 FPS"),
             ("streaming_fps", "电脑发送 FPS"),
             ("bind_addr", "当前连接地址"),
             ("screen_surface", "当前屏幕形状"),
@@ -577,7 +588,15 @@ class QuestMenu:
         self._wrap(draw, "\n".join(lines), 40, 418, 1450, 26, lines=10)
         self._button(draw, (40, 796, 450, 858), "屏幕居中（重新定位）", "command", "recenter")
         self._button(draw, (470, 796, 1000, 858), "退出网页全屏（Esc）", "command", "exit_fullscreen")
-        self._text(draw, (1020, 798), "需开启电脑控制、目标位于前台", 476, 22)
+        self._text(
+            draw,
+            (1020, 798),
+            "需开启控制、当前网页桥在线"
+            if values.get("screenshot") == "browser_video"
+            else "需开启电脑控制、目标位于前台",
+            476,
+            22,
+        )
         self._text(draw, (1020, 830), "发送 Esc；B / Y 仍负责关闭菜单", 476, 22)
 
     def texture(self) -> bytes | None:

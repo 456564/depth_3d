@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "抖音纯视频与 iw3 媒体桥",
+  "version": "1.1.0",
+  "description": "保留全屏净屏样式，将当前视频压缩片段和播放状态仅发送至本机 iw3 硬解串流。",
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {"service_worker": "media-background.js"},
+  "content_scripts": [
+    {
+      "matches": ["https://www.douyin.com/*"],
+      "css": ["pure-video.css"],
+      "js": ["media-relay.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://www.douyin.com/*"],
+      "js": ["media-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ]
+}

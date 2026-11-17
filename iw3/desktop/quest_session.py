@@ -104,7 +104,7 @@ class QuestSession:
             is_obs_supported,
         )
 
-        backends = ["pil"]
+        backends = ["pil", "browser_video"]
         if is_mss_supported():
             backends.append("mss")
         if sys.platform == "win32" and importlib.util.find_spec("windows_capture"):
@@ -153,11 +153,28 @@ class QuestSession:
             if self.server is not None:
                 self.server.check_error()
             self.apply_live()
+            if hasattr(capture, "get_status"):
+                source = capture.get_status()
+                self.set_stats(
+                    input_source="网页压缩视频（不录屏）",
+                    decoder=source.get("decoder", "NVDEC"),
+                    hardware_active=source.get("hardware_active", False),
+                    source_size=source.get("source_size"),
+                    audio_path="网页音频采集；视频跟随网页时钟",
+                )
+                if hasattr(capture, "get_fps"):
+                    self.set_stats(screenshot_fps=capture.get_fps())
+                if self.server is not None and hasattr(self.server, "get_fps"):
+                    self.set_stats(streaming_fps=self.server.get_fps())
+                if source.get("status") != "running" or self._committed:
+                    self.status(source.get("status", "waiting"), source.get("message", "等待网页视频"))
             if capture.frame_set_event.wait(0.1):
                 self.check_interrupt()
                 return capture.get_frame()
             if hasattr(capture, "is_alive") and not capture.is_alive():
                 raise RuntimeError("Capture thread stopped before supplying a frame")
+            if hasattr(capture, "get_status"):
+                return None
 
     def apply_live(self) -> None:
         with self._lock:

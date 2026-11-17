@@ -234,15 +234,17 @@ FIELDS = (
     ),
     Field(
         "screenshot",
-        "捕获后端",
+        "画面来源",
         PAGES[3],
         "enum",
         help=(
+            "browser_video：扩展读取当前网页压缩视频，经NVDEC硬解后做AI，不录屏；不依赖网页全屏，按视频比例输出。"
+            "需已加载新版本地扩展；无源时等待，不会自动回退截图。"
             "wc_mp：Windows窗口捕获，独立进程处理，推荐网页控制。mss：截取屏幕区域，遮挡也会入画，可作兼容备用。"
             "wc_cuda：GPU直取，减少CPU中转，不保证总帧率更高。pil：桌面基础备用，不支持指定窗口/显示器。"
             "电脑控制支持wc_mp/mss/wc_cuda，空窗口名控制所选整台显示器且需裁剪为0。它们不是AI画质档，切换后确认窗口与裁剪。"
         ),
-        choices=("pil", "mss", "wc_mp", "wc_cuda", "kwcapture", "obs"),
+        choices=("pil", "mss", "wc_mp", "wc_cuda", "kwcapture", "obs", "browser_video"),
     ),
     Field(
         "monitor_index",
@@ -297,7 +299,7 @@ FIELDS = (
         "手柄控制电脑",
         PAGES[3],
         "bool",
-        help="开：右手指向移动光标，扳机左键或拖动，摇杆上下切视频。需Windows、wc_mp/mss/wc_cuda、无额外补边。指定窗口须唯一且前台；空窗口名控制所选整台显示器，裁剪须为0，切视频前须指向该屏幕的前台窗口。显示器布局变化后须重启串流。关：仍可握柄移动虚拟屏幕。菜单打开时电脑控制和抓屏暂停。",
+        help="开：右手指向画面，A或扳机点击、摇杆上下切视频。browser_video模式只控制当前网页视频：点击播放/暂停、摇杆切条，不移动电脑鼠标；需扩展在线。截图模式需Windows、wc_mp/mss/wc_cuda且无额外补边；窗口须前台，整屏裁剪须为0。关：仍可握柄移动虚拟屏幕。菜单打开时网页输入暂停。",
     ),
     Field(
         "quest_screen_curvature",
@@ -414,8 +416,15 @@ def validate_patch(
     if not check_constraints:
         return copy.deepcopy(patch)
     merged = {**(current or {}), **patch}
+    if merged.get("screenshot") == "browser_video":
+        if merged.get("pad_mode") not in {None, "tblr"}:
+            raise ValueError("网页视频源须关闭补边")
+        if any(merged.get(key, 0) for key in ("crop_top", "crop_left", "crop_right", "crop_bottom")):
+            raise ValueError("网页视频源不使用桌面裁剪")
     if merged.get("quest_control"):
-        if merged.get("screenshot") not in {"wc_mp", "mss", "wc_cuda"} or merged.get("pad_mode") not in {None, "tblr"}:
+        if merged.get("screenshot") not in {"wc_mp", "mss", "wc_cuda", "browser_video"} or merged.get(
+            "pad_mode"
+        ) not in {None, "tblr"}:
             raise ValueError("电脑控制要求 wc_mp/mss/wc_cuda 且关闭补边")
         if not (merged.get("window_name") or "").strip() and any(
             merged.get(key, 0) for key in ("crop_top", "crop_left", "crop_right", "crop_bottom")

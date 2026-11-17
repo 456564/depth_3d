@@ -1,0 +1,41 @@
+/* shortcut: 仅隐藏已核实的覆盖UI；网站改版后重新核实选择器，未知画面保持原样。 */
+/* shortcut: 左上关闭/搜索与消息仅有已核实生成类名；失配时复核，不扩大到媒体容器。 */
+:is(:fullscreen, .isCssFullScreen) :is(
+  xg-bar, xg-controls, xg-text-track, .video-info-wrap,
+  .slider-video > .HlVWgVN0, .basePlayerContainer .pjGLDod0,
+  .basePlayerContainer .positionBox.immersive-player-switch-on-hide-interaction-area,
+  .basePlayerContainer > .danmu,
+  [data-e2e="video-info"], [data-e2e="danmaku-container"],
+  [data-e2e="video-avatar"], [data-e2e="feed-follow-icon"],
+  [data-e2e="video-player-digg"], [data-e2e="feed-comment-icon"],
+  [data-e2e="video-player-collect"], [data-e2e="video-player-share"], [data-e2e="video-play-more"]
+),
+:is(:fullscreen, .isCssFullScreen) :is(
+  xg-bar, xg-controls, xg-text-track, .video-info-wrap,
+  .slider-video > .HlVWgVN0, .basePlayerContainer .pjGLDod0,
+  .basePlayerContainer .positionBox.immersive-player-switch-on-hide-interaction-area,
+  .basePlayerContainer > .danmu,
+  [data-e2e="video-info"], [data-e2e="danmaku-container"],
+  [data-e2e="video-avatar"], [data-e2e="feed-follow-icon"],
+  [data-e2e="video-player-digg"], [data-e2e="feed-comment-icon"],
+  [data-e2e="video-player-collect"], [data-e2e="video-player-share"], [data-e2e="video-play-more"]
+) * {
+  visibility: hidden !important;
+}
+
+/* 只隐藏播放栏仍会保留站点48px布局槽；让视频容器填回空槽，不裁源画面。 */
+:is(:fullscreen, .isCssFullScreen) .xg-video-container {
+  height: 100% !important;
+  bottom: 0 !important;
+}
+
+/* shortcut: 背景仅有已核实生成类名；网站改版后重新核实，只隐藏其IMG，保留独立黑底。 */
+:is(:fullscreen, .isCssFullScreen) [data-e2e="feed-active-video"].sliderVideo > .xV0tZ1zu > img {
+  visibility: hidden !important;
+}
+
+/* 电脑鼠标不进入采样画面；头显原生射线和网页点击继续沿用原链路。 */
+:is(:fullscreen, .isCssFullScreen),
+:is(:fullscreen, .isCssFullScreen) * {
+  cursor: none !important;
+}
