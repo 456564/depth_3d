@@ -727,10 +727,13 @@ class OutputTransform:
         if has_alpha:
             return False
 
-        return (
-            x.device.type in {"cuda", "xpu", "mps"}
-            and self.dst_pix_fmt in {"nv12", "p010le", "yuv420p", "yuvj420p", "yuv420p10le"}
-        )
+        return x.device.type in {"cuda", "xpu", "mps"} and self.dst_pix_fmt in {
+            "nv12",
+            "p010le",
+            "yuv420p",
+            "yuvj420p",
+            "yuv420p10le",
+        }
 
     def is_cuda_dlpack_supported(self, x: torch.Tensor) -> bool:
         return (
@@ -759,14 +762,13 @@ class OutputTransform:
         y_p, uv_p = ColorTransform.to_yuv_planes(y, u, v, out_format=internal_pix_fmt)
 
         if self.is_cuda_dlpack_supported(x):
-            # For NVENC
-            # Ensure PyTorch has finished writing to y_p and uv_p
-            if self.cuda_stream is None:
-                if torch.cuda.default_stream() != torch.cuda.current_stream():
-                    torch.cuda.current_stream().synchronize()
-            else:
-                if torch.cuda.current_stream() != self.cuda_stream:
-                    torch.cuda.current_stream().synchronize()
+            # NVENC按同一allocation的基址/pitch读取UV，独立两平面会让连续帧串色。
+            height, width = y_p.shape
+            packed = torch.cat((y_p, uv_p.reshape(height // 2, width)), dim=0)
+            y_p = packed[:height]
+            uv_p = packed[height:].view(height // 2, width // 2, 2)
+            # FFmpeg读取前等实际生产流完成，避免默认流与编码流之间竞态。
+            torch.cuda.current_stream(x.device).synchronize()
             frame = av.VideoFrame.from_dlpack(
                 (y_p, uv_p),
                 format=internal_pix_fmt,
