@@ -45,7 +45,7 @@ def test_ambient_settings_default_ranges_and_cli() -> None:
 def test_ambient_live_update_applies_all_current_values_without_media_restart() -> None:
     owner = session()
     applied = []
-    owner.server = Namespace(configure_ambient=lambda *values: applied.append(values))
+    owner.server = Namespace(configure_ambient=lambda *values, **options: applied.append(values))
     owner.submit("set", {"quest_ambient_brightness": 0.4, "quest_ambient_spread": 3.0})
     owner.apply_live()
     assert applied == [(True, 0.4, 3.0, True, 0.03, "edge")]
@@ -88,7 +88,7 @@ def test_media_reconfiguration_passes_ambient_values(reference_aspect) -> None:
         configure_audio=lambda *a: None,
         set_screen_curvature=lambda *a: None,
         set_controller_factory=lambda *a: None,
-        configure_ambient=lambda *values: applied.append(values),
+        configure_ambient=lambda *values, **options: applied.append(values),
     )
     owner.configure(
         width=128,

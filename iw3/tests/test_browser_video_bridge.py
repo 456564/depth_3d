@@ -480,3 +480,70 @@ def test_fullscreen_operation_transition_rejects_old_bytes_and_commands(bridge):
     assert not bridge.queue_command("next", "tab:video:track")
     assert chunk(bridge, token, b"manual", generation="exited")[0] == 200
     assert bridge.snapshot().data == b"manual"
+
+
+def source_descriptor(kind="vod"):
+    return {
+        "kind": kind,
+        "id": "active:one",
+        "renditions": [
+            {
+                "id": "main",
+                "width": 1440,
+                "height": 2560,
+                "bitrate": 4000000,
+                "codec": "hevc",
+                "urls": ["https://media.douyinvod.com/stream?private=secret"],
+            }
+        ],
+    }
+
+
+def test_descriptor_is_ready_without_bytes_and_is_not_disclosed_in_status(bridge):
+    token = pair(bridge)
+    code, reply, _ = request(bridge, "/state", state(source=source_descriptor()), token=token)
+    assert code == 200 and reply["need_media"] is False
+    current = bridge.snapshot()
+    assert current is not None and current.source == source_descriptor() and current.data == b""
+    assert bridge.status()["status"] == "source"
+    assert "private" not in json.dumps(bridge.status())
+    assert chunk(bridge, token)[0] == 409
+
+
+def test_descriptor_change_requires_new_generation_and_snapshot_is_immutable(bridge):
+    token = pair(bridge)
+    assert request(bridge, "/state", state(source=source_descriptor()), token=token)[0] == 200
+    current = bridge.snapshot()
+    current.source["renditions"][0]["urls"][0] = "changed"
+    assert bridge.snapshot().source == source_descriptor()
+    newer = source_descriptor()
+    newer["renditions"][0]["urls"] = ["https://media.douyinvod.com/new"]
+    assert request(bridge, "/state", state(serial=1, source=newer), token=token)[0] == 409
+    assert request(bridge, "/state", state(serial=1, generation="new", source=newer), token=token)[0] == 200
+    assert bridge.snapshot().source == newer
+
+
+def test_live_descriptor_accepts_unknown_dimensions_and_normalizes_null_duration(bridge):
+    token = pair(bridge)
+    source = source_descriptor("live")
+    source["renditions"][0].update(width=0, height=0, bitrate=0)
+    payload = state(source=source, width=0, height=0, duration=None)
+    assert request(bridge, "/state", payload, token=token)[0] == 200
+    assert bridge.snapshot().source["kind"] == "live"
+
+
+def test_descriptor_body_can_exceed_old_8k_limit_but_remains_bounded(bridge):
+    token = pair(bridge)
+    source = source_descriptor()
+    source["renditions"][0]["urls"] = ["https://media.douyinvod.com/" + str(i) + "x" * 3900 for i in range(3)]
+    assert request(bridge, "/state", state(source=source), token=token)[0] == 200
+    assert request(bridge, "/state", {}, token=token, headers={"Content-Length": "131073"})[0] == 413
+
+
+def test_invalid_descriptor_is_not_silently_accepted_as_mse(bridge):
+    token = pair(bridge)
+    source = source_descriptor()
+    source["renditions"][0]["urls"] = ["https://127.0.0.1/private"]
+    code, body, _ = request(bridge, "/state", state(source=source), token=token)
+    assert code == 400 and "private" not in json.dumps(body)
+    assert bridge.snapshot() is None

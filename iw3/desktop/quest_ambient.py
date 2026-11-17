@@ -1,4 +1,4 @@
-"""Small, edge-colored ambient texture for the existing Pop3D client."""
+"""现有Pop3D协议的边缘填光、全天域背景与缓存动画。"""
 
 import math
 import struct
@@ -8,6 +8,9 @@ import zlib
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageFilter
+
+from .quest_ambient_panorama import ATLAS_HEIGHT, FACE_SIZE, GUTTER, MOTION_STYLES, AmbientPanorama
+from .quest_settings import AMBIENT_STYLES
 
 _Rect = tuple[float, float, float, float]
 _FULL: _Rect = (0.0, 0.0, 1.0, 1.0)
@@ -48,13 +51,20 @@ class AmbientBackground:
         self._y = torch.linspace(0, 1, self.HEIGHT)[:, None]
         self._colors: torch.Tensor | None = None
         self._last_tick: float | None = None
+        self._color_tick: float | None = None
         self._signature: tuple[object, ...] | None = None
         self._source_window = _ContentWindow()
         self._display_window = _ContentWindow()
+        self._panorama: AmbientPanorama | None = None
+        self._phase_start: float | None = None
+        self._render_cache: tuple[torch.Tensor, Image.Image, float, str, bool, bool] | None = None
 
     def reset(self, preserve_content: bool = False) -> None:
         self._colors = None
         self._last_tick = None
+        self._color_tick = None
+        self._phase_start = None
+        self._render_cache = None
         if not preserve_content:
             self._signature = None
             self._source_window = _ContentWindow()
@@ -200,6 +210,67 @@ class AmbientBackground:
         return Image.fromarray((alpha * outer * 255).round().byte().numpy())
 
     @torch.inference_mode()
+    def animate(self, *, tick: float | None = None) -> bytes | None:
+        cached = self._render_cache
+        if cached is None or not cached[-1] or cached[3] not in MOTION_STYLES:
+            return None
+        now = time.monotonic() if tick is None else tick
+        if type(now) not in (int, float) or not math.isfinite(now):
+            raise ValueError("ambient tick must be finite")
+        if self._last_tick is not None and now < math.nextafter(self._last_tick + 0.1, -math.inf):
+            return None
+        # 暂停时只读CPU float[3,18,32]颜色和L[320,180]遮罩，不访问原视频/CUDA张量。
+        payload = self._render(*cached, now)
+        self._last_tick = now
+        return payload
+
+    def _render(
+        self,
+        colors: torch.Tensor,
+        alpha: Image.Image,
+        brightness: float,
+        style: str,
+        panoramic: bool,
+        motion: bool,
+        now: float,
+    ) -> bytes:
+        if self._phase_start is None:
+            self._phase_start = now
+        atlas = None
+        if panoramic or style in MOTION_STYLES:
+            if self._panorama is None:
+                self._panorama = AmbientPanorama()
+            palette = torch.stack(
+                (
+                    colors[:, :, :2].mean((1, 2)),
+                    colors[:, :, -2:].mean((1, 2)),
+                    colors[:, :2, :].mean((1, 2)),
+                    colors[:, -2:, :].mean((1, 2)),
+                )
+            )
+            phase = (now - self._phase_start) * 0.12 if motion else 0.0
+            atlas = self._panorama.atlas(self._panorama.colors(palette, style, phase), brightness)
+        if style in MOTION_STYLES:
+            assert atlas is not None
+            image = atlas.crop((GUTTER, GUTTER, GUTTER + FACE_SIZE, GUTTER + FACE_SIZE))
+            image = image.resize((self.WIDTH, self.HEIGHT), Image.Resampling.BILINEAR)
+        else:
+            # 旧四种非360模式保留已验收的完整像素路径和哈希。
+            rgb = (colors.permute(1, 2, 0) * (255 * brightness)).round().clamp(0, 255).byte()
+            image = Image.fromarray(rgb.numpy()).resize((self.WIDTH, self.HEIGHT), Image.Resampling.BILINEAR)
+            image = image.filter(ImageFilter.BoxBlur(40 if style == "blur" else 24)).convert("RGBA")
+        image.putalpha(alpha)
+        if panoramic:
+            assert atlas is not None
+            combined = Image.new("RGBA", (self.WIDTH, self.HEIGHT + ATLAS_HEIGHT))
+            combined.paste(image, (0, 0))
+            combined.paste(atlas, (0, self.HEIGHT))
+            image = combined
+        identifier = self.TEXTURE_ID.encode("ascii")
+        payload = bytes([len(identifier)]) + identifier + struct.pack("!HHB", *image.size, 1)
+        return payload + zlib.compress(image.tobytes(), level=3)
+
+    @torch.inference_mode()
     def update(
         self,
         frame: torch.Tensor,
@@ -213,10 +284,14 @@ class AmbientBackground:
         feather: float = 0.03,
         video_rect: _Rect = _FULL,
         style: str = "edge",
+        panoramic: bool = False,
+        motion: bool = True,
     ) -> bytes | None:
         self._validate_frame(frame)
-        if type(style) is not str or style not in {"edge", "blur", "halo", "cinema"}:
-            raise ValueError("ambient style must be edge, blur, halo or cinema")
+        if type(style) is not str or style not in AMBIENT_STYLES:
+            raise ValueError("ambient style is unsupported")
+        if type(panoramic) is not bool or type(motion) is not bool:
+            raise ValueError("ambient panoramic and motion must be booleans")
         if sbs is not None:
             self._validate_frame(sbs)
             if sbs.shape[-1] % 2:
@@ -254,10 +329,10 @@ class AmbientBackground:
             left, top, right, bottom = content_rect
             if not 0 <= left < right <= frame.shape[2] or not 0 <= top < bottom <= frame.shape[1]:
                 raise ValueError("ambient content_rect must be inside the frame")
-        if self._signature is not None and self._signature[-1] != style:
+        if self._signature is not None and self._signature[-3:] != (style, panoramic, motion):
             # 暂停只重建一次，不能丢弃已稳定的黑条范围再等待后续帧。
             self.reset(preserve_content=True)
-            self._signature = (*self._signature[:-1], style)
+            self._signature = (*self._signature[:-3], style, panoramic, motion)
         if self._last_tick is not None and now < math.nextafter(self._last_tick + 0.1, -math.inf):
             return None
         signature = (
@@ -267,6 +342,8 @@ class AmbientBackground:
             fill_borders,
             video_rect,
             style,
+            panoramic,
+            motion,
         )
         if signature != self._signature:
             self.reset()
@@ -325,16 +402,13 @@ class AmbientBackground:
             )
             colors = sum((edge * weight for edge, weight in zip(edges, self._weights)), torch.zeros_like(reduced))
             colors = colors / self._weight_sum
-        if self._colors is not None and self._last_tick is not None:
-            blend = -math.expm1(-(now - self._last_tick) / 0.25)
+        if self._colors is not None and self._color_tick is not None:
+            blend = -math.expm1(-(now - self._color_tick) / 0.25)
             colors = self._colors.lerp(colors, blend)
-        # CPU float[3,18,32] → uint8 ndarray[18,32,3] → PIL RGBA(320,180) → zlib bytes。
-        rgb = (colors.permute(1, 2, 0) * (255 * brightness)).round().clamp(0, 255).byte()
-        image = Image.fromarray(rgb.numpy()).resize((self.WIDTH, self.HEIGHT), Image.Resampling.BILINEAR)
-        image = image.filter(ImageFilter.BoxBlur(40 if style == "blur" else 24)).convert("RGBA")
-        image.putalpha(self._alpha(display_rect, scale, feather, halo=style == "halo"))
-        identifier = self.TEXTURE_ID.encode("ascii")
-        payload = bytes([len(identifier)]) + identifier + struct.pack("!HHB", self.WIDTH, self.HEIGHT, 1)
-        payload += zlib.compress(image.tobytes(), level=3)
-        self._colors, self._last_tick = colors, now
+        # CPU float[3,18,32] → RGBA[180,320,4]；360时追加atlas，合成[316,320,4]后zlib。
+        alpha = self._alpha(display_rect, scale, feather, halo=style == "halo")
+        cached = (colors, alpha, brightness, style, panoramic, motion)
+        payload = self._render(*cached, now)
+        self._render_cache = cached
+        self._colors, self._last_tick, self._color_tick = colors, now, now
         return payload

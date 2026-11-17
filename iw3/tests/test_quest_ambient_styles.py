@@ -8,7 +8,7 @@ from iw3.desktop.quest_ambient import AmbientBackground
 from .test_quest_ambient import pixels, solid
 from .test_quest_feather import alpha_at, frame, settled
 
-STYLES = ("edge", "blur", "halo", "cinema")
+STYLES = ("edge", "blur", "halo", "cinema", "aurora", "mist", "stars")
 
 
 def test_paused_style_change_preserves_settled_embedded_black_borders():

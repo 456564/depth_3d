@@ -78,7 +78,8 @@ def test_depth_temporal_reset_retains_loaded_weights_and_ema_configuration():
     assert depth.scaler.min_value is None and depth.scaler.max_value is None
 
 
-def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(monkeypatch):
+@pytest.mark.parametrize("odd", [False, True])
+def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(monkeypatch, odd):
     from iw3.desktop import quest_server
 
     args = desktop.create_parser().parse_args(["--quest", "--bind-addr", "127.0.0.1", "--stream-height", "320"])
@@ -107,13 +108,19 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
         def set(self):
             pass
 
+        def is_set(self):
+            return self.ready
+
+        def clear(self):
+            self.ready = False
+
         def wait(self, timeout):
             self.calls += 1
             self.ready = self.calls != 2
             return self.ready
 
     class Source:
-        def __init__(self, snapshot, device, fps):
+        def __init__(self, snapshot, device, fps, quality="auto", state=None):
             nonlocal source
             source = self
             self.index = 0
@@ -121,7 +128,11 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
             self.current = True
             self.frame_set_event = SourceEvent()
             self.frame_set_event.set()
-            self.frames = [torch.ones(3, 640, 360), torch.ones(3, 360, 640), torch.ones(3, 360, 640)]
+            self.frames = [
+                torch.ones(3, 640 + odd, 360 + odd),
+                torch.ones(3, 360 + odd, 640 + odd),
+                torch.ones(3, 360 + odd, 640 + odd),
+            ]
 
         def start(self):
             pass
@@ -183,6 +194,8 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
         stop=lambda: cleaned.append("server"),
         check_error=lambda: None,
         set_audio_gain=lambda gain: None,
+        set_controller_factory=lambda value: None,
+        set_reference_aspect=lambda value: None,
         discard_video_frames=lambda: barriers.append(True),
         refresh_ambient_frame=lambda: refreshes.append(True),
         set_ambient_frame=lambda *a, **kw: backgrounds.append(kw),
@@ -200,9 +213,10 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
     monkeypatch.setattr(desktop.IW3U, "process_image", process)
     monkeypatch.setattr(quest_server, "QuestServer", lambda **kw: server)
     desktop._iw3_desktop_main_once(args, init_wxapp=False)
-    assert processed == [(3, 320, 180), (3, 320, 568), (3, 320, 568)]
-    assert configured == [(360, 320), (1136, 320)]
+    height, width = 640 + 2 * odd, 360 + 2 * odd
+    assert processed == [(3, height, width), (3, width, height), (3, width, height)]
+    assert configured == [(width * 2, height), (height * 2, width)]
     assert len(barriers) == 3 and len(refreshes) == 1
-    assert [value["content_rect"] for value in backgrounds] == [(0, 0, 180, 320), (0, 0, 568, 320)]
-    assert [tuple(frame.shape) for frame in sent if frame.any()] == [(3, 320, 360), (3, 320, 1136)]
+    assert [value["content_rect"] for value in backgrounds] == [(0, 0, width, height), (0, 0, height, width)]
+    assert [tuple(frame.shape) for frame in sent if frame.any()] == [(3, height, width * 2), (3, width, height * 2)]
     assert "bridge" in cleaned and "source" in cleaned and "depth-clear" in cleaned

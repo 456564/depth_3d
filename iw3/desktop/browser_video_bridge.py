@@ -1,4 +1,4 @@
-"""仅接收本机扩展的压缩视频字节与播放时钟，不访问远端媒体地址。"""
+"""接收本机扩展的播放时钟、压缩字节或有界来源描述；桥本身不访问 CDN。"""
 
 import hmac
 import json
@@ -7,9 +7,12 @@ import re
 import secrets
 import threading
 from collections import deque
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeGuard
+
+from .media_http_source import validate_source
 
 if TYPE_CHECKING:
     from .media_video_source import MediaSnapshot
@@ -38,10 +41,19 @@ def _validate_state(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BridgeRequestError(400, "Invalid playback state")
     media_available = value.get("media_available", True)
+    source = value.get("source")
+    if source is not None:
+        try:
+            source = validate_source(source)
+        except ValueError:
+            raise BridgeRequestError(400, "Invalid media source descriptor") from None
+        if media_available is not True:
+            raise BridgeRequestError(400, "Descriptor requires media availability")
     fullscreen = value.get("fullscreen", False)
     dimensions = (value.get("width"), value.get("height"))
     valid_dimensions = all(type(size) is int and 0 < size <= 8192 for size in dimensions) or (
-        media_available is False and all(type(size) is int and size == 0 for size in dimensions)
+        (media_available is False or source is not None and source["kind"] == "live")
+        and all(type(size) is int and size == 0 for size in dimensions)
     )
     if (
         not _identifier(value.get("session"))
@@ -73,6 +85,7 @@ def _validate_state(value: Any) -> dict[str, Any]:
     }
     validated["media_available"] = media_available
     validated["fullscreen"] = fullscreen
+    validated["source"] = source
     return validated
 
 
@@ -159,7 +172,11 @@ class BrowserVideoBridge:
                     if self.path != "/hello":
                         owner._authenticate(origin, self.headers.get("X-IW3-Token", ""))
                     limit = (
-                        MAX_CHUNK_BYTES if self.path == "/chunk" else MAX_MEDIA_BYTES if self.path == "/media" else 8192
+                        MAX_CHUNK_BYTES
+                        if self.path == "/chunk"
+                        else MAX_MEDIA_BYTES
+                        if self.path == "/media"
+                        else 131072
                     )
                     data = self._request_body(limit)
                     if self.path == "/hello":
@@ -247,6 +264,8 @@ class BrowserVideoBridge:
                     value["serial"] == previous["serial"] and value != previous
                 ):
                     raise BridgeRequestError(409, "Stale playback state")
+                if previous["generation"] == value["generation"] and previous.get("source") != value.get("source"):
+                    raise BridgeRequestError(409, "Media source change requires a new generation")
             # 页面心跳与媒体能力分开；能力切换同样废弃旧字节与待发命令。
             changed = previous is None or (
                 previous["session"],
@@ -275,7 +294,7 @@ class BrowserVideoBridge:
             self._commands.clear()
             return {
                 "commands": commands,
-                "need_media": value["media_available"] and not self._data,
+                "need_media": value["media_available"] and value.get("source") is None and not self._data,
                 "next_sequence": self._sequence,
             }
 
@@ -289,6 +308,7 @@ class BrowserVideoBridge:
             if (
                 state is None
                 or not state["media_available"]
+                or state.get("source") is not None
                 or monotonic() - self._received_at > STATE_TTL
                 or (session, generation) != (state["session"], state["generation"])
                 or sequence != self._sequence
@@ -315,6 +335,7 @@ class BrowserVideoBridge:
                 state is None
                 or not state["media_available"]
                 or not self._data
+                and state.get("source") is None
                 or monotonic() - self._received_at > STATE_TTL
             ):
                 return None
@@ -329,6 +350,7 @@ class BrowserVideoBridge:
                 playback_rate=state["playback_rate"],
                 received_at=self._received_at,
                 duration=state["duration"],
+                source=deepcopy(state.get("source")),
             )
 
     def status(self) -> dict[str, Any]:
@@ -336,7 +358,8 @@ class BrowserVideoBridge:
             state = self._state
             fresh = state is not None and monotonic() - self._received_at <= STATE_TTL
             media_available = state is not None and state["media_available"]
-            status = "source" if fresh and media_available and self._data else "waiting"
+            ready = state is not None and (bool(self._data) or state.get("source") is not None)
+            status = "source" if fresh and media_available and ready else "waiting"
             return {
                 "state": status,
                 "status": status,

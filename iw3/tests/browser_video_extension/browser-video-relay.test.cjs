@@ -12,7 +12,7 @@ function relay(sendMessage = async message => ({ok:true,commands:[],next_sequenc
   const calls=[], listeners={}, timers=[], posted=[];
   let now=0;
   const context={
-    console, ArrayBuffer, Uint8Array, Map, Date:{now:()=>now},
+    console, URL, ArrayBuffer, Uint8Array, Map, Date:{now:()=>now},
     btoa:s=>Buffer.from(s,'binary').toString('base64'),
     document:{documentElement:{dataset:{}},hasFocus:()=>true,querySelectorAll:()=>[]},
     chrome:{runtime:{sendMessage:async message=>{calls.push(message);return sendMessage(message);}}},
@@ -23,7 +23,7 @@ function relay(sendMessage = async message => ({ok:true,commands:[],next_sequenc
   context.window=context;
   const file=path.join(directory,'media-relay.js');
   assert.ok(fs.existsSync(file),'media relay missing');
-  vm.runInNewContext(fs.readFileSync(file,'utf8'),context);
+  vm.runInNewContext(fs.readFileSync(path.join(directory,'media-source.js'),'utf8')+'\n'+fs.readFileSync(file,'utf8'),context);
   context.listenersForTest=listeners.message||[];
   const emit=data=>{
     context.messageForTest={channel,session:'s',...data};
@@ -43,7 +43,7 @@ function background(handler = async (url, options) => ({status:200,ok:true,json:
   };
   const file=path.join(directory,'media-background.js');
   assert.ok(fs.existsSync(file),'media background missing');
-  vm.runInNewContext(fs.readFileSync(file,'utf8'),context);
+  vm.runInNewContext(fs.readFileSync(path.join(directory,'media-source.js'),'utf8')+'\n'+fs.readFileSync(file,'utf8'),context);
   const send=(message,sender={url:'https://www.douyin.com/?recommend=1',frameId:0,tab:{id:5,active:true}})=>new Promise(resolve=>listener(message,sender,resolve));
   return {calls,send,advance:ms=>{now+=ms;}};
 }
@@ -58,6 +58,67 @@ test('relay forwards actual compressed bytes through JSON runtime boundary after
   assert.deepEqual(Array.from(Buffer.from(b.calls[1].data,'base64')),[0,1,2,255]);
   assert.equal(b.calls[1].generation,'g');
   assert.equal(b.calls[1].sequence,0);
+});
+
+const descriptor = () => ({kind:'vod',id:'123',renditions:[{id:'1440',width:1440,height:2560,bitrate:1200000,codec:'hevc',urls:['https://v.example.douyinvod.com/movie?token=private']} ]});
+
+test('relay forwards source descriptor without duplicate cached media',async()=>{
+  const b=relay();
+  b.emit({kind:'chunk',generation:'g',sequence:0,data:new Uint8Array([0,1]).buffer});
+  b.emit({kind:'state',state:{...state(),media_available:true,source:descriptor()}});
+  await tick();
+  assert.equal(b.calls.length,1);
+  assert.equal(b.calls[0].state.source.id,'123');
+  assert.equal(JSON.parse(b.context.document.documentElement.dataset.iw3VideoBridge).state,'descriptor');
+  assert.ok(!JSON.stringify(b.context.document.documentElement.dataset).includes('private'));
+});
+
+test('unknown live dimensions pass relay and background while zero-size VOD remains invalid',async()=>{
+  const live={...descriptor(),kind:'live'};
+  live.renditions[0]={...live.renditions[0],width:0,height:0,bitrate:0,
+    urls:['https://pull.example.douyincdn.com/live.flv']};
+  const playback={...state(),media_available:true,width:0,height:0,duration:null,source:live};
+  const b=background();
+  const a=relay(message=>b.send(message));
+  a.emit({kind:'state',state:playback});
+  await tick();await tick();
+  assert.equal(a.calls.length,1,'live descriptor with unknown video size must reach background');
+  const post=b.calls.find(call=>call.url.endsWith('/state'));
+  assert.ok(post,'live descriptor must reach the Python state endpoint');
+  const delivered=JSON.parse(post.options.body);
+  assert.equal(delivered.source.kind,'live');
+  assert.deepEqual([delivered.width,delivered.height],[0,0]);
+  const bad={...playback,source:descriptor()};
+  const rejected=relay();rejected.emit({kind:'state',state:bad});await tick();
+  assert.equal(rejected.calls.length,0);
+  const before=b.calls.length;
+  assert.equal((await b.send({kind:'state',state:bad,focused:true})).ok,false);
+  assert.equal(b.calls.length,before);
+});
+
+test('background preserves clean source fields and reports descriptor delivery without claiming decoded bytes',async()=>{
+  const b=background();
+  await b.send({kind:'diagnostics',diagnostics:{main:null,relay:{version:'1.3.0',events:0,states:0,chunks:0,bytes:0},video:{kind:'url',width:1080,height:1920,paused:false,ready_state:4},bridge:{state:'waiting',bytes:0,next_sequence:0}}});
+  const value={...descriptor(),cookie:'never forwarded'};
+  const result=await b.send({kind:'state',state:{...state(),media_available:true,source:value},focused:true});
+  assert.equal(result.ok,true);
+  const body=JSON.parse(b.calls.find(call=>call.url.endsWith('/state')).options.body);
+  assert.equal(body.source.id,'123');
+  assert.equal(body.source.cookie,undefined);
+  const status=await b.send({kind:'status'},{id:'a'.repeat(32),url:`chrome-extension://${'a'.repeat(32)}/popup.html`});
+  assert.equal(status.page.descriptor_sent,true);
+  assert.equal(status.page.delivered,false);
+  assert.equal(status.page.source_descriptor.renditions[0].width,1440);
+  assert.equal(status.page.source_descriptor.renditions[0].urls,undefined);
+  assert.ok(!JSON.stringify(status).includes('private'));
+});
+
+test('malformed descriptors never cross relay or background network boundaries',async()=>{
+  for(const invalid of [null,{...descriptor(),kind:'other'},{...descriptor(),renditions:[{...descriptor().renditions[0],urls:['https://127.0.0.1/secret']}]}]){
+    const a=relay();a.emit({kind:'state',state:{...state(),media_available:true,source:invalid}});await tick();assert.equal(a.calls.length,0);
+    const b=background();const reply=await b.send({kind:'state',state:{...state(),media_available:true,source:invalid},focused:true});
+    assert.equal(reply.ok,false);assert.equal(b.calls.length,0);
+  }
 });
 
 test('relay forwards control-only heartbeats and navigation but no pause or compressed bytes',async()=>{
@@ -133,7 +194,7 @@ test('relay has a loading heartbeat before the first media event', () => {
   const b = relay();
   b.advance(250);
   const stats = JSON.parse(b.context.document.documentElement.dataset.iw3VideoRelay || '{}');
-  assert.equal(stats.version, '1.2.0');
+  assert.equal(stats.version, '1.3.0');
   assert.equal(stats.events, 0);
   assert.equal(stats.chunks, 0);
   assert.equal(b.calls.length, 0);

@@ -325,7 +325,7 @@ test('an authentication rejection stays visible during automatic pairing retry',
 
 test('manifest opens a local status popup without adding permissions', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(directory,'manifest.json'),'utf8'));
-  assert.equal(manifest.version,'1.2.0');
+  assert.equal(manifest.version,'1.3.0');
   assert.equal(manifest.action?.default_popup,'popup.html');
   assert.equal(manifest.permissions,undefined);
   assert.deepEqual(manifest.host_permissions,['http://127.0.0.1/*']);
@@ -362,6 +362,18 @@ test('popup renders live source statistics with text nodes and polls only status
   b.timers[0](); await settle();
   assert.deepEqual(b.sent.map(message=>message.kind),['status','status']);
   assert.equal(b.element('summary').dataset.state,'ok');
+});
+
+test('popup distinguishes descriptor confirmation from decoded media and lists safe rendition sizes',async()=>{
+  const status=connectedStatus();Object.assign(status.page,{delivered:false,descriptor_sent:true,
+    source_descriptor:{kind:'vod',renditions:[{id:'1440',width:1440,height:2560,bitrate:1200000,codec:'hevc'}]}});
+  status.page.diagnostics.main.current='blob_unmapped';
+  const b=popup(status);await settle();
+  assert.match(b.element('summary').textContent,/取源描述/);
+  assert.doesNotMatch(b.element('summary').textContent,/字节已送达/);
+  assert.match(b.element('quality-candidates').textContent,/1440×2560/);
+  assert.match(b.element('source-delivery').textContent,/不代表.*解码/);
+  assert.doesNotMatch(b.element('hint').textContent,/尚未关联/);
 });
 
 test('popup clearly marks missing, stale and failed status and never injects page HTML', async () => {

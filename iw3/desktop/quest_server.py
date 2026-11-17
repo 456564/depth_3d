@@ -14,10 +14,12 @@ from typing import Any
 import torch
 
 from .quest_ambient import AmbientBackground
+from .quest_ambient_panorama import MOTION_STYLES, panorama_layers
 from .quest_audio import QuestAudio
 from .quest_encoder import QuestEncoder
 from .quest_input import QuestController, _rotate
 from .quest_screen import QuestScreen
+from .quest_settings import AMBIENT_STYLES
 
 
 @dataclass
@@ -50,6 +52,8 @@ class QuestServer:
         ambient_feather: float = 0.03,
         reference_aspect: float | None = None,
         ambient_style: str = "edge",
+        ambient_360: bool = False,
+        ambient_motion: bool = True,
     ) -> None:
         address = ipaddress.IPv4Address(host)
         private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8")
@@ -66,7 +70,14 @@ class QuestServer:
         if type(screen_curvature) not in (int, float) or not 0 <= screen_curvature <= 120:
             raise ValueError("Quest screen curvature must be a finite number between 0 and 120 degrees")
         self._validate_ambient(
-            ambient_enabled, ambient_brightness, ambient_spread, ambient_fill_borders, ambient_feather, ambient_style
+            ambient_enabled,
+            ambient_brightness,
+            ambient_spread,
+            ambient_fill_borders,
+            ambient_feather,
+            ambient_style,
+            panoramic=ambient_360,
+            motion=ambient_motion,
         )
         self.host, self.port, self.discovery_port = host, port, discovery_port
         self.width, self.height, self.fps, self.bitrate = width, height, fps, bitrate
@@ -83,6 +94,7 @@ class QuestServer:
         self._ambient_fill_borders = ambient_fill_borders
         self._ambient_feather = float(ambient_feather)
         self._ambient_style = ambient_style
+        self._ambient_360, self._ambient_motion = ambient_360, ambient_motion
         self._ambient_background: AmbientBackground | None = None
         self._ambient_generation = 0
         self._ambient_pending: tuple[bytes, int] | None = None
@@ -354,7 +366,15 @@ class QuestServer:
 
     @staticmethod
     def _validate_ambient(
-        enabled: bool, brightness: float, spread: float, fill_borders: bool, feather: float, style: str = "edge"
+        enabled: bool,
+        brightness: float,
+        spread: float,
+        fill_borders: bool,
+        feather: float,
+        style: str = "edge",
+        *,
+        panoramic: bool = False,
+        motion: bool = True,
     ) -> None:
         if type(enabled) is not bool:
             raise ValueError("Quest ambient enabled must be a boolean")
@@ -366,8 +386,10 @@ class QuestServer:
             raise ValueError("Quest ambient fill borders must be a boolean")
         if type(feather) not in (int, float) or not 0 <= feather <= 0.1:
             raise ValueError("Quest ambient feather must be a finite number between 0 and 0.1")
-        if type(style) is not str or style not in ("edge", "blur", "halo", "cinema"):
-            raise ValueError("Quest ambient style must be edge, blur, halo or cinema")
+        if type(style) is not str or style not in AMBIENT_STYLES:
+            raise ValueError("Quest ambient style is unsupported")
+        if type(panoramic) is not bool or type(motion) is not bool:
+            raise ValueError("Quest ambient panoramic and motion must be booleans")
 
     def _ambient_scale(self) -> tuple[float, float]:
         angle = math.radians(self._screen_curvature)
@@ -396,17 +418,24 @@ class QuestServer:
         fill_borders: bool = True,
         feather: float = 0.03,
         style: str = "edge",
+        *,
+        panoramic: bool = False,
+        motion: bool = True,
     ) -> None:
-        self._validate_ambient(enabled, brightness, spread, fill_borders, feather, style)
+        self._validate_ambient(
+            enabled, brightness, spread, fill_borders, feather, style, panoramic=panoramic, motion=motion
+        )
         with self._layer_lock:
             with self._condition:
-                if (enabled, brightness, spread, fill_borders, feather, style) == (
+                if (enabled, brightness, spread, fill_borders, feather, style, panoramic, motion) == (
                     self._ambient_enabled,
                     self._ambient_brightness,
                     self._ambient_spread,
                     self._ambient_fill_borders,
                     self._ambient_feather,
                     self._ambient_style,
+                    self._ambient_360,
+                    self._ambient_motion,
                 ):
                     return
                 self._ambient_enabled = enabled
@@ -415,6 +444,7 @@ class QuestServer:
                 self._ambient_fill_borders = fill_borders
                 self._ambient_feather = float(feather)
                 self._ambient_style = style
+                self._ambient_360, self._ambient_motion = panoramic, motion
                 self._reset_ambient(clear_frame=False)
                 connection = self._connection
                 self._condition.notify_all()
@@ -440,17 +470,21 @@ class QuestServer:
         self._update_ambient_frame(cached)
 
     def refresh_ambient_frame(self) -> None:
-        # 只在主生产循环等待新帧时调用；设置未变时不运行Torch、不压缩、不发送。
+        # 主生产循环等待新帧时调用；设置不变仅新三样式的慢动画使用CPU缓存刷新。
         with self._condition:
             cached = self._ambient_frame
-            if cached is None or self._ambient_frame_revision == self._ambient_generation:
+            if cached is None:
                 return
-        self._update_ambient_frame(cached, refresh=True)
+            animate = self._ambient_frame_revision == self._ambient_generation
+            if animate and (not self._ambient_motion or self._ambient_style not in MOTION_STYLES):
+                return
+        self._update_ambient_frame(cached, refresh=True, animate=animate)
 
     def _update_ambient_frame(
         self,
         cached: tuple[torch.Tensor, tuple[int, int, int, int] | None, torch.Tensor | None, int, socket.socket],
         refresh: bool = False,
+        animate: bool = False,
     ) -> None:
         frame, content_rect, sbs, video_generation, connection = cached
         with self._layer_lock:
@@ -472,23 +506,32 @@ class QuestServer:
                 scale = self._ambient_scale()
                 fill_borders, feather = self._ambient_fill_borders, self._ambient_feather
                 style = self._ambient_style
+                panoramic, motion = self._ambient_360, self._ambient_motion
                 video_rect = self._video_rect()
         # 单目RGB取色+最终SBS遮罩→同包RGBA；提色与压缩由媒体owner在锁外完成。
         if background is None:
+            if animate:
+                return
             background = AmbientBackground()
         elif reset_colors:
             # 仅媒体owner改生成器；同一缓存帧保留黑条迟滞，换源仍完整清理。
             background.reset(preserve_content=True)
-        payload = background.update(
-            frame,
-            brightness,
-            content_rect,
-            sbs=sbs,
-            scale=scale,
-            fill_borders=fill_borders,
-            feather=feather,
-            video_rect=video_rect,
-            style=style,
+        payload = (
+            background.animate()
+            if animate
+            else background.update(
+                frame,
+                brightness,
+                content_rect,
+                sbs=sbs,
+                scale=scale,
+                fill_borders=fill_borders,
+                feather=feather,
+                video_rect=video_rect,
+                style=style,
+                panoramic=panoramic,
+                motion=motion,
+            )
         )
         if payload is None:
             return
@@ -762,6 +805,13 @@ class QuestServer:
             ]
         }
         if self._ambient_visible:
+            if self._ambient_360:
+                layers["camadas"] = (
+                    panorama_layers(
+                        AmbientBackground.TEXTURE_ID, list(position), list(rotation), AmbientBackground.HEIGHT
+                    )
+                    + layers["camadas"]
+                )
             sx, sy = self._ambient_scale()
             ambient = {**geometry}
             if geometry["tipo"] == "cilindro":

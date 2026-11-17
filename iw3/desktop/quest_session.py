@@ -44,6 +44,9 @@ class QuestSession:
     def values(args: Namespace) -> dict[str, Any]:
         values = {key: copy.deepcopy(getattr(args, key)) for key in FIELD_MAP if hasattr(args, key)}
         values.setdefault("quest_ambient_style", "edge")
+        values.setdefault("quest_ambient_360", True)
+        values.setdefault("quest_ambient_motion", True)
+        values.setdefault("browser_quality", "auto")
         return values
 
     def snapshot(self) -> dict[str, Any]:
@@ -170,6 +173,10 @@ class QuestSession:
                     decoder=source.get("decoder", "NVDEC"),
                     hardware_active=source.get("hardware_active", False),
                     source_size=source.get("source_size"),
+                    selected_quality=source.get("selected_quality"),
+                    available_quality=source.get("available_quality"),
+                    fallback_reason=source.get("fallback_reason", ""),
+                    codec=source.get("codec"),
                     audio_path=source.get("audio_path", "Windows 回环采音；网页视频跟随播放时钟"),
                 )
                 if hasattr(capture, "get_fps"):
@@ -226,6 +233,8 @@ class QuestSession:
                     args.quest_ambient_fill_borders,
                     args.quest_ambient_feather,
                     getattr(args, "quest_ambient_style", "edge"),
+                    panoramic=getattr(args, "quest_ambient_360", True),
+                    motion=getattr(args, "quest_ambient_motion", True),
                 )
         self.publish(args, patch)
 
@@ -258,6 +267,8 @@ class QuestSession:
             settings.get("ambient_fill_borders", True),
             settings.get("ambient_feather", 0.03),
             settings.get("ambient_style", "edge"),
+            panoramic=settings.get("ambient_360", True),
+            motion=settings.get("ambient_motion", True),
         )
         self.server.set_controller_factory(settings.get("controller_factory"))
         return self.server
@@ -285,6 +296,8 @@ class QuestSession:
             ambient_fill_borders=getattr(args, "quest_ambient_fill_borders", True),
             ambient_feather=getattr(args, "quest_ambient_feather", 0.03),
             ambient_style=getattr(args, "quest_ambient_style", "edge"),
+            ambient_360=getattr(args, "quest_ambient_360", True),
+            ambient_motion=getattr(args, "quest_ambient_motion", True),
             reference_aspect=16 / 9 if args.screenshot == "browser_video" else None,
         )
         self.server.set_menu(QuestMenu(self.snapshot, self.submit))

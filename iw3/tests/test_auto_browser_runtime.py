@@ -188,7 +188,7 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
             log.append(("release_keys", True))
 
     def process(frame, *a, **kw):
-        kind = "browser" if frame.shape[-1] == 180 else "desktop"
+        kind = "browser" if frame.shape[-1] == 360 else "desktop"
         processed.append((kind, tuple(frame.shape)))
         if kind == "browser" and state["generation"] == "video-2" and invalidation == "ai":
             state["fullscreen"] = False
@@ -265,16 +265,16 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
     desktop._iw3_desktop_main_once(args, init_wxapp=False)
     assert processed == [
         ("desktop", (3, 320, 568)),
-        ("browser", (3, 320, 180)),
-        ("browser", (3, 320, 180)),
+        ("browser", (3, 640, 360)),
+        ("browser", (3, 640, 360)),
         ("desktop", (3, 320, 568)),
     ]
-    assert sent == [(3, 320, 1136), (3, 320, 360), (3, 320, 1136)]
+    assert sent == [(3, 320, 1136), (3, 640, 720), (3, 320, 1136)]
     assert len(backgrounds) == (1 if invalidation == "ai" else 2)
-    assert backgrounds[0]["content_rect"] == (0, 0, 180, 320)
+    assert backgrounds[0]["content_rect"] == (0, 0, 360, 640)
     if invalidation == "ambient":
         assert log[log.index(("ambient", "video-2")) + 1] == ("discard", True)
-    assert configurations == [(360, 320), (1136, 320)]
+    assert configurations == [(720, 640), (1136, 320)]
     assert references == [None, 16 / 9, None]
     assert log.count(("server", "start")) == log.count(("bridge", "start")) == 1
     assert [kind for action, kind in log if action == "start"] == ["desktop", "browser", "desktop"]

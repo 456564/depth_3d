@@ -13,7 +13,7 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont
 
 from .quest_input import _rotate, _vector, ray_to_uv
-from .quest_settings import AMBIENT_STYLE_LABELS, FIELD_MAP, PAGES, get_fields, validate_patch
+from .quest_settings import AMBIENT_STYLE_LABELS, BROWSER_QUALITY_LABELS, FIELD_MAP, PAGES, get_fields, validate_patch
 
 
 class QuestMenu:
@@ -411,6 +411,8 @@ class QuestMenu:
     def _value(key: str, value: Any) -> str:
         if key == "quest_ambient_style":
             return AMBIENT_STYLE_LABELS.get(value, str(value))
+        if key == "browser_quality":
+            return BROWSER_QUALITY_LABELS.get(value, str(value))
         if key == "window_name" and not value:
             return "整个桌面（所选显示器）"
         if key == "quest_screen_curvature":
@@ -574,12 +576,16 @@ class QuestMenu:
         if browser:
             decode_status = "NVDEC 已硬解" if values.get("hardware_active") else "NVDEC 等待有效帧"
             lines = [
-                "来源：网页压缩视频；无源时等待，不回退录屏。",
+                "来源：网页原压缩视频；全部档位取源失败会提示并回录屏。",
                 f"解码：{decode_status}；源尺寸：{values.get('source_size') or '等待'}。",
                 "声音沿用 Windows 回环采音，视频跟随网页时间；尚无严格音画同步保证。",
             ]
+            if values.get("selected_quality"):
+                lines.append(f"实际档位：{values['selected_quality']}；编码：{values.get('codec') or '等待'}")
         elif values.get("quest_auto_browser"):
             lines[0] = "来源：桌面捕获；抖音进入全屏后自动切压缩视频，退出恢复桌面。"
+        if values.get("fallback_reason"):
+            lines.append(f"降档/录屏原因：{values['fallback_reason']}")
         for key, label in (
             ("depth_model", "当前模型"),
             ("method", "合成方法"),

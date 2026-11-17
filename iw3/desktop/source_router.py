@@ -12,18 +12,23 @@ class SourceRouter:
         desktop_factory: Callable[[], Any],
         media_factory: Callable[[], Any],
         on_switch: Callable[[str, int], None],
+        *,
+        fixed_browser: bool = False,
     ) -> None:
         self.bridge = bridge
         self._factories = {"desktop": desktop_factory, "browser": media_factory}
         self._on_switch = on_switch
-        self.source_kind = "desktop"
+        self._fixed_browser = fixed_browser
+        self.source_kind = "browser" if fixed_browser else "desktop"
         # 工厂可能已初始化 OBS portal；即使尚未 start，stop 也负责释放。
-        self._source = desktop_factory()
+        self._source = self._factories[self.source_kind]()
         self._epoch = 0
         self._frame_token: tuple[int, str | None] | None = None
         self._idle_event = threading.Event()
         self._started = False
         self._stopped = False
+        self._fallback_key: tuple[Any] | None = None
+        self._fallback_reason = ""
 
     @property
     def frame_set_event(self) -> threading.Event:
@@ -32,6 +37,10 @@ class SourceRouter:
     def _desired_kind(self) -> str:
         state = self.bridge.status()
         if state.get("fresh") is True and type(state.get("fullscreen")) is bool:
+            if (state["fullscreen"] or self._fixed_browser) and self._fallback_key == (state.get("generation"),):
+                return "desktop"
+            if self._fixed_browser:
+                return "browser"
             return "browser" if state["fullscreen"] else "desktop"
         # 超时不是退出全屏；网页源失效必须明确等待，不偷偷切回录屏。
         return self.source_kind
@@ -48,6 +57,19 @@ class SourceRouter:
     def poll_route(self) -> None:
         if not self._started or self._stopped:
             return
+        state = self.bridge.status()
+        if state.get("fresh") is True:
+            if (not self._fixed_browser and not state.get("fullscreen")) or self._fallback_key != (
+                state.get("generation"),
+            ):
+                self._fallback_key, self._fallback_reason = None, ""
+            if self.source_kind == "browser" and self._source is not None:
+                status = self._source.get_status()
+                if status.get("fallback_required") is True and status.get("failure_generation") == state.get(
+                    "generation"
+                ):
+                    self._fallback_key = (state.get("generation"),)
+                    self._fallback_reason = status.get("fallback_reason") or status.get("message", "原视频无法读取")
         desired = self._desired_kind()
         if desired == self.source_kind:
             return
@@ -139,6 +161,12 @@ class SourceRouter:
                     hardware_active=False,
                     source_size=None,
                 )
+        elif self._fallback_key is not None:
+            status.update(
+                message=f"取源失败，正在录屏：{self._fallback_reason}",
+                fallback_reason=self._fallback_reason,
+                input_source="屏幕捕获（取源失败回退）",
+            )
         return status
 
     def stop(self) -> None:

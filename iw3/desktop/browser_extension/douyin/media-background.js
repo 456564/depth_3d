@@ -1,6 +1,7 @@
 /* 仅本扩展的抖音顶层页面可访问固定本机视频桥。 */
 (() => {
   'use strict';
+  if (typeof importScripts === 'function') importScripts('media-source.js');
   const endpoint = 'http://127.0.0.1:52302';
   const maxChunk = 8 * 1024 * 1024;
   let token, pairing, lease, delivery;
@@ -23,9 +24,9 @@
     const relay = counts(value.relay, ['events','states','chunks','bytes']);
     const video = counts(value.video, ['width','height','ready_state']);
     const bridge = counts(value.bridge, ['bytes','next_sequence']);
-    if (!relay || !['1.1.1','1.1.2','1.1.3','1.1.4','1.2.0'].includes(value.relay.version) || !video || video.width > 8192 || video.height > 8192 || video.ready_state > 4 ||
+    if (!relay || !['1.1.1','1.1.2','1.1.3','1.1.4','1.2.0','1.3.0'].includes(value.relay.version) || !video || video.width > 8192 || video.height > 8192 || video.ready_state > 4 ||
       !['none','empty','url','blob','srcObject'].includes(value.video.kind) || typeof value.video.paused !== 'boolean' ||
-      !bridge || bridge.bytes > 256 * 1024 * 1024 || !['waiting','source','error'].includes(value.bridge.state)) return null;
+      !bridge || bridge.bytes > 256 * 1024 * 1024 || !['waiting','source','descriptor','error'].includes(value.bridge.state)) return null;
     for (const key of ['ticks','window_seen','rejected_source','rejected_channel','rejected_session','rejected_kind','rejected_state','rejected_chunk','report_sent','report_ok','report_rejected','report_pending']) {
       if (value.relay[key] === undefined) continue;
       if (!Number.isSafeInteger(value.relay[key]) || value.relay[key] < 0 || key === 'report_pending' && value.relay[key] > 1) return null;
@@ -38,7 +39,7 @@
     let main = null;
     if (value.main !== null && value.main !== undefined) {
       main = counts(value.main, ['ticks','mse_urls','blob_urls','other_urls','video_tracks','audio_tracks','other_tracks','appends','bytes','chunks','states']);
-      if (!main || !['1.1.1','1.1.2','1.1.3','1.1.4','1.2.0'].includes(value.main.version) || !['starting','ready'].includes(value.main.stage) ||
+      if (!main || !['1.1.1','1.1.2','1.1.3','1.1.4','1.2.0','1.3.0'].includes(value.main.version) || !['starting','ready'].includes(value.main.stage) ||
         !['none','empty','url','blob_mapped','blob_unmapped','srcObject'].includes(value.main.current)) return null;
       if (value.main.src_object_type !== undefined) {
         if (!['none','media_stream','media_source_handle','other'].includes(value.main.src_object_type)) return null;
@@ -59,6 +60,11 @@
         if (!dimensions || dimensions.width > 8192 || dimensions.height > 8192) return null;
         Object.assign(main,dimensions);
       }
+      if (value.main.source_kind !== undefined) {
+        if (!['none','vod','live'].includes(value.main.source_kind) || !Number.isInteger(value.main.renditions) || value.main.renditions < 0 || value.main.renditions > 8 ||
+            !Number.isInteger(value.main.known_works) || value.main.known_works < 0 || value.main.known_works > 64) return null;
+        Object.assign(main,{source_kind:value.main.source_kind,renditions:value.main.renditions,known_works:value.main.known_works});
+      }
       Object.assign(main, {version:value.main.version,stage:value.main.stage,current:value.main.current});
     }
     return {main,relay:{version:value.relay.version,...relay},video:{...video,kind:value.video.kind,paused:value.video.paused},bridge:{...bridge,state:value.bridge.state}};
@@ -67,11 +73,12 @@
     return value && identifier(value.session) && identifier(value.generation) &&
       (value.media_available === undefined || typeof value.media_available === 'boolean') &&
       (value.fullscreen === undefined || typeof value.fullscreen === 'boolean') &&
+      (value.source === undefined || value.media_available === true && globalThis.IW3MediaSource?.clean(value.source)) &&
       Number.isSafeInteger(value.serial) && value.serial >= 0 &&
       Number.isFinite(value.media_time) && value.media_time >= 0 && value.media_time <= 604800 &&
       typeof value.paused === 'boolean' && Number.isFinite(value.playback_rate) && value.playback_rate >= 0.05 && value.playback_rate <= 16 &&
       ([value.width, value.height].every(size => Number.isInteger(size) && size > 0 && size <= 8192) ||
-        value.media_available === false && value.width === 0 && value.height === 0) &&
+        (value.media_available === false || value.source?.kind === 'live') && value.width === 0 && value.height === 0) &&
       (value.duration === null || Number.isFinite(value.duration) && value.duration >= 0 && value.duration <= 604800);
   }
   async function pair() {
@@ -125,6 +132,8 @@
             source,media_available:source ? lease.media_available : null,fullscreen:source ? lease.fullscreen : null,
             controllable:!!confirmed && confirmed.state_confirmed_at !== null && transport.ok && now-confirmed.state_confirmed_at<=3000,
             delivered:!!confirmed && lease.media_available && confirmed.bytes > 0 && confirmed.sequence > 0 && transport.ok && now-transport.updated_at<=3000,
+            descriptor_sent:!!confirmed && !!lease.source_descriptor && confirmed.state_confirmed_at !== null && transport.ok && now-confirmed.state_confirmed_at<=3000,
+            source_descriptor:source ? lease.source_descriptor || null : null,
             confirmed_bytes:confirmed?.bytes || 0,confirmed_sequence:confirmed?.sequence || 0} : null,
           pages:pages.size,
           transport:{...transport,age_ms:transport.updated_at === null ? null : Math.max(0,now-transport.updated_at)},
@@ -148,8 +157,10 @@
         const state = {};
         for (const key of ['session','generation','serial','media_time','paused','playback_rate','duration','width','height']) state[key] = message.state[key];
         state.media_available = message.state.media_available !== false;
+        if (message.state.source) state.source = IW3MediaSource.clean(message.state.source);
         state.fullscreen = message.state.fullscreen === true && sender.tab.active === true && message.focused === true;
-        lease = {tab: sender.tab.id, session: state.session, generation: state.generation, media_available:state.media_available, fullscreen:state.fullscreen, until: now + 1000};
+        const sourceDescriptor = state.source ? {kind:state.source.kind,renditions:state.source.renditions.map(({id,width,height,bitrate,codec}) => ({id,width,height,bitrate,codec}))} : null;
+        lease = {tab: sender.tab.id, session: state.session, generation: state.generation, media_available:state.media_available, fullscreen:state.fullscreen, source_descriptor:sourceDescriptor, until: now + 1000};
         if (!delivery || delivery.tab !== lease.tab || delivery.session !== lease.session || delivery.generation !== lease.generation || delivery.media_available !== lease.media_available || delivery.fullscreen !== lease.fullscreen)
           delivery = {tab:lease.tab,session:lease.session,generation:lease.generation,media_available:lease.media_available,fullscreen:lease.fullscreen,bytes:0,sequence:0,state_confirmed_at:null};
         const currentLease = lease;
@@ -169,7 +180,7 @@
         stateQueue = pending.catch(() => {});
         return await pending;
       }
-      if (message?.kind !== 'chunk' || !lease || !lease.media_available || lease.tab !== sender.tab.id || now > lease.until ||
+      if (message?.kind !== 'chunk' || !lease || !lease.media_available || lease.source_descriptor || lease.tab !== sender.tab.id || now > lease.until ||
         message.session !== lease.session || message.generation !== lease.generation ||
         !Number.isSafeInteger(message.sequence) || message.sequence < 0 ||
         typeof message.data !== 'string' || !message.data.length || message.data.length > 4 * Math.ceil(maxChunk / 3) ||

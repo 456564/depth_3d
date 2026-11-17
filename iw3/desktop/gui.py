@@ -44,7 +44,7 @@ from nunif.gui import (
 from ..base_depth_model import BaseDepthModel
 from ..locales import LOCALES, load_language_setting, save_language_setting
 from .quest_restart import add_resume_argument, load_resume, restart_process
-from .quest_settings import AMBIENT_STYLE_LABELS, AMBIENT_STYLES, FIELD_MAP
+from .quest_settings import AMBIENT_STYLE_LABELS, AMBIENT_STYLES, BROWSER_QUALITY_LABELS, FIELD_MAP
 from .utils import (
     get_local_address,
     is_private_address,
@@ -495,6 +495,13 @@ class MainFrame(wx.Frame):
         )
         self.chk_quest_auto_browser.SetValue(True)
         self.chk_quest_auto_browser.SetToolTip(FIELD_MAP["quest_auto_browser"].help)
+        self.lbl_browser_quality = wx.StaticText(self.grp_network, label="网页源画质上限")
+        self.cbo_browser_quality = wx.Choice(
+            self.grp_network, choices=list(BROWSER_QUALITY_LABELS.values()), name="cbo_browser_quality"
+        )
+        self.cbo_browser_quality.SetSelection(0)
+        self.cbo_browser_quality.SetToolTip(FIELD_MAP["browser_quality"].help)
+        self.cbo_stream_height.SetToolTip(FIELD_MAP["stream_height"].help)
         self.sep_network1 = wx.StaticLine(self.grp_network, style=wx.LI_HORIZONTAL)
 
         self.chk_auth = wx.CheckBox(self.grp_network, label=T("Basic Authentication"), name="chk_auth")
@@ -503,7 +510,7 @@ class MainFrame(wx.Frame):
         self.lbl_auth_password = wx.StaticText(self.grp_network, label=T("Password"))
         self.txt_auth_password = wx.TextCtrl(self.grp_network, style=wx.TE_PASSWORD, name="txt_auth_password")
 
-        layout = wx.GridBagSizer(vgap=5, hgap=4)
+        layout = wx.GridBagSizer(vgap=4, hgap=4)
         layout.SetEmptyCellSize((0, 0))
         layout.Add(self.lbl_view_mode, (0, 0), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.cbo_view_mode, (0, 1), flag=wx.EXPAND)
@@ -531,7 +538,10 @@ class MainFrame(wx.Frame):
         layout.Add(self.chk_quest_control, (13, 1), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.lbl_quest_audio_source, (14, 0), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.cbo_quest_audio_source, (14, 1), flag=wx.EXPAND)
-        layout.Add(self.chk_quest_auto_browser, (15, 0), (1, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        browser_options = wx.BoxSizer(wx.HORIZONTAL)
+        for control in (self.chk_quest_auto_browser, self.lbl_browser_quality, self.cbo_browser_quality):
+            browser_options.Add(control, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=4)
+        layout.Add(browser_options, (15, 0), (1, 3), flag=wx.EXPAND)
         layout.Add(self.sep_network1, (16, 0), (0, 3), flag=wx.EXPAND | wx.ALL)
 
         layout.Add(self.chk_auth, (17, 0), (0, 3), flag=wx.ALIGN_CENTER_VERTICAL)
@@ -789,7 +799,7 @@ class MainFrame(wx.Frame):
         self.sld_quest_ambient_spread = wx.Slider(
             self.pnl_process, value=200, minValue=120, maxValue=400, name="sld_quest_ambient_spread"
         )
-        self.sld_quest_ambient_spread.SetToolTip("范围越大，前方柔光越广；跟随窗口和曲面，不是360房间。")
+        self.sld_quest_ambient_spread.SetToolTip(FIELD_MAP["quest_ambient_spread"].help)
         self.chk_quest_ambient_fill_borders = wx.CheckBox(
             self.pnl_process, label="智能黑边填光", name="chk_quest_ambient_fill_borders"
         )
@@ -802,6 +812,15 @@ class MainFrame(wx.Frame):
         )
         self.cbo_quest_ambient_style.SetSelection(0)
         self.cbo_quest_ambient_style.SetToolTip(FIELD_MAP["quest_ambient_style"].help)
+        self.chk_quest_ambient_360 = wx.CheckBox(self.pnl_process, label="360°全景背景", name="chk_quest_ambient_360")
+        self.chk_quest_ambient_motion = wx.CheckBox(
+            self.pnl_process, label="背景缓慢动画", name="chk_quest_ambient_motion"
+        )
+        for key in ("quest_ambient_360", "quest_ambient_motion"):
+            control = getattr(self, "chk_" + key)
+            control.SetValue(True)
+            control.SetToolTip(FIELD_MAP[key].help)
+            control.Bind(wx.EVT_CHECKBOX, self.on_quest_ambient)
         self.lbl_quest_ambient_feather = wx.StaticText(self.pnl_process, label="边缘渐隐 10.00%")
         self.lbl_quest_ambient_feather.SetMinSize(self.lbl_quest_ambient_feather.GetBestSize())
         self.lbl_quest_ambient_feather.SetLabel("边缘渐隐 3%")
@@ -832,7 +851,10 @@ class MainFrame(wx.Frame):
         layout.Add(self.sld_quest_ambient_brightness, (4, 2), (1, 2), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_ambient_spread, (5, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_ambient_spread, (5, 2), (1, 2), flag=wx.EXPAND)
-        layout.Add(self.chk_quest_ambient_fill_borders, (6, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
+        ambient_options = wx.BoxSizer(wx.HORIZONTAL)
+        for control in (self.chk_quest_ambient_fill_borders, self.chk_quest_ambient_360, self.chk_quest_ambient_motion):
+            ambient_options.Add(control, flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=4)
+        layout.Add(ambient_options, (6, 0), (1, 2), flag=wx.EXPAND)
         layout.Add(self.cbo_quest_ambient_style, (6, 2), (1, 2), flag=wx.EXPAND)
         layout.Add(self.lbl_quest_ambient_feather, (7, 0), (1, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         layout.Add(self.sld_quest_ambient_feather, (7, 2), (1, 2), flag=wx.EXPAND)
@@ -1060,6 +1082,8 @@ class MainFrame(wx.Frame):
             control = event.GetEventObject()
             for key, widget, value in (
                 ("quest_ambient", self.chk_quest_ambient, self.chk_quest_ambient.GetValue()),
+                ("quest_ambient_360", self.chk_quest_ambient_360, self.chk_quest_ambient_360.GetValue()),
+                ("quest_ambient_motion", self.chk_quest_ambient_motion, self.chk_quest_ambient_motion.GetValue()),
                 (
                     "quest_ambient_style",
                     self.cbo_quest_ambient_style,
@@ -1359,9 +1383,12 @@ class MainFrame(wx.Frame):
                 quest_audio_gain=self.sld_quest_audio_gain.GetValue() / 100,
                 quest_control=self.chk_quest_control.GetValue(),
                 quest_auto_browser=self.chk_quest_auto_browser.GetValue(),
+                browser_quality=tuple(BROWSER_QUALITY_LABELS)[max(0, self.cbo_browser_quality.GetSelection())],
                 quest_screen_curvature=self.sld_quest_screen_curvature.GetValue(),
                 quest_ambient=self.chk_quest_ambient.GetValue(),
                 quest_ambient_style=AMBIENT_STYLES[max(0, self.cbo_quest_ambient_style.GetSelection())],
+                quest_ambient_360=self.chk_quest_ambient_360.GetValue(),
+                quest_ambient_motion=self.chk_quest_ambient_motion.GetValue(),
                 quest_ambient_brightness=self.sld_quest_ambient_brightness.GetValue() / 100,
                 quest_ambient_spread=self.sld_quest_ambient_spread.GetValue() / 100,
                 quest_ambient_fill_borders=self.chk_quest_ambient_fill_borders.GetValue(),
@@ -1485,6 +1512,11 @@ class MainFrame(wx.Frame):
                 self.chk_quest_ambient.SetValue(values["quest_ambient"])
             if "quest_ambient_style" in values:
                 self.cbo_quest_ambient_style.SetSelection(AMBIENT_STYLES.index(values["quest_ambient_style"]))
+            if "browser_quality" in values:
+                self.cbo_browser_quality.SetSelection(tuple(BROWSER_QUALITY_LABELS).index(values["browser_quality"]))
+            for key in ("quest_ambient_360", "quest_ambient_motion"):
+                if key in values:
+                    getattr(self, "chk_" + key).SetValue(values[key])
             if "quest_ambient_fill_borders" in values:
                 self.chk_quest_ambient_fill_borders.SetValue(values["quest_ambient_fill_borders"])
             for key, scale in (
@@ -1689,6 +1721,9 @@ class MainFrame(wx.Frame):
 
     def load_preset(self, name=None, exclude_names=set()):
         self.cbo_quest_ambient_style.SetSelection(0)
+        self.cbo_browser_quality.SetSelection(0)
+        self.chk_quest_ambient_360.SetValue(True)
+        self.chk_quest_ambient_motion.SetValue(True)
         self.chk_quest_auto_browser.SetValue(True)
         exclude_names.add("cbo_language")  # ignore language
         if not name:
@@ -1835,6 +1870,7 @@ class MainFrame(wx.Frame):
     def update_view_mode(self, *args, **kwargs):
         local_viewer = self.cbo_view_mode.GetValue() == "Local Viewer"
         quest = self.cbo_view_mode.GetValue() == "Quest / Pop3D"
+        self.lbl_stream_height.SetLabel("桌面捕获高度" if quest else T("Streaming Resolution"))
         address_options = [self.chk_bind_addr, self.txt_bind_addr, self.btn_detect_ip]
         streaming_options = [
             self.lbl_port,
@@ -1866,6 +1902,8 @@ class MainFrame(wx.Frame):
             self.chk_quest_audio,
             self.chk_quest_control,
             self.chk_quest_auto_browser,
+            self.lbl_browser_quality,
+            self.cbo_browser_quality,
             self.lbl_quest_audio_source,
             self.cbo_quest_audio_source,
             self.lbl_quest_audio_gain,
@@ -1875,6 +1913,8 @@ class MainFrame(wx.Frame):
             self.sld_quest_screen_curvature,
             self.chk_quest_ambient,
             self.cbo_quest_ambient_style,
+            self.chk_quest_ambient_360,
+            self.chk_quest_ambient_motion,
             self.sld_quest_ambient_brightness,
             self.lbl_quest_ambient_spread,
             self.sld_quest_ambient_spread,

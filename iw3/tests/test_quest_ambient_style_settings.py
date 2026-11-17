@@ -12,8 +12,8 @@ from .test_quest_ambient_settings import session
 from .test_quest_gui_settings import frame as frame
 from .test_quest_menu import click, opened
 
-STYLES = ("edge", "blur", "halo", "cinema")
-LABELS = ("方向柔光", "画面模糊延展", "四边光晕", "影院暗光")
+STYLES = ("edge", "blur", "halo", "cinema", "aurora", "mist", "stars")
+LABELS = ("方向柔光", "画面模糊延展", "四边光晕", "影院暗光", "极光", "云雾", "星空")
 
 
 def test_legacy_settings_and_resume_default_to_directional_light() -> None:
@@ -58,7 +58,7 @@ def test_style_live_patch_and_media_reconfiguration_reach_server(style: str) -> 
     owner = session()
     applied = []
     owner.server = Namespace(
-        configure_ambient=lambda *values: applied.append(values),
+        configure_ambient=lambda *values, **options: applied.append(values),
         pause_media=lambda: None,
         set_reference_aspect=lambda value: None,
         configure_video=lambda *values: None,

@@ -120,6 +120,74 @@ def test_status_reports_real_source_and_browser_failure_never_falls_back():
     router.stop()
 
 
+def test_terminal_source_failure_falls_back_once_per_video_and_keeps_reason_visible():
+    router, state, log, _ = make_router()
+    router.start()
+    state.update(fresh=True, fullscreen=True, generation="clip-1")
+    router.poll_route()
+    failed = log[-1]
+    failed.get_status = lambda: {
+        "status": "error",
+        "fallback_required": True,
+        "failure_generation": "clip-1",
+        "message": "所有地址均无法读取（HTTP 403）",
+    }
+    router.poll_route()
+    assert router.source_kind == "desktop" and not failed.alive
+    assert "取源失败，正在录屏" in router.get_status()["message"]
+    assert "403" in router.get_status()["fallback_reason"]
+    for _ in range(3):
+        router.poll_route()
+    assert len(log) == 3
+    state["generation"] = "clip-2"
+    router.poll_route()
+    assert router.source_kind == "browser" and len(log) == 4
+    state["fullscreen"] = False
+    router.poll_route()
+    assert not router.get_status().get("fallback_reason")
+    router.stop()
+
+
+def test_fixed_browser_starts_without_desktop_capture_and_falls_back_without_fullscreen():
+    from iw3.desktop.source_router import SourceRouter
+
+    state, log = {"fresh": True, "fullscreen": False, "generation": "clip-1"}, []
+    router = SourceRouter(
+        SimpleNamespace(status=lambda: state),
+        lambda: Capture("desktop", log),
+        lambda: Capture("browser", log),
+        lambda *args: None,
+        fixed_browser=True,
+    )
+    router.start()
+    assert router.source_kind == "browser" and len(log) == 1
+    log[0].get_status = lambda: {
+        "fallback_required": True,
+        "failure_generation": "clip-1",
+        "message": "直播暂无可读取来源",
+    }
+    router.poll_route()
+    assert router.source_kind == "desktop"
+    router.poll_route()
+    assert len(log) == 2
+    state["generation"] = "clip-2"
+    router.poll_route()
+    assert router.source_kind == "browser" and len(log) == 3
+    router.stop()
+
+
+def test_failure_from_previous_video_cannot_lock_new_video_into_screen_capture():
+    router, state, log, _ = make_router()
+    router.start()
+    state.update(fresh=True, fullscreen=True, generation="clip-1")
+    router.poll_route()
+    log[-1].get_status = lambda: {"fallback_required": True, "failure_generation": "clip-1", "message": "403"}
+    state["generation"] = "clip-2"
+    router.poll_route()
+    assert router.source_kind == "browser" and len(log) == 2
+    router.stop()
+
+
 def test_ttl_invalidates_pending_event_instead_of_busy_polling_stale_browser_frame():
     router, state, log, _ = make_router()
     router.start()

@@ -22,7 +22,7 @@ from nunif.utils.video import pyav_init_cuda_primary_context
 from .. import models  # noqa
 from .. import utils as IW3U
 from ..stereo_model_factory import get_mlbw_divergence_level
-from .quest_settings import AMBIENT_STYLES
+from .quest_settings import AMBIENT_STYLES, BROWSER_QUALITY_LABELS
 from .screenshot_process import (  # noqa
     ScreenshotProcess,
     enum_window_names,
@@ -166,6 +166,12 @@ def create_parser():
         "--quest-auto-browser", action="store_true", help="Automatically use compressed webpage video during fullscreen"
     )
     parser.add_argument("--quest-bitrate", type=int, default=35, help="Quest HEVC bitrate in Mbps (5-100)")
+    parser.add_argument(
+        "--browser-quality",
+        choices=tuple(BROWSER_QUALITY_LABELS),
+        default="auto",
+        help="Maximum source short-edge resolution; auto selects highest readable quality",
+    )
     parser.add_argument("--quest-no-audio", action="store_true", help="Disable PC speaker audio in Quest mode")
     parser.add_argument("--quest-audio-source", choices=["process", "speaker"], default="process")
     parser.add_argument("--quest-audio-gain", type=float, default=1.0, help="Quest-only audio gain (0-4)")
@@ -192,6 +198,18 @@ def create_parser():
         help="Keep video black bars instead of filling them with ambient light",
     )
     parser.add_argument("--quest-ambient-feather", type=float, default=0.03, help="Video edge feather width (0-0.1)")
+    parser.add_argument(
+        "--quest-ambient-front-only",
+        action="store_false",
+        dest="quest_ambient_360",
+        help="Disable full-sphere ambient coverage",
+    )
+    parser.add_argument(
+        "--quest-ambient-no-motion",
+        action="store_false",
+        dest="quest_ambient_motion",
+        help="Disable slow ambient animation",
+    )
     parser.add_argument("--bind-addr", type=str, default=local_address, help="HTTP listen address")
     parser.add_argument("--user", type=str, help="HTTP Basic Authentication username")
     parser.add_argument("--password", type=str, help="HTTP Basic Authentication password")
@@ -290,6 +308,9 @@ def prepare_quest_args(args: Namespace) -> None:
                 "quest_screen_curvature",
                 "quest_ambient",
                 "quest_ambient_style",
+                "quest_ambient_360",
+                "quest_ambient_motion",
+                "browser_quality",
                 "quest_ambient_brightness",
                 "quest_ambient_spread",
                 "quest_ambient_fill_borders",
@@ -410,13 +431,16 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
             )
 
     browser_video = args.screenshot == "browser_video"
+    fixed_browser = browser_video
     auto_browser = bool(args.quest and getattr(args, "quest_auto_browser", False) and not browser_video)
     versioned_source = browser_video or auto_browser
     if versioned_source:
         from .browser_video_bridge import BrowserVideoBridge
         from .media_video_source import MediaVideoSource
     if browser_video:
-        pass
+
+        def screenshot_factory(*values, **settings):
+            return ScreenshotProcess(*values, **settings, backend="mss")
     elif args.screenshot == "pil":
         screenshot_factory = ScreenshotThreadPIL
     elif args.screenshot == "mss":
@@ -470,7 +494,6 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
             browser_bridge = BrowserVideoBridge()
             browser_bridge.start()
         if browser_video:
-            screenshot_thread = MediaVideoSource(browser_bridge.snapshot, device, fps=args.stream_fps)
             screen_width, screen_height = 1920, 1080
         elif args.screenshot == "obs":
             screenshot_thread = screenshot_factory(
@@ -591,6 +614,8 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 ambient_fill_borders=args.quest_ambient_fill_borders,
                 ambient_feather=args.quest_ambient_feather,
                 ambient_style=args.quest_ambient_style,
+                ambient_360=args.quest_ambient_360,
+                ambient_motion=args.quest_ambient_motion,
                 reference_aspect=16 / 9 if browser_video else None,
             )
         elif not args.local_viewer:
@@ -629,7 +654,37 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
         initial_capture = screenshot_thread if not browser_video else None
 
         def create_desktop_capture():
-            nonlocal initial_capture
+            nonlocal \
+                initial_capture, \
+                desktop_backend, \
+                desktop_frame_size, \
+                desktop_screen_size, \
+                frame_width, \
+                frame_height, \
+                screen_size
+            if fixed_browser:
+                # 纯视频失败时才查询桌面，避免正常取源依赖显示器或先启动录屏。
+                sizes = get_monitor_size_list()
+                if args.monitor_index >= len(sizes):
+                    raise ValueError("Fallback monitor is unavailable")
+                desktop_screen_size = sizes[args.monitor_index]
+                width, height = desktop_screen_size
+                frame_height = min(height, args.stream_height) // 2 * 2
+                frame_width = int(width * frame_height / height) // 2 * 2
+                desktop_frame_size = (frame_width, frame_height)
+                screen_size = desktop_screen_size
+                if args.quest_control:
+                    from .quest_input import QuestController
+                    from .quest_windows import WindowsInput
+
+                    desktop_backend = WindowsInput(
+                        None,
+                        "mss",
+                        (0, 0, 0, 0),
+                        frame_mapping=lambda: screenshot_thread.get_frame_mapping(),
+                        monitor_index=args.monitor_index,
+                    )
+                    server.set_controller_factory(lambda: QuestController(desktop_backend))
             if initial_capture is not None:
                 capture, initial_capture = initial_capture, None
                 return capture
@@ -638,7 +693,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 frame_width=desktop_frame_size[0],
                 frame_height=desktop_frame_size[1],
                 monitor_index=args.monitor_index,
-                window_name=args.window_name,
+                window_name=None if fixed_browser else args.window_name,
                 device=device,
                 crop_top=args.crop_top,
                 crop_left=args.crop_left,
@@ -694,20 +749,29 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                 from .quest_input import QuestController
 
                 selected_backend = BrowserInput(browser_bridge) if browser_video else desktop_backend
-                server.set_controller_factory(lambda: QuestController(selected_backend))
+                server.set_controller_factory(
+                    (lambda: QuestController(selected_backend)) if selected_backend is not None else None
+                )
             if session is not None:
                 session.set_stats(source_kind=kind)
             elif args.state["fps_event"] is not None and hasattr(args.state["fps_event"], "set_source_kind"):
                 args.state["fps_event"].set_source_kind(kind)
 
-        if auto_browser:
+        if versioned_source:
             from .source_router import SourceRouter
 
             screenshot_thread = SourceRouter(
                 browser_bridge,
                 create_desktop_capture,
-                lambda: MediaVideoSource(browser_bridge.snapshot, device, fps=args.stream_fps),
+                lambda: MediaVideoSource(
+                    browser_bridge.snapshot,
+                    device,
+                    fps=args.stream_fps,
+                    quality=args.browser_quality,
+                    state=browser_bridge.status,
+                ),
                 switch_source,
+                fixed_browser=fixed_browser,
             )
         elif screenshot_thread is None:
             screenshot_thread = create_desktop_capture()
@@ -743,13 +807,13 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
         while True:
             if args.state["stop_event"] and args.state["stop_event"].is_set():
                 break
-            if auto_browser:
+            if versioned_source:
                 screenshot_thread.poll_route()
             if versioned_source and session is None and not screenshot_thread.frame_set_event.wait(0.1):
                 frame = None
             else:
                 frame = session.read_frame(screenshot_thread) if session is not None else screenshot_thread.get_frame()
-            if auto_browser:
+            if versioned_source:
                 browser_video = screenshot_thread.source_kind == "browser"
             if frame is None:
                 if versioned_source and screenshot_thread.is_alive():
@@ -766,18 +830,17 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     blank_browser_frame()
                     continue
             if browser_video:
-                # 实测源 RGB 为 CUDA float32[3,H,W]；按原比例缩放，不回填桌面 canvas。
+                # 源为CUDA float32[3,H,W]；奇数边只复制末像素对齐NV12，不裁内容、不套桌面高度。
                 screen_height, screen_width = frame.shape[-2:]
                 screen_size = (screen_width, screen_height)
-                frame_height = min(screen_height, args.stream_height)
-                frame_height -= frame_height % 2
-                frame_width = max(2, int(frame_height * screen_width / screen_height) // 2 * 2)
+                frame_height = screen_height + screen_height % 2
+                frame_width = screen_width + screen_width % 2
                 if min(frame_height, frame_width) < 2:
                     raise ValueError("Browser video dimensions are too small")
                 if frame.shape[-2:] != (frame_height, frame_width):
-                    frame = torch.nn.functional.interpolate(
-                        frame.unsqueeze(0), size=(frame_height, frame_width), mode="bilinear", align_corners=False
-                    ).squeeze(0)
+                    frame = torch.nn.functional.pad(
+                        frame, (0, screen_width % 2, 0, screen_height % 2), mode="replicate"
+                    )
             tick = time.perf_counter()
             with args.state["args_lock"]:
                 ambient_enabled = args.quest and args.quest_ambient
