@@ -132,6 +132,8 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
             return self.alive
 
         def get_frame(self):
+            if self.kind == "browser" and len(sent) == 2:
+                state["generation"] = "video-2"
             self.generation = state["generation"]
             return torch.ones((3, 640, 360) if self.kind == "browser" else (3, 320, 568))
 
@@ -198,7 +200,9 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
         backgrounds.append(kw)
         log.append(("ambient", state["generation"]))
         if state["generation"] == "video-2" and invalidation == "ambient":
+            assert kw["still_current"]()
             state["fullscreen"] = False
+            assert not kw["still_current"]()
 
     def send(data):
         frame = data[0]
@@ -209,9 +213,7 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
         sent.append(tuple(frame.shape))
         if len(sent) == 1:
             state["fullscreen"] = True
-        elif len(sent) == 2:
-            state["generation"] = "video-2"
-        elif len(sent) == 3:
+        elif frame.shape[-1] == 1136:
             stop.set()
 
     active_controller = None
@@ -237,7 +239,7 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
         set_controller_factory=set_controller,
         discard_video_frames=lambda: log.append(("discard", True)),
         set_reference_aspect=references.append,
-        refresh_ambient_frame=lambda: None,
+        refresh_ambient_frame=lambda **kw: None,
         set_ambient_frame=background,
         configure_video=lambda w, h, fps, bitrate: configurations.append((w, h)),
         set_frame_data=send,
@@ -269,7 +271,11 @@ def test_auto_runtime_shares_ai_server_and_rejects_frames_on_fullscreen_exit(mon
         ("browser", (3, 640, 360)),
         ("desktop", (3, 320, 568)),
     ]
-    assert sent == [(3, 320, 1136), (3, 640, 720), (3, 320, 1136)]
+    expected_sent = [(3, 320, 1136), (3, 640, 720)]
+    if invalidation == "ambient":
+        # 退出发生在慢提色期间；先前已提交的有效视频保留，后续输出由代次屏障清除。
+        expected_sent.append((3, 640, 720))
+    assert sent == [*expected_sent, (3, 320, 1136)]
     assert len(backgrounds) == (1 if invalidation == "ai" else 2)
     assert backgrounds[0]["content_rect"] == (0, 0, 360, 640)
     if invalidation == "ambient":

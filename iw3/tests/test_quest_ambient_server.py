@@ -93,6 +93,59 @@ def test_video_precedes_texture_and_feather_layer(server: Any) -> None:
         server.check_error()
 
 
+@pytest.mark.parametrize("source_changed", [False, True])
+def test_video_escapes_blocked_ambient_and_only_current_source_publishes_texture(
+    server: Any, monkeypatch: pytest.MonkeyPatch, source_changed: bool
+) -> None:
+    entered, release, stale = threading.Event(), threading.Event(), threading.Event()
+    original = quest_server.AmbientBackground.update
+    errors = []
+
+    def blocked(background: Any, *args: Any, **kwargs: Any) -> bytes | None:
+        entered.set()
+        assert release.wait(2)
+        return original(background, *args, **kwargs)
+
+    def publish_paused() -> None:
+        try:
+            frame = torch.ones(3, 64, 64)
+            sbs = frame.repeat(1, 1, 2)
+            server.set_frame_data((sbs, 1.0))
+            server.set_ambient_frame(frame, sbs=sbs, wake=True, still_current=lambda: not stale.is_set())
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(quest_server.AmbientBackground, "update", blocked)
+    publisher = threading.Thread(target=publish_paused)
+    try:
+        with connect(server) as client:
+            initial_messages(client)
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._connection is not None, timeout=1)
+            publisher.start()
+            assert entered.wait(1), errors
+            kind, packet = read_message(client)
+            assert kind == 0x02 and packet[9:] == b"\xff"
+            assert publisher.is_alive(), "the video must arrive while ambient is still blocked"
+            if source_changed:
+                stale.set()
+            release.set()
+            publisher.join(1)
+            assert not publisher.is_alive() and not errors
+            if source_changed:
+                client.settimeout(0.1)
+                with pytest.raises(socket.timeout):
+                    read_message(client)
+            else:
+                assert read_message(client)[0] == 0x10
+                assert read_layers(client)[-1]["tex"] == "iw3_ambient"
+            server.check_error()
+    finally:
+        release.set()
+        if publisher.ident is not None:
+            publisher.join(2)
+
+
 def test_same_texture_id_updates_without_resending_layers(server: Any) -> None:
     with connect(server) as client:
         initial_messages(client)

@@ -6,6 +6,7 @@ import threading
 import time
 from argparse import Namespace
 from collections import deque
+from functools import partial
 from os import path
 
 import torch
@@ -821,7 +822,9 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     if not screenshot_thread.is_current_generation(generation):
                         blank_browser_frame()
                     else:
-                        server.refresh_ambient_frame()
+                        server.refresh_ambient_frame(
+                            still_current=partial(screenshot_thread.is_current_generation, generation)
+                        )
                     continue
                 break
             source_generation = screenshot_thread.get_frame_generation() if versioned_source else None
@@ -882,9 +885,6 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     blank_browser_frame()
                     continue
                 browser_blanked = False
-            if ambient_enabled or browser_video:
-                # 原单目[3,H,W]负责取色，最终FullSBS[3,H2,2W2]负责遮罩，同一包提交且不持设置锁。
-                server.set_ambient_frame(frame, content_rect=content_rect, sbs=sbs)
             with args.state["args_lock"]:
                 if args.quest:
                     if versioned_source and not screenshot_thread.is_current_generation(source_generation):
@@ -935,6 +935,21 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                             f"Screen Size = {screen_size_tuple}",
                             end="",
                         )
+
+            if ambient_enabled or browser_video:
+                # 先提交独占SBS副本再做只读提色；wake让暂停首帧也能独立发送柔光。
+                server.set_ambient_frame(
+                    frame,
+                    content_rect=content_rect,
+                    sbs=sbs,
+                    wake=True,
+                    still_current=partial(screenshot_thread.is_current_generation, source_generation)
+                    if versioned_source
+                    else None,
+                )
+                if versioned_source and not screenshot_thread.is_current_generation(source_generation):
+                    blank_browser_frame()
+                    continue
 
             if args.local_viewer:
                 # Platform-specific behavior for local viewer

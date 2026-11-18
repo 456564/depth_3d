@@ -177,6 +177,7 @@ class MediaHTTPIO(io.RawIOBase):
         self._connection: Any = None
         self._transport_socket: Any = None
         self._response: Any = None
+        self._response_position: int | None = None
         self._deadline: float | None = None
         self._abort = False
         self._signature = b""
@@ -198,6 +199,7 @@ class MediaHTTPIO(io.RawIOBase):
     def _disconnect(self) -> None:
         connection, self._connection = self._connection, None
         response, self._response = self._response, None
+        self._response_position = None
         transport, self._transport_socket = self._transport_socket, None
         sock = transport if transport is not None else connection.sock if connection is not None else None
         # will_close 会清 connection.sock，但 response.fp 仍持有实际连接。
@@ -276,6 +278,7 @@ class MediaHTTPIO(io.RawIOBase):
                     if not 0 < size <= MAX_MEDIA_SIZE or self._size is not None and self._size != size:
                         raise MediaHTTPError("媒体长度发生变化")
                     self._size = size
+                self._response_position = self._position
                 self._deadline = None
                 return
             raise MediaHTTPError("媒体重定向次数过多")
@@ -312,15 +315,16 @@ class MediaHTTPIO(io.RawIOBase):
             raise ValueError("Invalid seek mode")
         if not 0 <= target <= MAX_MEDIA_SIZE:
             raise MediaHTTPError("媒体跳转偏移无效")
-        if target != self._position:
-            self._disconnect()
-            self._position = target
+        # PyAV 反复跳到末尾查询尺寸后会回原位；等实际读偏移改变再断开 Range 响应。
+        self._position = target
         return target
 
     def read(self, size: int = -1) -> bytes:
         self._check()
         if size == 0 or not self.live and self._size is not None and self._position >= self._size:
             return b""
+        if self._response is not None and self._response_position != self._position:
+            self._disconnect()
         if self._response is None:
             self._open()
         self._deadline = time.monotonic() + IO_TIMEOUT
@@ -328,6 +332,7 @@ class MediaHTTPIO(io.RawIOBase):
             data = self._response.read1(min(32768 if size < 0 else size, MAX_READ))
             self._check()
             self._position += len(data)
+            self._response_position = self._position
             if self.live and len(self._signature) < 3:
                 self._signature = (self._signature + data)[:3]
                 if self._signature != b"FLV"[: len(self._signature)]:

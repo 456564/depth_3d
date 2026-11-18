@@ -205,6 +205,59 @@ def test_range_reader_seeks_without_whole_file_download_and_checks_content_range
         source.close()
 
 
+def test_initial_size_probe_keeps_unread_response_for_return_to_start(monkeypatch):
+    response = Response(b"abcdefgh")
+    reader, calls = fake_transport(monkeypatch, [response])
+    source = reader.MediaHTTPIO("https://media.douyinvod.com/x", lambda: False)
+    try:
+        assert source.seek(-1, io.SEEK_END) == 7
+        assert source.tell() == 7
+        assert source.seek(0) == 0
+        assert not response.closed
+        assert source.read(3) == b"abc"
+        assert len(calls) == 1
+        assert response.data.tell() == 3
+    finally:
+        source.close()
+
+
+def test_repeated_size_probes_preserve_response_at_actual_read_position(monkeypatch):
+    response = Response(b"abcdefgh")
+    reader, calls = fake_transport(monkeypatch, [response])
+    source = reader.MediaHTTPIO("https://media.douyinvod.com/x", lambda: False)
+    try:
+        assert source.read(3) == b"abc"
+        for _ in range(3):
+            assert source.seek(-1, io.SEEK_END) == 7
+            assert source.seek(3) == 3
+        assert not response.closed
+        assert source.read(3) == b"def"
+        assert len(calls) == 1
+        assert response.data.tell() == 6
+    finally:
+        source.close()
+
+
+def test_changed_read_offset_reopens_only_when_bytes_are_requested(monkeypatch):
+    response = Response(b"abcdefgh")
+    reader, calls = fake_transport(monkeypatch, [response, Response(b"fgh", start=5, size=8)])
+    source = reader.MediaHTTPIO("https://media.douyinvod.com/x", lambda: False)
+    try:
+        assert source.read(3) == b"abc"
+        assert source.seek(5) == 5
+        assert source.read(0) == b""
+        assert not response.closed
+        assert len(calls) == 1
+        assert source.read(2) == b"fg"
+        assert response.closed
+        assert len(calls) == 2
+        assert calls[1][2]["Range"] == "bytes=5-"
+        assert source.read(1) == b"h"
+        assert source.tell() == 8
+    finally:
+        source.close()
+
+
 def test_redirect_revalidates_cdn_and_never_contacts_private_destination(monkeypatch):
     reader, calls = fake_transport(monkeypatch, [Response(b"", status=302, location="https://127.0.0.1/secret")])
     source = reader.MediaHTTPIO("https://media.douyinvod.com/x", lambda: False)

@@ -459,6 +459,9 @@ class QuestServer:
         frame: torch.Tensor,
         content_rect: tuple[int, int, int, int] | None = None,
         sbs: torch.Tensor | None = None,
+        *,
+        wake: bool = False,
+        still_current: Callable[[], bool] | None = None,
     ) -> None:
         # RGB[3,H,W]/SBS[3,H,2W]只读引用由生产线程持有；暂停重建也在同一线程，不跨CUDA流。
         with self._layer_lock:
@@ -467,9 +470,9 @@ class QuestServer:
                     return
                 cached = (frame, content_rect, sbs, self._generation, self._connection)
                 self._ambient_frame = cached
-        self._update_ambient_frame(cached)
+        self._update_ambient_frame(cached, refresh=wake, still_current=still_current)
 
-    def refresh_ambient_frame(self) -> None:
+    def refresh_ambient_frame(self, *, still_current: Callable[[], bool] | None = None) -> None:
         # 主生产循环等待新帧时调用；设置不变仅新三样式的慢动画使用CPU缓存刷新。
         with self._condition:
             cached = self._ambient_frame
@@ -478,13 +481,14 @@ class QuestServer:
             animate = self._ambient_frame_revision == self._ambient_generation
             if animate and (not self._ambient_motion or self._ambient_style not in MOTION_STYLES):
                 return
-        self._update_ambient_frame(cached, refresh=True, animate=animate)
+        self._update_ambient_frame(cached, refresh=True, animate=animate, still_current=still_current)
 
     def _update_ambient_frame(
         self,
         cached: tuple[torch.Tensor, tuple[int, int, int, int] | None, torch.Tensor | None, int, socket.socket],
         refresh: bool = False,
         animate: bool = False,
+        still_current: Callable[[], bool] | None = None,
     ) -> None:
         frame, content_rect, sbs, video_generation, connection = cached
         with self._layer_lock:
@@ -533,7 +537,8 @@ class QuestServer:
                 motion=motion,
             )
         )
-        if payload is None:
+        # 提色期间网页可能已换条；让过期纹理在唤醒发送线程前就被丢弃。
+        if payload is None or (still_current is not None and not still_current()):
             return
         with self._condition:
             if (

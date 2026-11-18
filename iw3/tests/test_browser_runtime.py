@@ -189,6 +189,11 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
             assert frame.any(), "pause keeps the decoded frame visible"
         sent.append(frame.clone())
 
+    def background(*a, **kw):
+        assert sent and torch.equal(sent[-1], kw["sbs"]), "valid video must precede ambient pixel work"
+        assert kw["wake"] is True, "a paused first frame must wake the ambient sender"
+        backgrounds.append(kw)
+
     server = SimpleNamespace(
         start=lambda: None,
         stop=lambda: cleaned.append("server"),
@@ -197,8 +202,8 @@ def test_browser_media_runtime_uses_real_shapes_and_discards_stale_generation(mo
         set_controller_factory=lambda value: None,
         set_reference_aspect=lambda value: None,
         discard_video_frames=lambda: barriers.append(True),
-        refresh_ambient_frame=lambda: refreshes.append(True),
-        set_ambient_frame=lambda *a, **kw: backgrounds.append(kw),
+        refresh_ambient_frame=lambda **kw: refreshes.append(kw["still_current"]()),
+        set_ambient_frame=background,
         configure_video=lambda w, h, fps, bitrate: configured.append((w, h)),
         set_frame_data=send,
         get_fps=lambda: 0,

@@ -149,7 +149,8 @@ def test_capture_roi_and_final_sbs_reach_ambient_together_without_args_lock(monk
             self.count += 1
             return frame if self.count == 1 else None
 
-    def ambient(image, *, content_rect, sbs):
+    def ambient(image, *, content_rect, sbs, wake, still_current):
+        assert wake and still_current is None
         assert image is frame
         assert sbs is final_sbs
         assert not lock.locked()
@@ -182,4 +183,4 @@ def test_capture_roi_and_final_sbs_reach_ambient_together_without_args_lock(monk
 
     monkeypatch.setattr(quest_server, "QuestServer", create_server)
     utils._iw3_desktop_main_once(args, init_wxapp=False)
-    assert calls == ["stereo", "ambient", "video"]
+    assert calls == ["stereo", "video", "ambient"]
