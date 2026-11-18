@@ -428,6 +428,199 @@ def test_only_after_every_same_quality_url_fails_selects_next_rendition(monkeypa
     source.stop()
 
 
+def test_remote_vod_waits_for_current_position_without_discarding_readable_rendition(monkeypatch):
+    from iw3.desktop import media_video_source as module
+
+    current = [snapshot(data=b"", source=remote_descriptor())]
+    source, _ = make_remote_source(monkeypatch, current)
+
+    class PositionGapReader(RemoteReader):
+        def frame_at(self, target):
+            return None if target < 2.2 else super().frame_at(target)
+
+    monkeypatch.setattr(module, "_NVDECReader", PositionGapReader)
+    try:
+        source._update(current[0], 10)
+        assert not source.get_status()["fallback_required"]
+        assert source.get_frame() is None
+        current[0] = replace(current[0], media_time=2.3)
+        source._update(current[0], 10.1)
+        assert source.get_frame() is not None
+        assert source.get_status()["selected_quality"] == "1440p"
+        assert not source.get_status()["fallback_required"]
+    finally:
+        source.stop()
+
+
+@pytest.mark.parametrize("stage,code", [("打开媒体", 129), ("解码帧", 5), ("解码帧", None)])
+def test_remote_failure_reports_stage_and_code_without_exposing_raw_error(monkeypatch, stage, code):
+    from iw3.desktop import media_video_source as module
+
+    description = remote_descriptor()
+    description["renditions"] = [description["renditions"][0]]
+    current = [snapshot(data=b"", source=description)]
+    source, _ = make_remote_source(monkeypatch, current)
+
+    def fail():
+        if code is not None:
+            raise OSError(code, "https://private.example/signed?token=secret")
+        raise RuntimeError("https://private.example/signed?token=secret")
+
+    class FailingReader(RemoteReader):
+        def __init__(self, data, device, *, live=False):
+            if stage == "打开媒体":
+                fail()
+            super().__init__(data, device, live=live)
+
+        def frame_at(self, target):
+            fail()
+
+    monkeypatch.setattr(module, "_NVDECReader", FailingReader)
+    try:
+        source._update(current[0], 10)
+        status = source.get_status()
+        assert status["fallback_required"]
+        reason = status["fallback_reason"]
+        assert stage in reason
+        assert ("OSError" if code is not None else "RuntimeError") in reason
+        if code is not None:
+            assert str(code) in reason
+        assert all(value not in str(status) for value in ("https", "private", "token", "secret"))
+    finally:
+        source.stop()
+
+
+def test_remote_vod_persistently_missing_position_eventually_requests_capture(monkeypatch):
+    from iw3.desktop import media_video_source as module
+
+    current = [snapshot(data=b"", source=remote_descriptor(), paused=True)]
+    source, _ = make_remote_source(monkeypatch, current)
+    clock = [10.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    class MissingPositionReader(RemoteReader):
+        def frame_at(self, target):
+            return None
+
+    monkeypatch.setattr(module, "_NVDECReader", MissingPositionReader)
+    try:
+        source._update(current[0], clock[0])
+        assert not source.get_status()["fallback_required"]
+        for step in range(1, 81):
+            clock[0] = 10 + step * 0.25
+            current[0] = replace(current[0], received_at=clock[0])
+            source._update(current[0], clock[0])
+        assert source.get_status()["fallback_required"]
+        assert source.get_status()["failure_generation"] == "first"
+        assert source.get_status()["fallback_reason"]
+        assert source.get_frame() is None
+    finally:
+        source.stop()
+
+
+def test_remote_position_grace_does_not_consume_time_without_fresh_playback_state(monkeypatch):
+    from iw3.desktop import media_video_source as module
+
+    current = [snapshot(data=b"", source=remote_descriptor(), paused=True)]
+    source, _ = make_remote_source(monkeypatch, current)
+    clock = [10.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    class PositionGapReader(RemoteReader):
+        def frame_at(self, target):
+            return None if target < 2.2 else super().frame_at(target)
+
+    monkeypatch.setattr(module, "_NVDECReader", PositionGapReader)
+    try:
+        source._update(current[0], clock[0])
+        assert not source.get_status()["fallback_required"]
+        retained = current[0]
+        current[0] = None
+        clock[0] = 10.5
+        source._update(None, clock[0])
+        clock[0] = 14.0
+        current[0] = replace(retained, received_at=clock[0])
+        source._update(current[0], clock[0])
+        clock[0] = 14.1
+        current[0] = replace(current[0], media_time=2.3, received_at=clock[0])
+        source._update(current[0], clock[0])
+        assert source.get_frame() is not None
+        assert source.get_status()["selected_quality"] == "1440p"
+        assert not source.get_status()["fallback_required"]
+    finally:
+        source.stop()
+
+
+@pytest.mark.parametrize("start_time,first_pts", [(None, 0), (-1, 0), (0, 0), (1, 1)])
+def test_reader_start_time_clamps_only_before_first_frame_without_shifting_later_clock(start_time, first_pts):
+    from iw3.desktop.media_video_source import _NVDECReader
+
+    reader = _NVDECReader.__new__(_NVDECReader)
+    reader.stream = SimpleNamespace(start_time=start_time, time_base=Fraction(1, 25))
+    reader.fps = 25.0
+    reader._frames = reader._selected = reader._next = reader._rgb = None
+    seeks = []
+    frames = [SimpleNamespace(pts=i, time_base=Fraction(1, 25)) for i in range(first_pts, 12)]
+    reader.container = SimpleNamespace(
+        seek=lambda offset, **kwargs: seeks.append(offset),
+        decode=lambda stream: iter(frames),
+    )
+    reader._to_rgb = lambda frame: torch.full((3, 6, 4), frame.pts / 25)
+    initial = reader.frame_at(0)
+    assert initial is not None and initial[1] == pytest.approx(first_pts / 25)
+    repeated = reader.frame_at(0)
+    assert repeated is not None and repeated[0] is initial[0]
+    assert len(seeks) == 1
+    later = reader.frame_at(0.2)
+    assert later is not None and later[1] == pytest.approx(0.2)
+    assert len(seeks) == 1
+
+
+@pytest.mark.hwaccel
+@pytest.mark.parametrize("first_index", [-1, 0, 1])
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_real_nvdec_remote_paused_zero_clock_displays_delayed_first_frame(monkeypatch, first_index, fragmented):
+    from iw3.desktop import media_video_source as module
+    from nunif.utils.video import pyav_init_cuda_primary_context
+
+    pyav_init_cuda_primary_context(max_devices=1)
+    output = BytesIO()
+    options = {"movflags": "empty_moov+frag_keyframe+default_base_moof"} if fragmented else None
+    with av.open(output, mode="w", format="mp4", options=options) as container:
+        stream = container.add_stream("libx264", rate=25)
+        stream.width, stream.height, stream.pix_fmt = 96, 64, "yuv420p"
+        stream.options = {"crf": "12", "g": "2", "bf": "0"}
+        for index in range(first_index, first_index + 13):
+            frame = av.VideoFrame(96, 64, "rgb24")
+            frame.planes[0].update(bytes((30, 80, 180)) * (96 * 64))
+            frame.pts, frame.time_base = index, Fraction(1, 25)
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    description = remote_descriptor()
+    description["renditions"] = [description["renditions"][0]]
+    description["renditions"][0].update(width=96, height=64)
+    current = snapshot(data=b"", source=description, media_time=0, paused=True)
+    monkeypatch.setattr(module, "MediaHTTPIO", lambda *a, **k: BytesIO(output.getvalue()))
+    monkeypatch.setattr(module.time, "monotonic", lambda: 10.0)
+    source = module.MediaVideoSource(lambda: current, torch.device("cuda:0"))
+    try:
+        source._update(current, 10)
+        rgb = source.get_frame()
+        assert rgb is not None
+        assert rgb.device.type == "cuda" and rgb.dtype == torch.float32 and rgb.shape == (3, 64, 96)
+        assert torch.isfinite(rgb).all() and 0 <= rgb.min() <= rgb.max() <= 1
+        assert source.get_status()["hardware_active"]
+        assert not source.get_status()["fallback_required"]
+        repeated = source._reader.frame_at(0)
+        assert repeated is not None and repeated[0] is rgb
+        later = source._reader.frame_at(0.2)
+        assert later is not None and later[1] == pytest.approx(0.2)
+    finally:
+        source.stop()
+
+
 def test_missing_source_gets_finite_wait_then_explicit_fallback(monkeypatch):
     current = [None]
     source = make_source(monkeypatch, current)

@@ -92,6 +92,9 @@ class _NVDECReader:
         return float(frame.pts * frame.time_base)
 
     def frame_at(self, target: float) -> tuple[torch.Tensor, float] | None:
+        # 网页0秒可能早于MP4首帧；只钳制起点，不平移后续播放时钟。
+        if self.stream.start_time is not None:
+            target = max(target, float(self.stream.start_time * self.stream.time_base))
         selected_time = self._timestamp(self._selected) if self._selected is not None else None
         if self._frames is None or (
             selected_time is not None and (target < selected_time or target > selected_time + 0.5)
@@ -249,6 +252,8 @@ class MediaVideoSource(threading.Thread):
         if current is None or target is None:
             self._clear_slot(wake=True)
             self._close_reader()
+            if self._source_key is not None:
+                self._unreadable_since = None
             operation = self.state() if self.state is not None else None
             waiting_generation = (
                 operation.get("generation")
@@ -373,6 +378,7 @@ class MediaVideoSource(threading.Thread):
             self._source_key = source_key
             self._choice = self._live_reconnects = 0
             self._last_live_publish = -math.inf
+            self._unreadable_since = None
             try:
                 description = validate_source(description)
                 renditions = select_renditions(description, self.quality)
@@ -400,6 +406,7 @@ class MediaVideoSource(threading.Thread):
         reason = self.get_status()["fallback_reason"]
         while self._choice < len(self._choices) and not self._remote_cancelled(current.generation):
             rendition, url = self._choices[self._choice]
+            stage = "打开媒体"
             try:
                 if self._reader is None:
                     self._http = MediaHTTPIO(url, lambda: self._remote_cancelled(current.generation), live=live)
@@ -413,6 +420,7 @@ class MediaVideoSource(threading.Thread):
                     fresh_target = latest.position_at(time.monotonic())
                     if fresh_target is not None:
                         target = fresh_target
+                stage = "解码帧"
                 if live:
                     publish = (not current.paused or not self._valid) and now - self._last_live_publish >= 1 / self.fps
                     frame, timestamp = self._reader.next_frame(convert=publish)
@@ -421,13 +429,26 @@ class MediaVideoSource(threading.Thread):
                 else:
                     result = self._reader.frame_at(target)
                     if result is None:
-                        raise MediaHTTPError("原视频缺少当前播放位置")
+                        checked_at = time.monotonic()
+                        if self._unreadable_since is None:
+                            self._unreadable_since = checked_at
+                        if checked_at - self._unreadable_since >= SOURCE_GRACE_SECONDS:
+                            raise MediaHTTPError("原视频持续缺少当前播放位置")
+                        self._clear_slot(wake=True)
+                        self._set_status(
+                            "waiting",
+                            "等待原视频播放位置就绪。",
+                            fallback_required=False,
+                            fallback_reason=reason,
+                        )
+                        return
                     frame, timestamp = result
                 if self._remote_cancelled(current.generation):
                     self._clear_slot(wake=True)
                     self._close_reader()
                     return
                 quality = min(self._reader.width, self._reader.height)
+                self._unreadable_since = None
                 self._set_status(
                     "running",
                     "直播原流，NVDEC 硬解。" if live else "网页原视频，NVDEC 硬解。",
@@ -464,9 +485,16 @@ class MediaVideoSource(threading.Thread):
                 had_frame = self._last_sent is not None
                 self._clear_slot(wake=True)
                 self._close_reader()
+                self._unreadable_since = None
                 if self._remote_cancelled(current.generation):
                     return
-                reason = str(exc) if isinstance(exc, MediaHTTPError) else "NVDEC 原媒体解码失败"
+                code = getattr(exc, "errno", None)
+                detail = f"，错误码{code}" if type(code) is int else ""
+                reason = (
+                    str(exc)
+                    if isinstance(exc, MediaHTTPError)
+                    else f"NVDEC {stage}失败（{type(exc).__name__}{detail}）"
+                )
                 # 已成功的直播只重连当前 URL 两次；初次失败仍按同档备用、下一档顺序。
                 if live and had_frame and self._live_reconnects < 2:
                     self._live_reconnects += 1
