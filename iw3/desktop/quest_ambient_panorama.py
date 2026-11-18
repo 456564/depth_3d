@@ -92,9 +92,16 @@ class AmbientPanorama:
 
 
 def panorama_layers(
-    texture_id: str, position: list[float], rotation: list[float], overlay_height: int
+    texture_id: str,
+    position: list[float],
+    rotation: list[float],
+    overlay_height: int,
+    *,
+    face_size: int = FACE_SIZE,
+    gutter: int = GUTTER,
 ) -> list[dict[str, Any]]:
     layers = []
+    tile = face_size + 2 * gutter
     # OpenXR quad正面是local +Z；14万射线研究自检无漏口。几何沿窗口世界姿态调整，不随头转。
     for index, (center, orientation) in enumerate(_FACES):
         offset = _rotate(rotation, [RADIUS * value for value in center])
@@ -115,7 +122,7 @@ def panorama_layers(
                 "pos": [a + b for a, b in zip(position, offset)],
                 "rot": composed,
                 "tam": [2 * RADIUS, 2 * RADIUS],
-                "rect": [index % 3 * TILE + GUTTER, overlay_height + index // 3 * TILE + GUTTER, FACE_SIZE, FACE_SIZE],
+                "rect": [index % 3 * tile + gutter, overlay_height + index // 3 * tile + gutter, face_size, face_size],
             }
         )
     return layers

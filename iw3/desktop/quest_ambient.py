@@ -237,7 +237,7 @@ class AmbientBackground:
         if self._phase_start is None:
             self._phase_start = now
         atlas = None
-        if panoramic or style in MOTION_STYLES:
+        if style != "night" and (panoramic or style in MOTION_STYLES):
             if self._panorama is None:
                 self._panorama = AmbientPanorama()
             palette = torch.stack(
@@ -256,11 +256,13 @@ class AmbientBackground:
             image = image.resize((self.WIDTH, self.HEIGHT), Image.Resampling.BILINEAR)
         else:
             # 旧四种非360模式保留已验收的完整像素路径和哈希。
-            rgb = (colors.permute(1, 2, 0) * (255 * brightness)).round().clamp(0, 255).byte()
+            gain = 1.0 if style == "night" else brightness
+            rgb = (colors.permute(1, 2, 0) * (255 * gain)).round().clamp(0, 255).byte()
             image = Image.fromarray(rgb.numpy()).resize((self.WIDTH, self.HEIGHT), Image.Resampling.BILINEAR)
             image = image.filter(ImageFilter.BoxBlur(40 if style == "blur" else 24)).convert("RGBA")
-        image.putalpha(alpha)
-        if panoramic:
+        # 夜景上的柔光以透明度调强度，零亮度不能用不透明黑色盖住底图。
+        image.putalpha(alpha.point([round(value * brightness) for value in range(256)]) if style == "night" else alpha)
+        if panoramic and style != "night":
             assert atlas is not None
             combined = Image.new("RGBA", (self.WIDTH, self.HEIGHT + ATLAS_HEIGHT))
             combined.paste(image, (0, 0))

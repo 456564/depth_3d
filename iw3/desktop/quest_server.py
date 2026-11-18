@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from . import quest_night
 from .quest_ambient import AmbientBackground
 from .quest_ambient_panorama import MOTION_STYLES, panorama_layers
 from .quest_audio import QuestAudio
@@ -99,6 +100,8 @@ class QuestServer:
         self._ambient_generation = 0
         self._ambient_pending: tuple[bytes, int] | None = None
         self._ambient_visible = False
+        self._night_sent = False
+        self._night_texture = quest_night.texture() if ambient_enabled and ambient_style == "night" else None
         self._ambient_frame: (
             tuple[torch.Tensor, tuple[int, int, int, int] | None, torch.Tensor | None, int, socket.socket] | None
         ) = None
@@ -425,6 +428,7 @@ class QuestServer:
         self._validate_ambient(
             enabled, brightness, spread, fill_borders, feather, style, panoramic=panoramic, motion=motion
         )
+        night_texture = quest_night.texture() if enabled and style == "night" else None
         with self._layer_lock:
             with self._condition:
                 if (enabled, brightness, spread, fill_borders, feather, style, panoramic, motion) == (
@@ -444,6 +448,7 @@ class QuestServer:
                 self._ambient_fill_borders = fill_borders
                 self._ambient_feather = float(feather)
                 self._ambient_style = style
+                self._night_texture = night_texture
                 self._ambient_360, self._ambient_motion = panoramic, motion
                 self._reset_ambient(clear_frame=False)
                 connection = self._connection
@@ -701,6 +706,7 @@ class QuestServer:
                         except Exception as error:
                             release_error = error
                     self._connection = None
+                    self._night_sent = False
                     self._pending = None
                     self._suspended = False
                     self._audio_discard_pending = False
@@ -810,7 +816,17 @@ class QuestServer:
             ]
         }
         if self._ambient_visible:
-            if self._ambient_360:
+            if self._ambient_style == "night" and self._night_sent:
+                night = panorama_layers(
+                    quest_night.TEXTURE_ID,
+                    list(position),
+                    list(rotation),
+                    0,
+                    face_size=quest_night.FACE_SIZE,
+                    gutter=quest_night.GUTTER,
+                )
+                layers["camadas"] = (night if self._ambient_360 else night[:1]) + layers["camadas"]
+            elif self._ambient_360:
                 layers["camadas"] = (
                     panorama_layers(
                         AmbientBackground.TEXTURE_ID, list(position), list(rotation), AmbientBackground.HEIGHT
@@ -889,6 +905,10 @@ class QuestServer:
                     return
                 self._ambient_pending = None
                 self._ambient_refresh_pending = False
+            if self._ambient_style == "night" and not self._night_sent:
+                assert self._night_texture is not None
+                self._send(connection, 0x10, self._night_texture)
+                self._night_sent = True
             self._send(connection, 0x10, pending[0])
             with self._condition:
                 if pending[1] != self._ambient_generation or not self._video_enabled:
@@ -915,6 +935,7 @@ class QuestServer:
                 with self._layer_lock:
                     try:
                         self._reset_input()
+                        self._night_sent = False
                         self._cylinder_supported = None
                         self._video_config(connection)
                         with self._condition:

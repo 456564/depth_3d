@@ -12,8 +12,8 @@ from .test_quest_ambient_settings import session
 from .test_quest_gui_settings import frame as frame
 from .test_quest_menu import click, opened
 
-STYLES = ("edge", "blur", "halo", "cinema", "aurora", "mist", "stars")
-LABELS = ("方向柔光", "画面模糊延展", "四边光晕", "影院暗光", "极光", "云雾", "星空")
+STYLES = ("edge", "blur", "halo", "cinema", "aurora", "mist", "stars", "night")
+LABELS = ("方向柔光", "画面模糊延展", "四边光晕", "影院暗光", "极光", "云雾", "星空", "自然夜景＋视频柔光")
 
 
 def test_legacy_settings_and_resume_default_to_directional_light() -> None:

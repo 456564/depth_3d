@@ -6,6 +6,7 @@ TODO
 *.log
 tmp
 *.png
+!/iw3/desktop/assets/lakeside_night.png
 *.webp
 *.jpg
 *.gif
