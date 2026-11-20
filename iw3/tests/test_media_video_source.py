@@ -1,3 +1,4 @@
+import sys
 from dataclasses import replace
 from fractions import Fraction
 from io import BytesIO
@@ -70,7 +71,7 @@ def make_source(monkeypatch, current):
 
     FakeReader.instances.clear()
     monkeypatch.setattr(module, "_NVDECReader", FakeReader)
-    monkeypatch.setattr(module.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(module, "media_now", lambda: 10.0)
     return module.MediaVideoSource(lambda: current[0], torch.device("cuda:0"), fps=30)
 
 
@@ -307,6 +308,157 @@ def test_real_nvdec_bytes_keep_rgb_shape_timestamps_and_backward_seek(fragmented
         reader.close()
 
 
+@pytest.mark.hwaccel
+@pytest.mark.parametrize("w,h", [(3840, 2160), (2160, 3840)])
+def test_real_4k_nvdec_fused_color_matches_existing_rgb_bits(monkeypatch, w, h):
+    from iw3.desktop.media_video_source import _NVDECReader
+    from nunif.utils.video import pyav_init_cuda_primary_context
+    from nunif.utils.video.color_transform import ColorTransform
+
+    if sys.platform != "win32" or torch.__version__ != "2.14.1+cu132":
+        pytest.skip("requires the validated Windows CUDA runtime")
+    pyav_init_cuda_primary_context(max_devices=1)
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device) != (8, 9) or torch.backends.cudnn.version() != 92400:
+        pytest.skip("requires the validated Ada/cuDNN runtime")
+    output = BytesIO()
+    with av.open(output, "w", format="mp4") as container:
+        stream = container.add_stream("libx264", rate=30)
+        stream.width, stream.height, stream.pix_fmt = w, h, "yuv420p"
+        stream.options = {"preset": "ultrafast", "tune": "zerolatency", "threads": "2"}
+        frame = av.VideoFrame(w, h, "yuv420p")
+        gradient = bytes(range(256))
+        for index, plane in enumerate(frame.planes):
+            start, size = 73 * index, plane.buffer_size
+            plane.update((gradient * (size // 256 + 2))[start : start + size])
+        for packet in stream.encode(frame) + stream.encode():
+            container.mux(packet)
+    reader = _NVDECReader(output.getvalue(), device)
+    try:
+        frame = next(iter(reader.container.decode(reader.stream)))
+        assert frame.sw_format is not None and frame.sw_format.name == "nv12"
+        with torch.inference_mode():
+            expected = {}
+            for colorspace in (1, 2):
+                frame.colorspace, frame.color_range = colorspace, 1
+                expected[colorspace] = ColorTransform.to_tensor(frame, device=device).squeeze(0)
+
+            def old_path(*args, **kwargs):
+                pytest.fail("eligible 4K NVDEC frame fell back to the old color conversion")
+
+            monkeypatch.setattr(ColorTransform, "yuv_to_rgb", staticmethod(old_path))
+            for colorspace, reference in expected.items():
+                frame.colorspace, frame.color_range = colorspace, 1
+                rgb = reader._to_rgb(frame)
+                assert rgb.shape == (3, h, w) and rgb.is_contiguous() and rgb.dtype == torch.float32
+                assert torch.equal(rgb.view(torch.int32), reference.view(torch.int32))
+    finally:
+        reader.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows short wait pacing")
+@pytest.mark.parametrize(
+    "fused,paused,fps,expected",
+    [(True, False, 60, "sleep"), (True, True, 60, "event"), (False, False, 60, "event"), (True, False, 30, "event")],
+)
+def test_short_wait_pacing_is_only_for_playing_fused_4k(monkeypatch, fused, paused, fps, expected):
+    from iw3.desktop import media_video_source as module
+
+    state = snapshot(paused=paused)
+    source = module.MediaVideoSource(lambda: state, torch.device("cuda:0"), fps=fps)
+    source._reader = SimpleNamespace(_uses_fused_color=fused, close=lambda: None)
+    calls = []
+
+    def wait(kind, seconds):
+        calls.append((kind, seconds))
+        source.stop_event.set()
+
+    monkeypatch.setattr(source, "_update", lambda *_: None)
+    monkeypatch.setattr(module, "media_now", lambda: 10.0)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: wait("sleep", seconds))
+    monkeypatch.setattr(source.stop_event, "wait", lambda seconds: wait("event", seconds))
+    source.run()
+    assert calls == [(expected, 1 / fps)]
+
+
+def test_heartbeat_between_loop_start_and_snapshot_keeps_decoder(monkeypatch):
+    from iw3.desktop import media_video_source as module
+
+    current = [snapshot(data=b"", source=remote_descriptor())]
+    source, _ = make_remote_source(monkeypatch, current)
+    source._update(current[0], 10.0)
+    assert source.get_frame() is not None
+    generation = source.get_frame_generation()
+    reader = source._reader
+    clock = [10.0]
+
+    def snapshot_with_heartbeat():
+        current[0] = replace(current[0], received_at=10.00005)
+        clock[0] = 10.0001
+        return current[0]
+
+    def stop_after_iteration(_delay):
+        assert source._reader is reader
+        assert source.is_current_generation(generation)
+        assert source.get_status()["status"] == "running"
+        source.stop_event.set()
+
+    monkeypatch.setattr(module, "media_now", lambda: clock[0])
+    monkeypatch.setattr(source, "snapshot", snapshot_with_heartbeat)
+    monkeypatch.setattr(source.stop_event, "wait", stop_after_iteration)
+    source.run()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows short wait pacing")
+def test_4k_vod_wait_uses_next_decoded_pts(monkeypatch):
+    from iw3.desktop import media_video_source as module
+
+    state = snapshot(source=remote_descriptor())
+    source = module.MediaVideoSource(lambda: state, torch.device("cuda:0"), fps=60)
+    source._reader = SimpleNamespace(
+        _uses_fused_color=True,
+        _next=SimpleNamespace(pts=241, time_base=Fraction(1, 120)),
+        _timestamp=module._NVDECReader._timestamp,
+        close=lambda: None,
+    )
+
+    def assert_sleep(delay):
+        assert delay == pytest.approx(1 / 120 - 0.00025)
+        source.stop_event.set()
+
+    monkeypatch.setattr(source, "_update", lambda *_: None)
+    monkeypatch.setattr(module, "media_now", lambda: 10.0)
+    monkeypatch.setattr(module.time, "sleep", assert_sleep)
+    source.run()
+
+
+@pytest.mark.parametrize("slack,backstep,seek", [(1 / 60, 0.007, False), (0, 0.007, True), (1 / 60, 0.2, True)])
+def test_4k_playback_jitter_does_not_seek_but_a_real_backstep_does(slack, backstep, seek):
+    from iw3.desktop.media_video_source import _NVDECReader
+
+    def frame(pts):
+        return SimpleNamespace(pts=pts, time_base=Fraction(1, 60))
+
+    reader = object.__new__(_NVDECReader)
+    reader.stream = SimpleNamespace(start_time=None, time_base=Fraction(1, 60))
+    reader.fps = 60
+    reader._frames = iter(())
+    reader._selected, reader._next = frame(90), frame(91)
+    last_rgb = reader._rgb = torch.zeros(3, 2, 2)
+    target = 1.5 - backstep
+    restarted_pts = int(target * 60)
+    seeks = []
+    reader.container = SimpleNamespace(
+        seek=lambda pts, **_: seeks.append(pts),
+        decode=lambda _: iter((frame(restarted_pts), frame(restarted_pts + 1))),
+    )
+    reader._to_rgb = lambda _: torch.ones_like(last_rgb)
+    rgb, timestamp = reader.frame_at(target, clock_slack=slack)
+    assert seeks == ([restarted_pts] if seek else [])
+    assert (rgb is not last_rgb) == seek
+    assert timestamp == pytest.approx(restarted_pts / 60 if seek else 1.5)
+
+
 def remote_descriptor(kind="vod"):
     return {
         "kind": kind,
@@ -369,7 +521,7 @@ def make_remote_source(monkeypatch, current, quality="auto"):
 
     monkeypatch.setattr(module, "MediaHTTPIO", network)
     monkeypatch.setattr(module, "_NVDECReader", RemoteReader)
-    monkeypatch.setattr(module.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(module, "media_now", lambda: 10.0)
     return module.MediaVideoSource(lambda: current[0], torch.device("cuda:0"), fps=30, quality=quality), handles
 
 
@@ -496,7 +648,7 @@ def test_remote_vod_persistently_missing_position_eventually_requests_capture(mo
     current = [snapshot(data=b"", source=remote_descriptor(), paused=True)]
     source, _ = make_remote_source(monkeypatch, current)
     clock = [10.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "media_now", lambda: clock[0])
 
     class MissingPositionReader(RemoteReader):
         def frame_at(self, target):
@@ -524,7 +676,7 @@ def test_remote_position_grace_does_not_consume_time_without_fresh_playback_stat
     current = [snapshot(data=b"", source=remote_descriptor(), paused=True)]
     source, _ = make_remote_source(monkeypatch, current)
     clock = [10.0]
-    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "media_now", lambda: clock[0])
 
     class PositionGapReader(RemoteReader):
         def frame_at(self, target):
@@ -603,7 +755,7 @@ def test_real_nvdec_remote_paused_zero_clock_displays_delayed_first_frame(monkey
     description["renditions"][0].update(width=96, height=64)
     current = snapshot(data=b"", source=description, media_time=0, paused=True)
     monkeypatch.setattr(module, "MediaHTTPIO", lambda *a, **k: BytesIO(output.getvalue()))
-    monkeypatch.setattr(module.time, "monotonic", lambda: 10.0)
+    monkeypatch.setattr(module, "media_now", lambda: 10.0)
     source = module.MediaVideoSource(lambda: current, torch.device("cuda:0"))
     try:
         source._update(current, 10)

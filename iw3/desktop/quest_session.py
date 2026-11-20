@@ -2,11 +2,15 @@
 
 import copy
 import importlib.util
+import os
 import sys
 import threading
+import time
+import warnings
 from argparse import Namespace
 from typing import Any
 
+from .quest_4k import FrameToken, Quest4KForward, playing_4k, wait_for_slot
 from .quest_settings import COMMANDS, FIELD_MAP, validate_patch
 
 
@@ -39,6 +43,7 @@ class QuestSession:
         self._recovery_message = ""
         self._operation: str | None = None
         self._stream_restart_count = 0
+        self._cadence: Quest4KForward | None = None
 
     @staticmethod
     def values(args: Namespace) -> dict[str, Any]:
@@ -157,6 +162,8 @@ class QuestSession:
             raise SessionInterrupted("Quest media reload requested")
 
     def read_frame(self, capture: Any) -> Any:
+        if self._cadence is not None and self._cadence.used:
+            wait_for_slot(self, capture)
         # 实际捕获器均为单消费者 Event；事件置位后 get_frame 不再阻塞。
         while True:
             self.check_interrupt()
@@ -254,8 +261,63 @@ class QuestSession:
             self._operation = None
             self.status("running", message)
 
+    def _prepare_4k(self) -> Quest4KForward | None:
+        from ..depth_models.depth_anything_model import DepthAnythingModel
+
+        args = self.args
+        device = args.state.get("device")
+        depth = args.state.get("depth_model")
+        if not (
+            sys.platform == "win32"
+            and device is not None
+            and device.type == "cuda"
+            and args.stream_fps == 60
+            and args.depth_model == "Any_V2_S"
+            and args.method == "row_flow_v3_sym"
+            and not (args.disable_amp or args.tta or args.compile)
+            and (args.screenshot == "browser_video" or getattr(args, "quest_auto_browser", False))
+            and isinstance(depth, DepthAnythingModel)
+            and getattr(depth.model, "prep_lower_bound", None) == 392
+        ):
+            return None
+        ready = self.server._cuda_prepare_event
+        if ready is not None:
+            ready.synchronize()
+        try:
+            cadence = None
+            if os.getenv("IW3_4K60_EXPERIMENT") == "1":
+                from .quest_trt import try_create
+
+                cadence = try_create(depth.model, device)
+            if cadence is None:
+                cadence = Quest4KForward(depth.model, device)
+        except RuntimeError as exc:
+            warnings.warn(f"Quest 4K depth Graph disabled: {exc}", RuntimeWarning, stacklevel=2)
+            return None
+        depth.forward_override = cadence
+        return cadence
+
+    def begin_frame(self, token: FrameToken) -> None:
+        if self._cadence is not None:
+            self._cadence.enabled = playing_4k(self.capture, token)
+            self._cadence.used = False
+
+    def wait_between_frames(self, delay: float, token: FrameToken) -> None:
+        if (
+            self._cadence is not None
+            and self._cadence.used
+            and 0 < delay <= 1 / 60
+            and not self.run_stop.is_set()
+            and playing_4k(self.capture, token)
+        ):
+            time.sleep(delay)
+        else:
+            self.run_stop.wait(delay)
+
     def configure(self, **settings: Any) -> Any:
         self.server.pause_media()
+        self._cadence = self._prepare_4k()
+        self.check_interrupt()
         self.server.set_reference_aspect(settings.get("reference_aspect"))
         self.server.configure_video(settings["width"], settings["height"], settings["fps"], settings["bitrate"])
         self.server.configure_audio(settings["audio"], settings["audio_source"], settings["audio_gain"])
@@ -342,12 +404,20 @@ class QuestSession:
                         continue
                 finally:
                     self.capture = None
-                    self.server.set_controller_factory(None)
-                    self.server.pause_media()
-                    # reset只清时序状态；释放所有旧模型引用后才能在8GB显存加载下一模型。
-                    args.state["depth_model"] = None
-                    args.state["convergence_model"] = None
-                    gc_collect()
+                    try:
+                        self.server.set_controller_factory(None)
+                        self.server.pause_media()
+                    finally:
+                        try:
+                            if self._cadence is not None:
+                                args.state["depth_model"].forward_override = None
+                                self._cadence.close()
+                        finally:
+                            self._cadence = None
+                            # reset只清时序状态；释放所有旧模型引用后才能在8GB显存加载下一模型。
+                            args.state["depth_model"] = None
+                            args.state["convergence_model"] = None
+                            gc_collect()
                 if self.stop_event.is_set():
                     break
                 for key, value in self._values.items():

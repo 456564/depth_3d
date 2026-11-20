@@ -10,6 +10,7 @@ from PIL import Image
 
 from iw3.base_depth_model import BaseDepthModel
 from iw3.depth_model_factory import create_depth_model, get_all_depth_models
+from iw3.depth_models.depth_anything_model import batch_preprocess
 from iw3.mapper import get_mapper, resolve_mapper_name
 
 DEFAULT_TEST_IMAGE = "tests/images/dog_448.png"
@@ -56,6 +57,34 @@ def run_model(
     BaseDepthModel.save_normalized_depth(depth, output_filename)
 
     return f"[OK] `{model_type}` (mapper={mapper_name}) -> {output_filename} (shape={tuple(depth.shape)})"
+
+
+@pytest.mark.hwaccel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_depth_anything_cuda_normalization_reuses_constants(monkeypatch):
+    from iw3.depth_models import depth_anything_model as depth
+
+    def pixels():
+        return torch.linspace(0, 1, 3 * 28 * 42, device="cuda").reshape(1, 3, 28, 42)
+
+    x = pixels()
+    with monkeypatch.context() as reference:
+        reference.setattr(depth, "_cached_normalization_constants", depth._normalization_constants)
+        expected = batch_preprocess(x, lower_bound=28)
+    batch_preprocess(x, lower_bound=28)
+    make_tensor = torch.tensor
+
+    def reject_cuda_upload(*args, **kwargs):
+        assert torch.device(kwargs["device"]).type != "cuda", "normalization uploaded again"
+        return make_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", reject_cuda_upload)
+    stream = torch.cuda.Stream(device=x.device)
+    with torch.cuda.stream(stream):
+        actual = batch_preprocess(pixels(), lower_bound=28)
+    stream.synchronize()
+    assert actual.shape == (1, 3, 28, 42) and torch.equal(actual, expected)
 
 
 @pytest.mark.slow

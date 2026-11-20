@@ -74,7 +74,7 @@ def make_input_tensor(c, depth, divergence, convergence, image_width, mapper=Non
         )
 
 
-def backward_warp(c, grid, delta, delta_scale):
+def backward_warp(c, grid, delta, delta_scale, *, clamp_output: bool = True):
     grid = grid + delta * delta_scale
     if c.shape[2] != grid.shape[2] or c.shape[3] != grid.shape[3]:
         grid = F.interpolate(grid, size=c.shape[-2:], mode="bilinear", align_corners=True, antialias=False)
@@ -88,8 +88,7 @@ def backward_warp(c, grid, delta, delta_scale):
         padding_mode = "border"
 
     z = F.grid_sample(c, grid, mode=mode, padding_mode=padding_mode, align_corners=True)
-    z = torch.clamp(z, 0, 1)
-    return z
+    return z.clamp(0, 1) if clamp_output else z
 
 
 # Cache invariant base coordinate grids to avoid repeated linspace/meshgrid allocations.
@@ -223,6 +222,9 @@ def apply_divergence_nn_LR(
     synthetic_view="both",
     preserve_screen_border=False,
     enable_amp=True,
+    *,
+    clamp_output: bool = True,
+    warp_both=None,
 ):
     assert synthetic_view in {"both", "right", "left"}
     steps = 1 if steps is None else steps
@@ -237,6 +239,8 @@ def apply_divergence_nn_LR(
             synthetic_view=synthetic_view,
             enable_amp=enable_amp,
             preserve_screen_border=preserve_screen_border,
+            clamp_output=clamp_output,
+            warp_both=warp_both,
         )
     else:
         if synthetic_view == "both":
@@ -506,7 +510,17 @@ def apply_divergence_nn_delta_weight(
 
 
 def apply_divergence_nn_symmetric(
-    model, c, depth, divergence, convergence, synthetic_view, enable_amp, preserve_screen_border=False
+    model,
+    c,
+    depth,
+    divergence,
+    convergence,
+    synthetic_view,
+    enable_amp,
+    preserve_screen_border=False,
+    *,
+    clamp_output: bool = True,
+    warp_both=None,
 ):
     # BCHW
     assert synthetic_view in {"both", "right", "left"}
@@ -540,8 +554,10 @@ def apply_divergence_nn_symmetric(
     delta_scale = 1.0 / (W // 2 - 1)
 
     if synthetic_view == "both":
-        left_eye = backward_warp(c, grid, delta, delta_scale)
-        right_eye = backward_warp(c, grid, -delta, delta_scale)
+        if warp_both is not None and (eyes := warp_both(c, grid, delta, delta_scale)) is not None:
+            return eyes
+        left_eye = backward_warp(c, grid, delta, delta_scale, clamp_output=clamp_output)
+        right_eye = backward_warp(c, grid, -delta, delta_scale, clamp_output=clamp_output)
     elif synthetic_view == "right":
         left_eye = c
         right_eye = backward_warp(c, grid, -delta, delta_scale)

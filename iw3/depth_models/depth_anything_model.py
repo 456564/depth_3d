@@ -1,4 +1,6 @@
 import os
+from collections.abc import Callable
+from functools import cache
 from os import path
 
 import torch
@@ -86,6 +88,15 @@ SMALL_MODELS = {
 MIN_RESOLUTION = 224
 
 
+def _normalization_constants(device, dtype):
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=dtype, device=device).reshape(1, 3, 1, 1)
+    stdv = torch.tensor([0.229, 0.224, 0.225], dtype=dtype, device=device).reshape(1, 3, 1, 1)
+    return mean, stdv
+
+
+_cached_normalization_constants = cache(_normalization_constants)
+
+
 def batch_preprocess(x, lower_bound=392, max_aspect_ratio=4, limit_resolution=False):
     # x: BCHW float32 0-1
     B, C, H, W = x.shape
@@ -123,9 +134,11 @@ def batch_preprocess(x, lower_bound=392, max_aspect_ratio=4, limit_resolution=Fa
     x = F.interpolate(x, size=(new_h, new_w), mode="bilinear", align_corners=False, antialias=antialias)
     x.clamp_(0, 1)
 
-    # normalize
-    mean = torch.tensor([0.485, 0.456, 0.406], dtype=x.dtype, device=x.device).reshape(1, 3, 1, 1)
-    stdv = torch.tensor([0.229, 0.224, 0.225], dtype=x.dtype, device=x.device).reshape(1, 3, 1, 1)
+    # 常量首次上传后只读，推理时复用以免每帧等 CUDA 流。
+    constants = (
+        _cached_normalization_constants if x.is_cuda and torch.is_inference_mode_enabled() else _normalization_constants
+    )
+    mean, stdv = constants(x.device, x.dtype)
     x.sub_(mean).div_(stdv)
     return x
 
@@ -152,8 +165,10 @@ def batch_infer(
     depth_aa=None,
     limit_resolution=False,
     alpha=None,
+    forward: Callable | None = None,
     **kwargs,
 ):
+    forward = forward if forward is not None else _forward
     device = device if device is not None else model.device
     batch = False
     if torch.is_tensor(im):
@@ -172,13 +187,13 @@ def batch_infer(
     if not low_vram:
         if flip_aug:
             x = torch.cat([x, torch.flip(x, dims=[3])], dim=0)
-        out = _forward(model, x, enable_amp)
+        out = forward(model, x, enable_amp)
     else:
         x_org = x
-        out = _forward(model, x, enable_amp)
+        out = forward(model, x, enable_amp)
         if flip_aug:
             x = torch.flip(x_org, dims=[3])
-            out2 = _forward(model, x, enable_amp)
+            out2 = forward(model, x, enable_amp)
             out = torch.cat([out, out2], dim=0)
 
     if alpha is not None:
@@ -219,6 +234,7 @@ def batch_infer(
 class DepthAnythingModel(BaseDepthModel):
     def __init__(self, model_type):
         super().__init__(model_type)
+        self.forward_override: Callable | None = None
 
     def load_model(self, model_type, resolution=None, device=None):
         # load aa model
@@ -341,6 +357,7 @@ class DepthAnythingModel(BaseDepthModel):
             edge_dilation=edge_dilation,
             depth_aa=self.depth_aa if depth_aa else None,
             resize_depth=False,
+            forward=self.forward_override,
             limit_resolution=self.limit_resolution,
             alpha=alpha,
         )

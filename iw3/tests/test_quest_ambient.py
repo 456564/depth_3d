@@ -56,6 +56,25 @@ def test_brightness_scales_rgb_without_changing_alpha(brightness: float, expecte
     assert rgba[90, 160, 3] == 0 and rgba[90, 60, 3] > 0
 
 
+def test_display_refines_black_edges_without_rescanning_rgb(monkeypatch: pytest.MonkeyPatch) -> None:
+    eye = torch.full((3, 144, 256), 0.75)
+    eye[:, :, :4] = eye[:, :, -4:] = 0
+    scans = 0
+    amax = torch.Tensor.amax
+
+    def count_rgb_scan(frame: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        nonlocal scans
+        if frame.shape == eye.shape:
+            scans += 1
+        return amax(frame, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "amax", count_rgb_scan)
+    left, top, right, bottom = background()._display_rect(eye, 0.03, (2.0, 2.0))
+    assert 0 < left < 0.04 and 0.96 < right < 1
+    assert (top, bottom) == (0, 1)
+    assert scans == 1
+
+
 def test_ten_hz_limit_does_not_feed_skipped_frames_into_smoothing() -> None:
     ambient = background()
     pixels(ambient.update(solid(1, 0, 0), 1, tick=0))

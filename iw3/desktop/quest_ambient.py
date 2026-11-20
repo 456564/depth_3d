@@ -4,6 +4,8 @@ import math
 import struct
 import time
 import zlib
+from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +57,6 @@ class AmbientBackground:
         self._signature: tuple[object, ...] | None = None
         self._source_window = _ContentWindow()
         self._display_window = _ContentWindow()
-        self._panorama: AmbientPanorama | None = None
         self._phase_start: float | None = None
         self._render_cache: tuple[torch.Tensor, Image.Image, float, str, bool, bool] | None = None
 
@@ -122,7 +123,7 @@ class AmbientBackground:
         )
 
     @staticmethod
-    def _refine_black_edges(frame: torch.Tensor, reduced: torch.Tensor, rect: _Rect, strict: bool) -> _Rect:
+    def _refine_black_edges(frame_or_max: torch.Tensor, reduced: torch.Tensor, rect: _Rect, strict: bool) -> _Rect:
         left, top, right, bottom = rect
         content = reduced[
             round(top * _SAMPLE_H) : round(bottom * _SAMPLE_H),
@@ -130,11 +131,15 @@ class AmbientBackground:
         ]
         if float((content > 32 / 255).float().mean()) < (0.5 if strict else 0.35):
             return rect
-        # 原尺寸RGB[3,H,W] → 同设备max[H,W] → 行/列max[H]/[W]；只读回两条投影，定位低清漏掉的窄边。
-        value = frame.detach().amax(0)
+        # 复用最大值图 [H,W]；把行列投影合并读回，定位低清漏掉的窄边。
+        value = frame_or_max.detach()
+        if value.ndim == 3:
+            value = value.amax(0)
+        height, width = value.shape
+        projections = torch.cat((value.amax(0), value.amax(1))).to(device="cpu", dtype=torch.float32)
         refined = list(rect)
-        for axis, projection in enumerate((value.amax(0), value.amax(1))):
-            positions = torch.nonzero(projection.to(device="cpu", dtype=torch.float32) > 16 / 255).flatten()
+        for axis, projection in enumerate(projections.split((width, height))):
+            positions = torch.nonzero(projection > 16 / 255).flatten()
             if not positions.numel():
                 continue
             start, stop = int(positions[0]) / projection.numel(), (int(positions[-1]) + 1) / projection.numel()
@@ -149,11 +154,12 @@ class AmbientBackground:
 
     def _display_rect(self, frame: torch.Tensor, feather: float, scale: tuple[float, float]) -> _Rect:
         # 最终每眼RGB[3,H,W] → max-pool[1,72,128]，一像素亮点也保留。
-        value = F.adaptive_max_pool2d(frame.detach().amax(dim=0, keepdim=True), (_SAMPLE_H, _SAMPLE_W))
+        full_max = frame.detach().amax(0)
+        value = F.adaptive_max_pool2d(full_max.unsqueeze(0), (_SAMPLE_H, _SAMPLE_W))
         value = value.squeeze(0).to(device="cpu", dtype=torch.float32)
         self._check_values(value)
         rect = self._content_rect(value, strict=True)
-        rect = self._refine_black_edges(frame, value, rect, strict=True)
+        rect = self._refine_black_edges(full_max, value, rect, strict=True)
         inset = list(rect)
         for axis, pixels in enumerate((self.WIDTH, self.HEIGHT)):
             # 已确认黑条的渐隐向内容内走，留一纹素使GL双线性采样的填光端完全不透黑。
@@ -210,7 +216,9 @@ class AmbientBackground:
         return Image.fromarray((alpha * outer * 255).round().byte().numpy())
 
     @torch.inference_mode()
-    def animate(self, *, tick: float | None = None) -> bytes | None:
+    def animate(
+        self, *, tick: float | None = None, enqueue: Callable[[Callable[[], bytes]], None] | None = None
+    ) -> bytes | None:
         cached = self._render_cache
         if cached is None or not cached[-1] or cached[3] not in MOTION_STYLES:
             return None
@@ -220,10 +228,22 @@ class AmbientBackground:
         if self._last_tick is not None and now < math.nextafter(self._last_tick + 0.1, -math.inf):
             return None
         # 暂停时只读CPU float[3,18,32]颜色和L[320,180]遮罩，不访问原视频/CUDA张量。
-        payload = self._render(*cached, now)
         self._last_tick = now
-        return payload
+        return self._schedule_render(now, enqueue)
 
+    def _schedule_render(self, now: float, enqueue: Callable[[Callable[[], bytes]], None] | None) -> bytes | None:
+        assert self._render_cache is not None
+        if self._phase_start is None:
+            self._phase_start = now
+        phase = (now - self._phase_start) * 0.12 if self._render_cache[-1] else 0.0
+        colors, alpha, brightness, style, panoramic, _ = self._render_cache
+        render = partial(self._render, colors, alpha, brightness, style, panoramic, phase)
+        if enqueue is None:
+            return render()
+        enqueue(render)
+        return None
+
+    @torch.inference_mode()
     def _render(
         self,
         colors: torch.Tensor,
@@ -231,15 +251,11 @@ class AmbientBackground:
         brightness: float,
         style: str,
         panoramic: bool,
-        motion: bool,
-        now: float,
+        phase: float,
     ) -> bytes:
-        if self._phase_start is None:
-            self._phase_start = now
         atlas = None
         if style != "night" and (panoramic or style in MOTION_STYLES):
-            if self._panorama is None:
-                self._panorama = AmbientPanorama()
+            panorama = AmbientPanorama()
             palette = torch.stack(
                 (
                     colors[:, :, :2].mean((1, 2)),
@@ -248,8 +264,7 @@ class AmbientBackground:
                     colors[:, -2:, :].mean((1, 2)),
                 )
             )
-            phase = (now - self._phase_start) * 0.12 if motion else 0.0
-            atlas = self._panorama.atlas(self._panorama.colors(palette, style, phase), brightness)
+            atlas = panorama.atlas(panorama.colors(palette, style, phase), brightness)
         if style in MOTION_STYLES:
             assert atlas is not None
             image = atlas.crop((GUTTER, GUTTER, GUTTER + FACE_SIZE, GUTTER + FACE_SIZE))
@@ -288,6 +303,7 @@ class AmbientBackground:
         style: str = "edge",
         panoramic: bool = False,
         motion: bool = True,
+        enqueue: Callable[[Callable[[], bytes]], None] | None = None,
     ) -> bytes | None:
         self._validate_frame(frame)
         if type(style) is not str or style not in AMBIENT_STYLES:
@@ -409,8 +425,6 @@ class AmbientBackground:
             colors = self._colors.lerp(colors, blend)
         # CPU float[3,18,32] → RGBA[180,320,4]；360时追加atlas，合成[316,320,4]后zlib。
         alpha = self._alpha(display_rect, scale, feather, halo=style == "halo")
-        cached = (colors, alpha, brightness, style, panoramic, motion)
-        payload = self._render(*cached, now)
-        self._render_cache = cached
+        self._render_cache = (colors, alpha, brightness, style, panoramic, motion)
         self._colors, self._last_tick, self._color_tick = colors, now, now
-        return payload
+        return self._schedule_render(now, enqueue)

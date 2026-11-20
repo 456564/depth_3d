@@ -387,7 +387,7 @@ def test_latest_raw_frame_replaces_stale_and_owns_copy(module: Any, monkeypatch:
             assert entered.wait(1)
             server.set_frame_data((torch.full((3, 64, 128), 0.25), 2.0))
             latest = torch.ones(3, 64, 128)
-            server.set_frame_data((latest, 3.0))
+            server.set_frame_data((latest, 3.0), take_ownership=True)
             latest.zero_()
             release.set()
             assert read_message(client)[1][9:] == b"\x00"
@@ -560,4 +560,114 @@ def test_cuda_producer_stream_owns_frame_through_real_tcp_encode(module: Any, mo
             np.testing.assert_allclose(pixels[90, 480], [0, 255, 0], atol=10)
             server.check_error()
     finally:
+        server.stop()
+
+
+@pytest.mark.hwaccel
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA NVENC")
+def test_4k_prepares_next_frame_while_encoding_and_discards_stale_frames(
+    module: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import av
+    import numpy as np
+
+    from iw3.desktop.quest_encoder import PreparedCudaFrame, QuestEncoder
+    from nunif.utils.video import pyav_init_cuda_primary_context
+
+    pyav_init_cuda_primary_context(max_devices=1)
+    width, height = 7680, 2160
+    encoding, release = threading.Event(), threading.Event()
+    preparations: list[torch.cuda.Event] = []
+    consumed: list[int] = []
+    transferred_pointers: list[int] = []
+
+    class ObservedEncoder(QuestEncoder):
+        def cuda_preparer(self):
+            prepare = super().cuda_preparer()
+            assert prepare is not None
+
+            def observe(frame: torch.Tensor) -> PreparedCudaFrame | None:
+                ticket = prepare(frame)
+                assert ticket is not None
+                preparations.append(ticket.ready)
+                return ticket
+
+            return observe
+
+        def encode(
+            self,
+            frame: torch.Tensor,
+            pts: int,
+            force_idr: bool = False,
+            *,
+            prepared: PreparedCudaFrame | None = None,
+        ) -> list[av.Packet]:
+            if prepared is not None:
+                consumed.append(pts)
+            if pts == 2_000_000:
+                if prepared is not None:
+                    prepared.ready.synchronize()
+                encoding.set()
+                assert release.wait(10)
+            if pts in (5_000_000, 6_000_000):
+                transferred_pointers.append(frame.data_ptr())
+            return super().encode(frame, pts, force_idr, prepared=prepared)
+
+    monkeypatch.setattr(module, "QuestEncoder", ObservedEncoder)
+    server = module.QuestServer("127.0.0.1", width, height, 30, 35, audio=False, port=0, discovery_port=0)
+    producer = torch.cuda.Stream()
+
+    def submit(tick: int, swap: bool = False, *, take_ownership: bool = False) -> int:
+        with torch.cuda.stream(producer):
+            rgb = torch.zeros(3, height, width, device="cuda", dtype=torch.float32)
+            rgb[int(swap), :, : width // 2] = 1
+            rgb[1 - int(swap), :, width // 2 :] = 1
+            if take_ownership:
+                server.set_frame_data((rgb, float(tick)), take_ownership=True)
+            else:
+                server.set_frame_data((rgb, float(tick)))
+                rgb.zero_()
+            return rgb.data_ptr()
+
+    server.start()
+    try:
+        with connect(server) as client:
+            client.settimeout(10)
+            assert [read_message(client)[0] for _ in range(2)] == [0x01, 0x11]
+            submit(1)
+            assert read_message(client)[0] == 0x02
+            assert not preparations  # 首帧先确认可用的编码路径。
+            submit(2)
+            assert encoding.wait(10)
+            submit(3)
+            assert len(preparations) == 2
+            # 转色未完成时，新帧仍替换待编码槽，但不能排入更多转色。
+            with monkeypatch.context() as patch:
+                patch.setattr(preparations[-1], "query", lambda: False)
+                submit(4)
+                assert len(preparations) == 2
+                server.discard_video_frames()
+                # 调用方只返回地址，在编码线程恢复前就已释放 RGB 引用。
+                transferred_pointer = submit(5, swap=True, take_ownership=True)
+                release.set()
+                kind, after_switch = read_message(client)
+                assert kind == 0x02 and struct.unpack("!QB", after_switch[:9]) == (5_000_000, 1)
+                assert transferred_pointers == [transferred_pointer]
+            preparations[-1].synchronize()
+            following_pointer = submit(6, take_ownership=True)
+            kind, following = read_message(client)
+            assert kind == 0x02 and int.from_bytes(following[:8], "big") == 6_000_000
+            assert transferred_pointers == [transferred_pointer, following_pointer]
+            assert consumed == [2_000_000, 6_000_000]
+            decoder = av.CodecContext.create("hevc", "r")
+            pictures = decoder.decode(av.Packet(after_switch[9:])) + decoder.decode(av.Packet(following[9:]))
+            pictures += decoder.decode(None)
+            assert len(pictures) == 2
+            for picture, (left, right) in zip(pictures, ((1, 0), (0, 1)), strict=True):
+                pixels = picture.to_ndarray(format="rgb24")
+                np.testing.assert_allclose(pixels[height // 2, width // 4], np.eye(3)[left] * 255, atol=10)
+                np.testing.assert_allclose(pixels[height // 2, width * 3 // 4], np.eye(3)[right] * 255, atol=10)
+            server.check_error()
+    finally:
+        release.set()
         server.stop()

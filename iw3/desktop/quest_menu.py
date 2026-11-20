@@ -15,6 +15,8 @@ from PIL import Image, ImageDraw, ImageFont
 from .quest_input import _rotate, _vector, ray_to_uv
 from .quest_settings import AMBIENT_STYLE_LABELS, BROWSER_QUALITY_LABELS, FIELD_MAP, PAGES, get_fields, validate_patch
 
+_FPS_STATS = ("estimated_fps", "screenshot_fps", "streaming_fps")
+
 
 class QuestMenu:
     WIDTH, HEIGHT = 1536, 1280
@@ -26,6 +28,8 @@ class QuestMenu:
         self._lock = threading.RLock()
         self.visible = False
         self._state: dict[str, Any] = {"values": {}, "choices": {}, "status": "", "message": ""}
+        self._fps: dict[str, Any] = {}
+        self._rendered_fps: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._waiting: dict[str, Any] = {}
         self._page, self._offset = 0, 0
@@ -64,6 +68,10 @@ class QuestMenu:
 
     def _sync(self) -> None:
         state = self._snapshot()
+        values = state.get("values", {})
+        # FPS 高频变化，只有状态页需要用它重绘整张纹理。
+        self._fps = {key: values[key] for key in _FPS_STATS if key in values}
+        state = {**state, "values": {key: value for key, value in values.items() if key not in _FPS_STATS}}
         if state != self._state:
             self._state = copy.deepcopy(state)
             self._dirty = True
@@ -598,13 +606,13 @@ class QuestMenu:
             if key in values:
                 lines.append(f"{label}：{values[key]}")
         fps = " / ".join(
-            f"{label} {values[key]}"
+            f"{label} {self._fps[key]}"
             for key, label in (
                 ("estimated_fps", "处理"),
                 ("screenshot_fps", "解码" if browser else "捕获"),
                 ("streaming_fps", "发送"),
             )
-            if key in values
+            if key in self._fps
         )
         if fps:
             lines.append(f"电脑 FPS：{fps}")
@@ -633,11 +641,14 @@ class QuestMenu:
                 self._confirm_until = 0
                 self._message = "重启确认已过期，请重新点击"
                 self._dirty = True
-            if not self._dirty or now - self._last_texture < 0.1:
+            elapsed = now - self._last_texture
+            fps_changed = self._page == 4 and self._picker is None and self._fps != self._rendered_fps
+            if elapsed < 0.1 or not (self._dirty or (fps_changed and elapsed >= 1.0)):
                 return None
             image = self._render()
             identifier = self.TEXTURE_ID.encode("ascii")
             payload = bytes([len(identifier)]) + identifier + struct.pack("!HHB", self.WIDTH, self.HEIGHT, 1)
             payload += zlib.compress(image.tobytes(), level=3)
+            self._rendered_fps = self._fps
             self._dirty, self._last_texture = False, now
             return payload

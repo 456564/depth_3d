@@ -205,6 +205,40 @@ def test_texture_changes_for_actual_snapshot_and_coalesces_changes(menu: Any, cl
     assert state.texture() is None
 
 
+@pytest.mark.parametrize("page", [4, 5])
+def test_fps_updates_only_redraw_status_page_once_per_second(menu: Any, clock: list[float], page: int) -> None:
+    state, snapshot, _ = menu
+    snapshot["values"].update(estimated_fps=24, screenshot_fps=30, streaming_fps=23)
+    opened(state)
+    click(state, "page", page)
+    clock[0] += 0.2
+    assert state.texture() is not None
+    for _ in range(3):
+        clock[0] += 0.2
+        snapshot["values"]["streaming_fps"] += 1
+        assert state.texture() is None
+    clock[0] += 0.5
+    assert (state.texture() is not None) == (page == 4)
+
+
+def test_fps_throttle_does_not_delay_status_changes_or_page_switch(menu: Any, clock: list[float], monkeypatch) -> None:
+    state, snapshot, _ = menu
+    snapshot["values"].update(estimated_fps=24, screenshot_fps=30, streaming_fps=23)
+    opened(state)
+    snapshot["values"]["streaming_fps"] = 26
+    click(state, "page", 4)
+    rendered = []
+    monkeypatch.setattr(state, "_text", lambda draw, xy, text, *args, **kwargs: rendered.append(str(text)))
+    clock[0] += 0.2
+    assert state.texture() is not None
+    assert any("发送 26" in line for line in rendered)
+    snapshot.update(status="waiting", message="等待视频")
+    clock[0] += 0.2
+    rendered.clear()
+    assert state.texture() is not None
+    assert "等待视频" in rendered
+
+
 def test_staged_enum_does_not_claim_applied_and_apply_sends_patch(menu: Any, clock: list[float]) -> None:
     state, snapshot, commands = menu
     opened(state)

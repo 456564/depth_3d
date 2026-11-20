@@ -1,4 +1,7 @@
 import logging
+import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from fractions import Fraction
 from typing import cast
 
@@ -7,7 +10,17 @@ import torch
 from av.video.codeccontext import VideoCodecContext
 
 from nunif.utils.video import VideoOutputConfig
-from nunif.utils.video.color_transform import configure_video_codec, setup_color_transform
+from nunif.utils.video.color_transform import OutputTransform, configure_video_codec, setup_color_transform
+
+from .quest_nv12 import try_pack_nv12
+
+
+@dataclass(frozen=True, eq=False)
+class PreparedCudaFrame:
+    frame: torch.Tensor
+    transform: OutputTransform
+    planes: tuple[torch.Tensor, torch.Tensor, str]
+    ready: torch.cuda.Event
 
 
 class QuestEncoder:
@@ -43,8 +56,9 @@ class QuestEncoder:
         encoder.color_primaries = self.transform.dst_color_primaries
         encoder.color_trc = self.transform.dst_color_trc
         encoder.color_range = self.transform.dst_color_range
+        preset = "p1" if os.getenv("IW3_4K60_EXPERIMENT") == "1" and (self.width, self.height) == (7680, 2160) else "p5"
         encoder.options = {
-            "preset": "p5",
+            "preset": preset,
             "tune": "ull",
             "rc": "cbr",
             "zerolatency": "1",
@@ -54,8 +68,39 @@ class QuestEncoder:
         }
         return encoder
 
+    def cuda_preparer(self) -> Callable[[torch.Tensor], PreparedCudaFrame | None] | None:
+        """Snapshot the CUDA transform for the producer without sharing the codec."""
+        device = self._cuda_device
+        if self.last_pts < 0 or device is None:
+            return None
+        transform = self.transform
+
+        @torch.inference_mode()
+        def prepare(frame: torch.Tensor) -> PreparedCudaFrame | None:
+            if (
+                frame.device != device
+                or not transform.is_dlpack_supported(frame)
+                or not transform.is_cuda_dlpack_supported(frame)
+            ):
+                return None
+            stream = torch.cuda.current_stream(device)
+            frame.record_stream(stream)
+            planes = try_pack_nv12(frame, transform, stream)
+            if planes is None:
+                planes = transform.prepare_yuv_planes(frame)
+            return PreparedCudaFrame(frame, transform, planes, stream.record_event())
+
+        return prepare
+
     @torch.inference_mode()
-    def encode(self, frame: torch.Tensor, pts: int, force_idr: bool = False) -> list[av.Packet]:
+    def encode(
+        self,
+        frame: torch.Tensor,
+        pts: int,
+        force_idr: bool = False,
+        *,
+        prepared: PreparedCudaFrame | None = None,
+    ) -> list[av.Packet]:
         if frame.shape != (3, self.height, self.width):
             raise ValueError(f"Expected RGB CHW {(3, self.height, self.width)}, got {tuple(frame.shape)}")
         if frame.dtype not in (torch.float16, torch.float32) or frame.device.type not in {"cpu", "cuda"}:
@@ -77,11 +122,17 @@ class QuestEncoder:
                 self.encoder = self._create_encoder(self._config.pix_fmt)
         if self._cuda_device is not None:
             frame = frame.to(self._cuda_device)
-        return self._encode(frame, pts, force_idr)
+        return self._encode(frame, pts, force_idr, prepared)
 
-    def _encode(self, frame: torch.Tensor, pts: int, force_idr: bool) -> list[av.Packet]:
+    def _encode(
+        self, frame: torch.Tensor, pts: int, force_idr: bool, prepared: PreparedCudaFrame | None = None
+    ) -> list[av.Packet]:
         # RGB CUDA [3,1080,3840] → 共享storage的CUDA NV12 → HEVC；DLPack持有帧存储。
-        video_frame = self.transform(frame)
+        if prepared is not None and prepared.frame is frame and prepared.transform is self.transform:
+            prepared.ready.synchronize()
+            video_frame = self.transform.from_yuv_planes(*prepared.planes)
+        else:
+            video_frame = self.transform(frame)
         video_frame.pts = pts
         video_frame.time_base = Fraction(1, 1_000_000)
         if force_idr:

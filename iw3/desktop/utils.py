@@ -869,6 +869,8 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     if args.state["convergence_model"] is not None:
                         args.state["convergence_model"].reset(enable_ema=True, decay=0.98)
                     processed_source_generation = source_generation
+                if session is not None:
+                    session.begin_frame(source_generation)
                 sbs = IW3U.process_image(frame, args, depth_model, side_model, autocrop_uncrop=True)
 
             if versioned_source:
@@ -890,7 +892,10 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                     if versioned_source and not screenshot_thread.is_current_generation(source_generation):
                         blank_browser_frame()
                         continue
-                    server.set_frame_data((sbs, tick))
+                    if sbs.is_cuda:
+                        server.set_frame_data((sbs, tick), take_ownership=True)
+                    else:
+                        server.set_frame_data((sbs, tick))
                     if session is not None and server.get_fps() > 0:
                         session.media_ready()
                 elif not args.local_viewer:
@@ -937,7 +942,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
                         )
 
             if ambient_enabled or browser_video:
-                # 先提交独占SBS副本再做只读提色；wake让暂停首帧也能独立发送柔光。
+                # 提交后的成片只读提色；wake 让暂停首帧也能独立发送柔光。
                 server.set_ambient_frame(
                     frame,
                     content_rect=content_rect,
@@ -964,7 +969,7 @@ def _iw3_desktop_main_once(args, init_wxapp=True):
             process_time = time.perf_counter() - tick
             wait_time = max((1 / (args.stream_fps)) - process_time, 0)
             if session is not None:
-                session.run_stop.wait(wait_time)
+                session.wait_between_frames(wait_time, source_generation)
             else:
                 time.sleep(wait_time)
             fps_counter.append(process_time)

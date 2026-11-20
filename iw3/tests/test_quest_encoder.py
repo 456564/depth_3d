@@ -19,6 +19,23 @@ def test_reject_invalid_encoder_configuration(width: int, height: int, fps: int,
         QuestEncoder(width, height, fps, bitrate)
 
 
+@pytest.mark.parametrize("load_status,symbol_status", [(223, 0), (0, 500)])
+def test_unavailable_fused_cuda_kernel_keeps_original_conversion(monkeypatch, load_status, symbol_status) -> None:
+    from types import SimpleNamespace
+
+    from iw3.desktop import quest_nv12
+
+    unloaded = []
+    driver = SimpleNamespace(
+        cuModuleLoadData=lambda *_: load_status,
+        cuModuleGetFunction=lambda *_: symbol_status,
+        cuModuleUnload=lambda module: unloaded.append(module) or 0,
+    )
+    monkeypatch.setattr(quest_nv12, "_compile_ptx", lambda: None)
+    assert quest_nv12._kernel.__wrapped__(driver, 0) is None
+    assert len(unloaded) == int(symbol_status == 500)
+
+
 def test_reject_invalid_frame_and_timestamps() -> None:
     from iw3.desktop.quest_encoder import QuestEncoder
 

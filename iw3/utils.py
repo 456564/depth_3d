@@ -434,6 +434,9 @@ def apply_divergence(
     convergence=None,
     return_convergence=False,
     alpha=None,
+    *,
+    clamp_output=True,
+    warp_both=None,
 ):
     batch = True
     if depth.ndim != 4:
@@ -573,6 +576,8 @@ def apply_divergence(
             synthetic_view=args.synthetic_view,
             preserve_screen_border=args.preserve_screen_border,
             enable_amp=not args.disable_amp,
+            clamp_output=clamp_output,
+            warp_both=warp_both,
         )
 
     if not batch:
@@ -642,7 +647,9 @@ def postprocess_padding(left_eye, right_eye, pad, pad_mode):
     return left_eye, right_eye
 
 
-def apply_stereo(x, depth, alpha, args, side_model, reset_pts=None):
+def apply_stereo(
+    x, depth, alpha, args, side_model, reset_pts=None, *, clamp_output: bool = True, warp_both=None
+):
     if alpha is not None and args.anaglyph:
         x = x * alpha + (1.0 - alpha)
         alpha = None
@@ -667,7 +674,8 @@ def apply_stereo(x, depth, alpha, args, side_model, reset_pts=None):
             )
         else:
             left_eye, right_eye, convergence = apply_divergence(
-                depth, x, args, side_model, reset_pts=reset_pts, return_convergence=True
+                depth, x, args, side_model, reset_pts=reset_pts, return_convergence=True,
+                clamp_output=clamp_output, warp_both=warp_both,
             )
             if alpha is not None and left_eye is not None:
                 alpha_3ch = alpha.repeat(3, 1, 1) if alpha.ndim == 3 else alpha.repeat(1, 3, 1, 1)
@@ -740,6 +748,21 @@ def postprocess_image(left_eye, right_eye, args, left_alpha=None, right_alpha=No
         # Reverse SideBySide
         sbs = torch.cat([right_eye, left_eye], dim=2)
         sbs = torch.clamp(sbs, 0.0, 1.0)
+    elif (
+        getattr(args, "quest", False)
+        and not torch.is_grad_enabled()
+        and left_eye.is_cuda
+        and left_eye.device == right_eye.device
+        and left_eye.dtype == right_eye.dtype == torch.float32
+        and left_eye.shape == right_eye.shape
+        and left_eye.shape[0] == 3
+        and left_eye.shape[-2] * left_eye.shape[-1] >= 3840 * 2160
+    ):
+        # 裁值直接写入左右半幅，避免先分配一整张未裁值的 SBS。
+        width = left_eye.shape[-1]
+        sbs = left_eye.new_empty((*left_eye.shape[:-1], width * 2))
+        torch.clamp(left_eye, 0.0, 1.0, out=sbs[..., :width])
+        torch.clamp(right_eye, 0.0, 1.0, out=sbs[..., width:])
     else:
         # SideBySide or RGBD
         sbs = torch.cat([left_eye, right_eye], dim=2)
@@ -843,7 +866,42 @@ def process_image(
             )
             depth = depth_model.minmax_normalize_chw(depth)
 
-        left_eye, right_eye, left_alpha, right_alpha = apply_stereo(x, depth, alpha, args, side_model)
+        # 4K FP32 分眼 [3,2160,3840] 无中间重采样，合入 [3,2160,7680] 时一次裁值。
+        quest_4k_sbs = (
+            getattr(args, "quest", False)
+            and args.full_sbs
+            and args.method == "row_flow_v3_sym"
+            and args.synthetic_view == "both"
+            and alpha is None
+            and args.autocrop is None
+            and not (args.half_sbs or args.half_tb or args.vr180 or args.anaglyph)
+            and x.is_cuda
+            and x.dtype == torch.float32
+            and x.shape in {(3, 2160, 3840), (3, 3840, 2160)}
+        )
+        defer_clamp = quest_4k_sbs and x.shape[-2:] == (2160, 3840)
+        packed = None
+        warp_both = None
+        # 始终先走原视差、会聚与 mapper；无后续几何处理时可直接用已打包的两眼。
+        if (
+            quest_4k_sbs
+            and not (args.tb or args.cross_eyed or args.rgbd or args.half_rgbd or args.ipd_offset)
+            and args.pad is None and args.pad_mode not in {"16:9", "1:1"}
+            and (args.max_output_height is None or args.max_output_height >= x.shape[-2])
+            and (args.max_output_width is None or args.max_output_width >= x.shape[-1] * 2)
+        ):
+            from .desktop.quest_nv12 import try_warp_sbs
+
+            def warp_both(rgb, grid, delta, scale):
+                nonlocal packed
+                packed = try_warp_sbs(rgb, grid, delta, scale)
+                return packed.unsqueeze(0).chunk(2, dim=-1) if packed is not None else None
+
+        left_eye, right_eye, left_alpha, right_alpha = apply_stereo(
+            x, depth, alpha, args, side_model, clamp_output=not defer_clamp, warp_both=warp_both
+        )
+        if packed is not None:
+            return packed
         assert left_eye is not None
         left_eye = autocrop.uncrop(left_eye)
         right_eye = autocrop.uncrop(right_eye)

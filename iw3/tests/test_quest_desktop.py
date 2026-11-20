@@ -100,6 +100,124 @@ def test_quest_selects_full_sbs_without_changing_web_defaults() -> None:
     assert args.quest_bitrate == 40 and not args.quest_no_audio
 
 
+@pytest.mark.hwaccel
+@pytest.mark.skipif(not desktop.torch.cuda.is_available(), reason="requires CUDA")
+def test_quest_4k_writes_clamped_eyes_without_full_size_intermediate() -> None:
+    import torch
+
+    desktop.pyav_init_cuda_primary_context(max_devices=1)
+    args = desktop.create_parser().parse_args(["--quest"])
+    desktop.prepare_quest_args(args)
+    with torch.inference_mode():
+        left = torch.full((3, 2160, 3840), 0.2, device="cuda", dtype=torch.float32)
+        right = torch.full_like(left, 0.7)
+        left[:, :, 0] = -0.1
+        right[:, 0] = 1.1
+        expected = torch.cat((left, right), dim=-1).clamp_(0, 1)
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        output = desktop.IW3U.postprocess_image(left, right, args)
+        added = torch.cuda.max_memory_allocated() - before
+        assert output.is_contiguous() and torch.equal(output, expected)
+        assert added < output.nbytes * 1.5, (added, output.nbytes)
+
+
+@pytest.mark.hwaccel
+@pytest.mark.skipif(not desktop.torch.cuda.is_available(), reason="requires CUDA")
+def test_quest_4k_defers_symmetric_warp_clamp_until_full_sbs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from iw3 import backward_warp
+
+    class SymmetricFlow(torch.nn.Module):
+        symmetric = delta_output = True
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return torch.cat((x[:, :1] * 6, torch.zeros_like(x[:, :1])), dim=1)
+
+    desktop.pyav_init_cuda_primary_context(max_devices=1)
+    args = desktop.create_parser().parse_args(
+        ["--quest", "--screenshot", "browser_video", "--method", "row_flow_v3_sym"]
+    )
+    desktop.prepare_quest_args(args)
+    args.mapper, args.state = "none", {"convergence_model": None}
+    gpu = torch.device("cuda:0")
+    rng = torch.Generator(device=gpu).manual_seed(392)
+    frame = torch.rand((3, 2160, 3840), device=gpu, generator=rng).mul_(2).sub_(0.5)
+    depth = torch.rand((1, 392, 686), device=gpu, generator=rng)
+    depth_model = SimpleNamespace(
+        get_ema_buffer_size=lambda: 1,
+        is_matting=lambda: False,
+        infer=lambda *args, **kwargs: depth,
+        minmax_normalize_chw=lambda d: d,
+    )
+    original = backward_warp.backward_warp
+    clamp_calls, outside = [], []
+
+    def capture(*args, **kwargs):
+        clamp_output = kwargs.get("clamp_output", True)
+        clamp_calls.append(clamp_output)
+        warped = original(*args, **kwargs)
+        if not clamp_output:
+            outside.append(warped.amin().item() < 0)
+        return warped
+
+    monkeypatch.setattr(backward_warp, "backward_warp", capture)
+    flow = SymmetricFlow().eval()
+    monkeypatch.setenv("IW3_DISABLE_QUEST_FUSED_STEREO", "1")
+    args.quest = False
+    expected = desktop.IW3U.process_image(frame, args, depth_model, flow)
+    args.quest = True
+    result = desktop.IW3U.process_image(frame, args, depth_model, flow)
+    assert result.shape == (3, 2160, 7680) and torch.equal(expected, result)
+    assert clamp_calls == [True, True, False, False] and outside == [True, True]
+    args.half_sbs, args.full_sbs = True, False
+    desktop.IW3U.process_image(frame, args, depth_model, flow)
+    assert clamp_calls[-2:] == [True, True]
+
+    from iw3.desktop.quest_nv12 import _compatible
+
+    if _compatible(gpu):
+        monkeypatch.delenv("IW3_DISABLE_QUEST_FUSED_STEREO")
+        args.half_sbs, args.full_sbs = False, True
+        warp_calls = len(clamp_calls)
+        result = desktop.IW3U.process_image(frame, args, depth_model, flow)
+        assert len(clamp_calls) == warp_calls
+        assert torch.equal(result.view(torch.int32), expected.view(torch.int32))
+        args.ipd_offset = 1.0
+        desktop.IW3U.process_image(frame, args, depth_model, flow)
+        assert len(clamp_calls) == warp_calls + 2
+
+
+@pytest.mark.hwaccel
+@pytest.mark.skipif(not desktop.torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("height,width,gh,gw", [(2160, 3840, 392, 686), (3840, 2160, 686, 392)])
+def test_fused_quest_warp_keeps_both_4k_eyes_bitwise(height, width, gh, gw) -> None:
+    from iw3.backward_warp import backward_warp, make_grid
+    from iw3.desktop.quest_nv12 import _compatible, try_warp_sbs
+
+    torch = desktop.torch
+    desktop.pyav_init_cuda_primary_context(max_devices=1)
+    device = torch.device("cuda:0")
+    if not _compatible(device):
+        pytest.skip("requires validated CUDA runtime")
+    rng = torch.Generator(device=device).manual_seed(392)
+    with torch.inference_mode():
+        rgb = torch.rand((1, 3, height, width), device=device, generator=rng).mul_(1.2).sub_(0.1)
+        grid = make_grid(1, gw, gh, device)
+        dx = torch.randn((1, 1, gh, gw), device=device, generator=rng)
+        dx[..., :2].sub_(gw)
+        dx[..., -2:].add_(gw)
+        delta = torch.cat((dx, torch.zeros_like(dx)), dim=1)
+        scale = 1 / (gw // 2 - 1)
+        expected = torch.cat((backward_warp(rgb, grid, delta, scale), backward_warp(rgb, grid, -delta, scale)), dim=-1)
+        actual = try_warp_sbs(rgb, grid, delta, scale)
+        assert actual is not None and actual.shape == (3, height, width * 2) and actual.is_contiguous()
+        assert torch.equal(expected[0].view(torch.int32), actual.view(torch.int32))
+
+
 @pytest.mark.parametrize("capture", ["wc_mp", "mss", "wc_cuda"])
 def test_quest_control_accepts_explicit_windows_capture_target(monkeypatch, capture: str) -> None:
     monkeypatch.setattr(desktop.sys, "platform", "win32")

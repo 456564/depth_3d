@@ -2,6 +2,7 @@
 
 import io
 import math
+import sys
 import threading
 import time
 from collections import deque
@@ -16,6 +17,8 @@ from nunif.utils.video.color_transform import ColorTransform
 from nunif.utils.video.hwaccel import create_hwaccel
 
 from .media_http_source import QUALITY_OPTIONS, MediaHTTPError, MediaHTTPIO, select_renditions, validate_source
+from .media_clock import now as media_now
+from .quest_nv12 import try_unpack_nv12
 
 SOURCE_GRACE_SECONDS = 3.0  # 允许初始分片准备；持续不可读三秒后才请求显式录屏。
 
@@ -58,6 +61,7 @@ class _NVDECReader:
     def __init__(self, data: bytes | io.RawIOBase, device: torch.device, *, live: bool = False) -> None:
         self.device = device
         self.live = live
+        self._uses_fused_color = False
         hwaccel = create_hwaccel("cuda", device_id=device.index or 0, disable_software_fallback=True)
         self.container = av.open(
             io.BytesIO(data) if isinstance(data, bytes) else data,
@@ -91,11 +95,14 @@ class _NVDECReader:
             raise ValueError("Video frame has no presentation timestamp")
         return float(frame.pts * frame.time_base)
 
-    def frame_at(self, target: float) -> tuple[torch.Tensor, float] | None:
+    def frame_at(self, target: float, *, clock_slack: float = 0.0) -> tuple[torch.Tensor, float] | None:
         # 网页0秒可能早于MP4首帧；只钳制起点，不平移后续播放时钟。
         if self.stream.start_time is not None:
             target = max(target, float(self.stream.start_time * self.stream.time_base))
         selected_time = self._timestamp(self._selected) if self._selected is not None else None
+        if selected_time is not None and 0 < selected_time - target <= clock_slack:
+            # 播放时钟微小回跳复用已选帧，避免回到关键帧重新解码。
+            target = selected_time
         if self._frames is None or (
             selected_time is not None and (target < selected_time or target > selected_time + 0.5)
         ):
@@ -128,7 +135,20 @@ class _NVDECReader:
         if not 0 < frame.width <= 8192 or not 0 < frame.height <= 8192:
             raise RuntimeError("Unsupported NVDEC frame dimensions")
         # 实测：HEVC FLV → AVFrame cuda/NV12 → float32 RGB[3,1920,1088]，范围[0,1]。
+        self._uses_fused_color = False
+        if (
+            not self.live
+            and (frame.width, frame.height) in {(3840, 2160), (2160, 3840)}
+            and frame.sw_format.name == "nv12"
+        ):
+            with torch.cuda.device(self.device):
+                return ColorTransform.to_tensor(frame, device=self.device, nv12_to_rgb=self._try_fused_color).squeeze(0)
         return ColorTransform.to_tensor(frame, device=self.device).squeeze(0)
+
+    def _try_fused_color(self, *args) -> torch.Tensor | None:
+        rgb = try_unpack_nv12(*args)
+        self._uses_fused_color = rgb is not None
+        return rgb
 
     def next_frame(self, *, convert: bool = True) -> tuple[torch.Tensor | None, float]:
         if self._frames is None:
@@ -361,7 +381,7 @@ class MediaVideoSource(threading.Thread):
         if self.stop_event.is_set():
             return True
         current = self.snapshot()
-        return current is None or current.generation != generation or current.position_at(time.monotonic()) is None
+        return current is None or current.generation != generation or current.position_at(media_now()) is None
 
     def _generation_token(self, current: MediaSnapshot) -> str:
         # 同一网页操作内的降档/重连也要隔离已在 AI 中的旧帧。
@@ -417,7 +437,7 @@ class MediaVideoSource(threading.Thread):
                         raise MediaHTTPError("实际源尺寸超过所选画质上限")
                 latest = self.snapshot()
                 if latest is not None:
-                    fresh_target = latest.position_at(time.monotonic())
+                    fresh_target = latest.position_at(media_now())
                     if fresh_target is not None:
                         target = fresh_target
                 stage = "解码帧"
@@ -427,9 +447,18 @@ class MediaVideoSource(threading.Thread):
                     if not publish or frame is None:
                         return
                 else:
-                    result = self._reader.frame_at(target)
+                    if (
+                        self.fps >= 60
+                        and self._reader._uses_fused_color
+                        and not current.paused
+                        and latest is not None
+                        and not latest.paused
+                    ):
+                        result = self._reader.frame_at(target, clock_slack=min(1 / self._reader.fps, 1 / 60))
+                    else:
+                        result = self._reader.frame_at(target)
                     if result is None:
-                        checked_at = time.monotonic()
+                        checked_at = media_now()
                         if self._unreadable_since is None:
                             self._unreadable_since = checked_at
                         if checked_at - self._unreadable_since >= SOURCE_GRACE_SECONDS:
@@ -515,13 +544,46 @@ class MediaVideoSource(threading.Thread):
     def run(self) -> None:
         try:
             while not self.stop_event.is_set():
-                started = time.monotonic()
+                started = media_now()
                 current = self.snapshot()
-                self._update(current, started)
+                # 读取快照期间可能收到更新的心跳，按读取后的时刻判断有效性。
+                self._update(current, media_now())
                 # 持续直播必须读完参考帧；只限制 RGB 转换/发布，不能按目标 FPS 节流网络。
                 draining = current is not None and current.source is not None and current.source["kind"] == "live"
-                if not draining or self._reader is None:
-                    self.stop_event.wait(max(0, 1 / self.fps - (time.monotonic() - started)))
+                reader = self._reader
+                if not draining or reader is None:
+                    now = media_now()
+                    delay = max(0, 1 / self.fps - (now - started))
+                    if (
+                        sys.platform == "win32"
+                        and delay > 0
+                        and self.fps >= 60
+                        and reader is not None
+                        and reader._uses_fused_color
+                        and current is not None
+                        and not current.paused
+                        and current.source is not None
+                        and current.source.get("kind") == "vod"
+                        and reader._next is not None
+                    ):
+                        position = current.position_at(now)
+                        if position is not None:
+                            next_delay = reader._timestamp(reader._next) - position
+                            delay = max(0, min(delay, next_delay) - 0.00025)
+                    if (
+                        sys.platform == "win32"
+                        and delay > 0
+                        and self.fps >= 60
+                        and reader is not None
+                        and reader._uses_fused_color
+                        and current is not None
+                        and not current.paused
+                    ):
+                        # Windows Event.wait 会将数毫秒的节拍等待拉长；仅在已降低转色成本的点播使用短睡眠。
+                        if not self.stop_event.is_set():
+                            time.sleep(delay)
+                    else:
+                        self.stop_event.wait(delay)
         finally:
             self._close_reader()
             self._clear_slot()
@@ -529,7 +591,7 @@ class MediaVideoSource(threading.Thread):
 
     def get_frame(self) -> torch.Tensor | None:
         current = self.snapshot()
-        now = time.monotonic()
+        now = media_now()
         with self._lock:
             frame = self._frame
             self._frame = None
@@ -574,7 +636,7 @@ class MediaVideoSource(threading.Thread):
             and generation is not None
             and current is not None
             and self._generation_token(current) == generation
-            and current.position_at(time.monotonic()) is not None
+            and current.position_at(media_now()) is not None
         )
 
     def get_status(self) -> dict[str, Any]:
@@ -583,7 +645,7 @@ class MediaVideoSource(threading.Thread):
 
     def get_fps(self) -> float:
         with self._lock:
-            if len(self._frame_times) < 2 or time.monotonic() - self._frame_times[-1] > 1.0:
+            if len(self._frame_times) < 2 or media_now() - self._frame_times[-1] > 1.0:
                 return 0.0
             elapsed = self._frame_times[-1] - self._frame_times[0]
             return (len(self._frame_times) - 1) / elapsed if elapsed > 0 else 0.0

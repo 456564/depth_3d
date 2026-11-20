@@ -402,6 +402,7 @@ def test_media_owner_stop_cancels_network_before_joining_decoder(monkeypatch):
     from iw3.desktop import media_video_source as video
 
     reader = module()
+    monkeypatch.setattr(video, "media_now", time.monotonic)
     entered, release = threading.Event(), threading.Event()
 
     class BlockingResponse(Response):

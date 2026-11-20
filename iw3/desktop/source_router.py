@@ -112,17 +112,22 @@ class SourceRouter:
         return self._frame_token
 
     def is_current_generation(self, token: tuple[int, str | None] | None) -> bool:
-        if (
-            token is None
-            or self._stopped
-            or token[0] != self._epoch
-            or self._source is None
-            or self._desired_kind() != self.source_kind
-        ):
+        source, kind = self._source, self.source_kind
+        if token is None or self._stopped or token[0] != self._epoch or source is None or self._desired_kind() != kind:
             return False
-        if self.source_kind == "desktop":
-            return self.is_alive()
-        return bool(self.bridge.status().get("fresh") is True and self._source.is_current_generation(token[1]))
+        # A texture can finish while the producer is replacing the source.
+        if kind == "desktop":
+            valid = self._started and source.is_alive()
+        else:
+            validate = getattr(source, "is_current_generation", None)
+            valid = validate is not None and self.bridge.status().get("fresh") is True and validate(token[1])
+        return bool(
+            valid
+            and not self._stopped
+            and token[0] == self._epoch
+            and source is self._source
+            and kind == self.source_kind
+        )
 
     def get_content_rect(self) -> tuple[int, int, int, int] | None:
         if self._source is not None and hasattr(self._source, "get_content_rect"):

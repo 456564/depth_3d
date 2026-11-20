@@ -1,6 +1,8 @@
 import ipaddress
 import json
+import logging
 import math
+import os
 import select
 import socket
 import struct
@@ -17,7 +19,7 @@ from . import quest_night
 from .quest_ambient import AmbientBackground
 from .quest_ambient_panorama import MOTION_STYLES, panorama_layers
 from .quest_audio import QuestAudio
-from .quest_encoder import QuestEncoder
+from .quest_encoder import PreparedCudaFrame, QuestEncoder
 from .quest_input import QuestController, _rotate
 from .quest_screen import QuestScreen
 from .quest_settings import AMBIENT_STYLES
@@ -98,7 +100,8 @@ class QuestServer:
         self._ambient_360, self._ambient_motion = ambient_360, ambient_motion
         self._ambient_background: AmbientBackground | None = None
         self._ambient_generation = 0
-        self._ambient_pending: tuple[bytes, int] | None = None
+        self._ambient_pending: tuple[bytes, int, Callable[[], bool] | None] | None = None
+        self._ambient_job: tuple[Callable[[], bytes], int, socket.socket, Callable[[], bool] | None] | None = None
         self._ambient_visible = False
         self._night_sent = False
         self._night_texture = quest_night.texture() if ambient_enabled and ambient_style == "night" else None
@@ -123,7 +126,13 @@ class QuestServer:
         self._listener: socket.socket | None = None
         self._discovery: socket.socket | None = None
         self._source: QuestAudio | None = None
-        self._pending: tuple[torch.Tensor, float, torch.cuda.Event | None, int] | None = None
+        self._pending: tuple[torch.Tensor, float, torch.cuda.Event | None, int, PreparedCudaFrame | None] | None = None
+        self._cuda_preparer: (
+            tuple[socket.socket, int, Callable[[torch.Tensor], PreparedCudaFrame | None] | None] | None
+        ) = None
+        self._cuda_prepare_lock = threading.Lock()
+        self._cuda_prepare_stream: torch.cuda.Stream | None = None
+        self._cuda_prepare_event: torch.cuda.Event | None = None
         self._generation = 0
         self._video_enabled = True
         self._video_request: _MediaRequest | None = None
@@ -166,6 +175,7 @@ class QuestServer:
                 raise RuntimeError("Quest端口无法绑定；请先关闭电脑上的Pop3D，并检查所选局域网地址") from error
             raise
         self._spawn(self._video_loop)
+        self._spawn(self._ambient_loop)
         self._spawn(self._audio_loop)
         try:
             if self.audio:
@@ -206,6 +216,7 @@ class QuestServer:
                     release_error = error
             connection, self._connection = self._connection, None
             self._pending = None
+            self._cuda_preparer = None
             self._suspended = False
             self._audio_discard_pending = False
             for request in (self._video_request, self._audio_request):
@@ -278,6 +289,7 @@ class QuestServer:
                 if video:
                     self._generation += 1
                     self._pending = None
+                    self._cuda_preparer = None
                     self._video_enabled = False
                     self._video_request = request
                     self._reset_ambient()
@@ -406,6 +418,7 @@ class QuestServer:
         if clear_frame:
             self._ambient_background = None
         self._ambient_generation += 1
+        self._ambient_job = None
         self._ambient_pending = None
         self._ambient_visible = False
         self._ambient_refresh_pending = False
@@ -517,7 +530,7 @@ class QuestServer:
                 style = self._ambient_style
                 panoramic, motion = self._ambient_360, self._ambient_motion
                 video_rect = self._video_rect()
-        # 单目RGB取色+最终SBS遮罩→同包RGBA；提色与压缩由媒体owner在锁外完成。
+        # Keep GPU sampling on the producer; only CPU texture rendering can leave it.
         if background is None:
             if animate:
                 return
@@ -525,8 +538,10 @@ class QuestServer:
         elif reset_colors:
             # 仅媒体owner改生成器；同一缓存帧保留黑条迟滞，换源仍完整清理。
             background.reset(preserve_content=True)
+        jobs: list[Callable[[], bytes]] = []
+        enqueue = jobs.append if refresh else None
         payload = (
-            background.animate()
+            background.animate(enqueue=enqueue)
             if animate
             else background.update(
                 frame,
@@ -540,10 +555,10 @@ class QuestServer:
                 style=style,
                 panoramic=panoramic,
                 motion=motion,
+                enqueue=enqueue,
             )
         )
-        # 提色期间网页可能已换条；让过期纹理在唤醒发送线程前就被丢弃。
-        if payload is None or (still_current is not None and not still_current()):
+        if (payload is None and not jobs) or (still_current is not None and not still_current()):
             return
         with self._condition:
             if (
@@ -555,10 +570,59 @@ class QuestServer:
                 and not self._shutdown.is_set()
             ):
                 self._ambient_background = background
-                self._ambient_pending = payload, generation
                 self._ambient_frame_revision = generation
-                self._ambient_refresh_pending = self._ambient_refresh_pending or refresh
+                if jobs:
+                    self._ambient_job = jobs[0], generation, connection, still_current
+                elif payload is not None:
+                    self._ambient_pending = payload, generation, still_current
+                    self._ambient_refresh_pending = self._ambient_refresh_pending or refresh
                 self._condition.notify_all()
+
+    @staticmethod
+    def _ambient_source_is_current(still_current: Callable[[], bool] | None) -> bool:
+        try:
+            return still_current is None or still_current()
+        except Exception:
+            # 切换期间无法核对源时，丢弃本次柔光。
+            return False
+
+    def _ambient_loop(self) -> None:
+        warned_generation = -1
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._shutdown.is_set() or self._ambient_job is not None)
+                if self._shutdown.is_set():
+                    return
+                assert self._ambient_job is not None
+                render, generation, connection, still_current = self._ambient_job
+                self._ambient_job = None
+            try:
+                error_name = None
+                try:
+                    payload = render()
+                except Exception as error:
+                    payload, error_name = None, type(error).__name__
+                if not self._ambient_source_is_current(still_current):
+                    continue
+                with self._condition:
+                    if (
+                        generation != self._ambient_generation
+                        or connection is not self._connection
+                        or not self._video_enabled
+                        or not self._ambient_enabled
+                        or self._suspended
+                        or self._shutdown.is_set()
+                    ):
+                        continue
+                    if payload is not None:
+                        self._ambient_pending = payload, generation, still_current
+                        self._ambient_refresh_pending = True
+                        self._condition.notify_all()
+                if error_name is not None and generation != warned_generation:
+                    warned_generation = generation
+                    logging.getLogger(__name__).warning("Quest ambient texture failed: %s", error_name)
+            finally:
+                del render, connection, still_current
 
     def set_menu(self, menu: Any) -> None:
         with self._layer_lock:
@@ -662,10 +726,40 @@ class QuestServer:
             if self._source is not None:
                 self._source.set_gain(gain)
 
-    def set_frame_data(self, frame_data: tuple[torch.Tensor, float]) -> None:
+    def _prepare_cuda_frame(
+        self,
+        frame: torch.Tensor,
+        ready: torch.cuda.Event,
+        prepare: Callable[[torch.Tensor], PreparedCudaFrame | None],
+    ) -> PreparedCudaFrame | None:
+        if not self._cuda_prepare_lock.acquire(blocking=False):
+            return None
+        try:
+            # 覆盖待编码帧不会取消已提交的GPU工作，所以单独保留就绪事件。
+            if self._cuda_prepare_event is not None and not self._cuda_prepare_event.query():
+                return None
+            stream = self._cuda_prepare_stream
+            if stream is None or stream.device != frame.device:
+                self._cuda_prepare_stream = stream = torch.cuda.Stream(device=frame.device)
+            ready.wait(stream)
+            with torch.cuda.stream(stream):
+                try:
+                    prepared = prepare(frame)
+                except torch.OutOfMemoryError:
+                    self._cuda_prepare_event = stream.record_event()
+                    return None
+            if prepared is not None:
+                self._cuda_prepare_event = prepared.ready
+            return prepared
+        finally:
+            self._cuda_prepare_lock.release()
+
+    def set_frame_data(self, frame_data: tuple[torch.Tensor, float], *, take_ownership: bool = False) -> None:
+        """移交成片后，调用方不得再改写其显存。"""
         frame, tick = frame_data
         with self._condition:
-            generation = self._generation
+            connection, generation = self._connection, self._generation
+            preparer = self._cuda_preparer
             width, height = self.width, self.height
             enabled = self._video_enabled and not self._suspended
         if frame.shape != (3, height, width) or frame.dtype not in (torch.float16, torch.float32):
@@ -674,16 +768,38 @@ class QuestServer:
             raise ValueError("Quest frames require CPU/CUDA tensors and nonnegative finite timestamps")
         if self._shutdown.is_set() or not enabled:
             return
+        if os.getenv("IW3_4K60_EXPERIMENT") == "1" and take_ownership and frame.is_cuda and frame.shape == (3, 2160, 7680):
+            deadline = time.perf_counter() + 1 / 60
+            while time.perf_counter() < deadline:
+                with self._condition:
+                    pending = self._pending
+                    stale = connection is not self._connection or generation != self._generation
+                if pending is None or stale or self._shutdown.is_set():
+                    break
+                time.sleep(min(0.00075, max(0.0, deadline - time.perf_counter())))
         with torch.inference_mode():
-            # 实测RGB float CHW[3,H,2W]；独占副本与生产流事件保护异步编码读取。
-            owned = frame.detach().clone()
+            # RGB CHW[3,H,2W]：仅可信的 4K CUDA FP32 成片可以省去防覆写副本。
+            owned = frame.detach()
+            if not (
+                take_ownership and frame.is_cuda and frame.dtype == torch.float32 and width * height >= 7680 * 2160
+            ):
+                owned = owned.clone()
             ready = None
+            prepared = None
             if frame.is_cuda:
                 ready = torch.cuda.Event()
                 ready.record(torch.cuda.current_stream(frame.device))
+                if preparer is not None and preparer[:2] == (connection, generation) and preparer[2] is not None:
+                    prepared = self._prepare_cuda_frame(owned, ready, preparer[2])
         with self._condition:
-            if not self._shutdown.is_set() and self._video_enabled and generation == self._generation:
-                self._pending = owned, tick, ready, generation
+            if (
+                not self._shutdown.is_set()
+                and self._video_enabled
+                and not self._suspended
+                and connection is self._connection
+                and generation == self._generation
+            ):
+                self._pending = owned, tick, ready, generation, prepared
                 self._condition.notify_all()
 
     def get_fps(self) -> float:
@@ -708,6 +824,7 @@ class QuestServer:
                     self._connection = None
                     self._night_sent = False
                     self._pending = None
+                    self._cuda_preparer = None
                     self._suspended = False
                     self._audio_discard_pending = False
                     self._reset_ambient()
@@ -890,11 +1007,16 @@ class QuestServer:
         )
 
     def _send_ambient(self, connection: socket.socket) -> None:
+        with self._condition:
+            pending = self._ambient_pending
+        if pending is None:
+            return
+        # 取源锁前释放服务器锁；获取层锁后重新核对队列。
+        source_current = self._ambient_source_is_current(pending[2])
         with self._layer_lock:
             with self._condition:
-                pending = self._ambient_pending
                 if (
-                    pending is None
+                    pending is not self._ambient_pending
                     or pending[1] != self._ambient_generation
                     or connection is not self._connection
                     or not self._video_enabled
@@ -905,6 +1027,8 @@ class QuestServer:
                     return
                 self._ambient_pending = None
                 self._ambient_refresh_pending = False
+            if not source_current:
+                return
             if self._ambient_style == "night" and not self._night_sent:
                 assert self._night_texture is not None
                 self._send(connection, 0x10, self._night_texture)
@@ -1262,7 +1386,7 @@ class QuestServer:
                 except OSError:
                     self._disconnect(connection)
                 continue
-            frame, tick, ready, generation = pending
+            frame, tick, ready, generation, prepared = pending
             try:
                 if current is not connection:
                     if current is not None:
@@ -1281,11 +1405,17 @@ class QuestServer:
                     ready.wait(stream)
                     with torch.cuda.stream(stream):
                         frame.record_stream(stream)
-                        packets = encoder.encode(frame, pts, force_idr=force_idr)
+                        if prepared is None:
+                            packets = encoder.encode(frame, pts, force_idr=force_idr)
+                        else:
+                            packets = encoder.encode(frame, pts, force_idr=force_idr, prepared=prepared)
                 else:
                     packets = encoder.encode(frame, pts, force_idr=force_idr)
                 with self._condition:
                     stale = generation != self._generation or connection is not self._connection
+                    if not stale and frame.is_cuda and self.width * self.height >= 7680 * 2160:
+                        if self._cuda_preparer is None or self._cuda_preparer[:2] != (connection, generation):
+                            self._cuda_preparer = connection, generation, encoder.cuda_preparer()
                 if stale:
                     continue
                 last_pts = pts
@@ -1313,6 +1443,7 @@ class QuestServer:
                         remove_layers = self._ambient_visible or self._pointer is not None
                         self._video_enabled = False
                         self._pending = None
+                        self._cuda_preparer = None
                         self._reset_ambient()
                     self._control(connection, "reset")
                     if remove_layers:
@@ -1322,7 +1453,7 @@ class QuestServer:
                             self._disconnect(connection)
                 self._media_failed(error)
             finally:
-                del frame, ready, pending
+                del frame, ready, prepared, pending
 
     def _audio_loop(self) -> None:
         source: QuestAudio | None = None

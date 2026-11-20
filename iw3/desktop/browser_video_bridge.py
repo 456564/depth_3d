@@ -9,9 +9,9 @@ import threading
 from collections import deque
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeGuard
 
+from .media_clock import now as monotonic
 from .media_http_source import validate_source
 
 if TYPE_CHECKING:

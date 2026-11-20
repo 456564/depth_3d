@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from fractions import Fraction
 from typing import Any, Dict, List, Set, Tuple
 
@@ -116,6 +117,10 @@ class ColorTransform:
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float32,
         upsample_mode: str = "bilinear",
+        *,
+        nv12_to_rgb: Callable[
+            [torch.Tensor, torch.Tensor, torch.Tensor, Colorspace | int, ColorRange | int], torch.Tensor | None
+        ] | None = None,
     ) -> torch.Tensor:
         """Convert PyAV VideoFrame to CHW RGB tensor."""
         src_fmt: str = frame.format.name
@@ -216,15 +221,23 @@ class ColorTransform:
                 uv = uv.reshape(uv.shape[0], uv.shape[1] // 2, 2)
             u = uv[:, :, 0].unsqueeze(0).unsqueeze(0)
             v = uv[:, :, 1].unsqueeze(0).unsqueeze(0)
-            rgb = ColorTransform.yuv_to_rgb(
-                y,
-                u,
-                v,
-                colorspace=src_colorspace,
-                color_range=src_color_range,
-                div=div,
-                mode=upsample_mode,
+            converted = (
+                nv12_to_rgb(y, u, v, src_colorspace, src_color_range)
+                if nv12_to_rgb is not None and fmt == "nv12" and upsample_mode == "bilinear"
+                else None
             )
+            if converted is not None:
+                rgb = converted
+            else:
+                rgb = ColorTransform.yuv_to_rgb(
+                    y,
+                    u,
+                    v,
+                    colorspace=src_colorspace,
+                    color_range=src_color_range,
+                    div=div,
+                    mode=upsample_mode,
+                )
         elif fmt in ColorTransform.RGB_PLANAR:
             g, b, r = [p.unsqueeze(0).unsqueeze(0).div_(div) for p in planes_f[:3]]
             rgb = torch.cat([r, g, b], dim=1)
@@ -742,7 +755,8 @@ class OutputTransform:
             and self.dst_pix_fmt in {"nv12", "p010le", "yuv420p", "yuvj420p", "yuv420p10le"}
         )
 
-    def from_cuda_tensor(self, x: torch.Tensor) -> av.VideoFrame:
+    def prepare_yuv_planes(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, str]:
+        """Pack NVENC planes on CUDA or copy compatible planes to CPU."""
         assert self.is_dlpack_supported(x)
 
         internal_pix_fmt: str
@@ -753,37 +767,58 @@ class OutputTransform:
         else:
             internal_pix_fmt = self.dst_pix_fmt
 
-        y, u, v = ColorTransform.rgb_to_yuv(
-            x if x.dim() == 4 else x.unsqueeze(0),
-            colorspace=self.dst_colorspace,
-            color_range=self.dst_color_range,
-            out_format=internal_pix_fmt,
-        )
-        y_p, uv_p = ColorTransform.to_yuv_planes(y, u, v, out_format=internal_pix_fmt)
+        cuda_planes = self.is_cuda_dlpack_supported(x)
+        height, width = x.shape[-2:]
+        if (
+            cuda_planes
+            and internal_pix_fmt == "nv12"
+            and self.dst_colorspace == Colorspace.ITU709
+            and self.dst_color_range == ColorRange.MPEG
+            and x.ndim == 3
+            and x.dtype == torch.float32
+            and width * height >= 7680 * 2160
+            and width % 2 == height % 2 == 0
+        ):
+            weight = ColorTransform._get_matrix(self.dst_colorspace, x.device, x.dtype, "rgb2yuv")
+            assert isinstance(weight, torch.Tensor)
+            yuv = F.conv2d(x.unsqueeze(0), weight)
+            # 先缩小色度再换算范围，避免两张全尺寸的浮点 UV 临时图。
+            y = yuv[0, 0]
+            y_p = ((y * 219.0 + 16.0) / 255.0 * 255.0 + 0.5).clamp_(0, 255).to(torch.uint8)
+            uv = F.interpolate(yuv[:, 1:], size=(height // 2, width // 2), mode="bilinear", align_corners=False)
+            uv_p = (uv[0].permute(1, 2, 0) * 224.0 + 128.5).clamp_(0, 255).to(torch.uint8)
+        else:
+            y, u, v = ColorTransform.rgb_to_yuv(
+                x if x.dim() == 4 else x.unsqueeze(0),
+                colorspace=self.dst_colorspace,
+                color_range=self.dst_color_range,
+                out_format=internal_pix_fmt,
+            )
+            y_p, uv_p = ColorTransform.to_yuv_planes(y, u, v, out_format=internal_pix_fmt)
 
-        if self.is_cuda_dlpack_supported(x):
+        if cuda_planes:
             # NVENC按同一allocation的基址/pitch读取UV，独立两平面会让连续帧串色。
             height, width = y_p.shape
             packed = torch.cat((y_p, uv_p.reshape(height // 2, width)), dim=0)
             y_p = packed[:height]
             uv_p = packed[height:].view(height // 2, width // 2, 2)
-            # FFmpeg读取前等实际生产流完成，避免默认流与编码流之间竞态。
-            torch.cuda.current_stream(x.device).synchronize()
+        else:
+            y_p = y_p.contiguous().cpu()
+            uv_p = uv_p.contiguous().cpu()
+        return y_p, uv_p, internal_pix_fmt
+
+    def from_yuv_planes(self, y: torch.Tensor, uv: torch.Tensor, pix_fmt: str) -> av.VideoFrame:
+        """Wrap already completed planes in a video frame."""
+        if y.is_cuda:
             frame = av.VideoFrame.from_dlpack(
-                (y_p, uv_p),
-                format=internal_pix_fmt,
+                (y, uv),
+                format=pix_fmt,
                 primary_ctx=False,
                 current_ctx=True,
                 cuda_context=self.cuda_context,
             )
         else:
-            # For software encoders
-            y_p = y_p.contiguous().cpu()
-            uv_p = uv_p.contiguous().cpu()
-            frame = av.VideoFrame.from_dlpack(
-                (y_p, uv_p),
-                format=internal_pix_fmt,
-            )
+            frame = av.VideoFrame.from_dlpack((y, uv), format=pix_fmt)
 
         frame.pts = None
         frame.dts = None
@@ -792,6 +827,13 @@ class OutputTransform:
         frame.color_trc = self.dst_color_trc
         frame.color_range = self.dst_color_range
         return frame
+
+    def from_cuda_tensor(self, x: torch.Tensor) -> av.VideoFrame:
+        y, uv, pix_fmt = self.prepare_yuv_planes(x)
+        if y.is_cuda:
+            # FFmpeg读取前等实际生产流完成，避免默认流与编码流之间竞态。
+            torch.cuda.current_stream(x.device).synchronize()
+        return self.from_yuv_planes(y, uv, pix_fmt)
 
     def transform(self, x: av.VideoFrame | torch.Tensor | np.ndarray | TensorFrame) -> av.VideoFrame:
         if isinstance(x, TensorFrame):

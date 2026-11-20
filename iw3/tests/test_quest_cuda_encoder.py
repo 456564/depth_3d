@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 
 import av
@@ -51,7 +52,9 @@ def test_cuda_nvenc_transform_preserves_every_frame_and_both_eyes(width, height,
             rgb[:, :, : width // 2] = torch.tensor(left, device="cuda")[:, None, None]
             rgb[:, :, width // 2 :] = torch.tensor(right, device="cuda")[:, None, None]
             frame = transform(rgb)
-            assert frame.format.name == "cuda" and frame.sw_format.name == config.pix_fmt
+            assert (
+                frame.format.name == "cuda" and frame.sw_format is not None and frame.sw_format.name == config.pix_fmt
+            )
             frame.pts, frame.time_base = index * 33_333, Fraction(1, 1_000_000)
             if index == 23:
                 frame.pict_type = av.video.frame.PictureType.I
@@ -137,3 +140,144 @@ def test_cpu_first_codec_keeps_compatible_input_when_later_frame_is_cuda() -> No
     packets += encoder.encode(torch.zeros(3, 180, 640, device="cuda"), 33_333)
     assert encoder.encoder.pix_fmt == "nv12"
     assert len(decode_all(packets)) == 2
+
+
+def test_prepared_cuda_frames_encode_from_another_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    from iw3.desktop.quest_encoder import PreparedCudaFrame, QuestEncoder
+
+    pyav_init_cuda_primary_context(max_devices=1)
+    width, height = 7680, 2160
+    encoder = QuestEncoder(width, height, 30, 35)
+    expected = [
+        ((0.9, 0.1, 0.2), (0.2, 0.9, 0.1)),
+        ((0.2, 0.1, 0.8), (0.8, 0.8, 0.2)),
+        ((0.1, 0.8, 0.8), (0.8, 0.2, 0.7)),
+        ((0.6, 0.2, 0.1), (0.4, 0.8, 0.3)),
+    ]
+
+    def make_rgb(colors: tuple[tuple[float, float, float], tuple[float, float, float]]) -> torch.Tensor:
+        rgb = torch.empty(3, height, width, dtype=torch.float16, device="cuda")
+        for eye, color in enumerate(colors):
+            rgb[:, :, eye * width // 2 : (eye + 1) * width // 2] = torch.tensor(color, device="cuda")[:, None, None]
+        return rgb
+
+    producer_stream = torch.cuda.Stream()
+    warmup = make_rgb(expected[0])
+    assert encoder.cuda_preparer() is None
+    packets = encoder.encode(warmup, 0)
+    del warmup
+    prepare_cuda_frame = encoder.cuda_preparer()
+    assert prepare_cuda_frame is not None
+
+    def prepare(index: int) -> tuple[torch.Tensor, PreparedCudaFrame | None]:
+        with torch.cuda.stream(producer_stream):
+            rgb = make_rgb(expected[index])
+            return rgb, prepare_cuda_frame(rgb)
+
+    def unexpected_conversion(frame: torch.Tensor) -> av.VideoFrame:
+        raise AssertionError("a matching prepared frame must skip the synchronous conversion")
+
+    with ThreadPoolExecutor(max_workers=1) as producer, monkeypatch.context() as patch:
+        patch.setattr(encoder.transform, "from_cuda_tensor", unexpected_conversion)
+        for index in (1, 2):
+            frame, prepared = producer.submit(prepare, index).result(timeout=10)
+            assert prepared is not None
+            packets += encoder.encode(frame, index * 33_333, force_idr=index == 1, prepared=prepared)
+
+    # 旧的转色结果即使来自同一编码器，也不能用于不同的RGB张量。
+    packets += encoder.encode(make_rgb(expected[3]), 99_999, prepared=prepared)
+    assert [p.pts for p in packets] == [0, 33_333, 66_666, 99_999]
+    assert packets[1].is_keyframe and len(decode_all([packets[1]])) == 1
+    decoded = decode_all(packets)
+    assert len(decoded) == len(expected)
+    for decoded_frame, colors in zip(decoded, expected, strict=True):
+        image = decoded_frame.to_ndarray(format="rgb24")
+        for eye, x in enumerate((width // 4, width * 3 // 4)):
+            for y in (2, height // 2, height - 3):
+                np.testing.assert_allclose(image[y, x], np.array(colors[eye]) * 255, atol=10)
+
+
+def test_4k_bt709_nv12_downsamples_both_chroma_planes_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    import torch.nn.functional as F
+
+    from nunif.utils.video.color_transform import ColorTransform
+
+    pyav_init_cuda_primary_context(max_devices=1)
+    width, height = 7680, 2160
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device=device).manual_seed(709)
+    rgb = torch.rand(3, height, width, device=device, generator=generator)
+    rgb[:, :8, : width // 2] = 0
+    rgb[:, :8, width // 2 :] = 1
+    config = VideoOutputConfig(video_codec="hevc_nvenc", pix_fmt="yuv420p", colorspace="bt709-tv")
+    configure_video_codec(config)
+    _, transform = setup_color_transform(None, config, device=device)
+    assert transform.is_cuda_dlpack_supported(rgb)
+    expected_y, expected_uv = ColorTransform.to_yuv_planes(
+        *ColorTransform.rgb_to_yuv(rgb.unsqueeze(0), colorspace=1, color_range=1, out_format="nv12")
+    )
+
+    interpolate = F.interpolate
+    resized = []
+
+    def observe(x, *args, **kwargs):
+        resized.append(tuple(x.shape))
+        return interpolate(x, *args, **kwargs)
+
+    monkeypatch.setattr(F, "interpolate", observe)
+    y, uv, fmt = transform.prepare_yuv_planes(rgb)
+    # 原始 RGB [3,2160,7680] → Y [2160,7680] + UV [1080,3840,2]，同一 CUDA allocation。
+    assert fmt == "nv12" and y.shape == expected_y.shape and uv.shape == expected_uv.shape
+    assert y.dtype == uv.dtype == torch.uint8 and y.device == uv.device == device
+    assert uv.data_ptr() - y.data_ptr() == width * height
+    assert y.untyped_storage().data_ptr() == uv.untyped_storage().data_ptr()
+    assert torch.equal(y, expected_y)
+    delta = (uv.to(torch.int16) - expected_uv.to(torch.int16)).abs()
+    assert delta.max().item() <= 1
+    assert (delta > 0).sum().item() < uv.numel() / 1000
+    assert resized == [(1, 2, height, width)]
+
+
+@pytest.mark.parametrize("width,height", [(7680, 2160), (4320, 3840)])
+def test_quest_preparer_fuses_4k_bt709_nv12_without_changing_bytes(
+    monkeypatch: pytest.MonkeyPatch, width: int, height: int
+) -> None:
+    import sys
+
+    from iw3.desktop.quest_encoder import QuestEncoder
+
+    if sys.platform != "win32" or torch.__version__ != "2.14.1+cu132":
+        pytest.skip("requires the validated Windows CUDA runtime")
+    pyav_init_cuda_primary_context(max_devices=1)
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device) != (8, 9) or torch.backends.cudnn.version() != 92400:
+        pytest.skip("requires the validated Ada/cuDNN runtime")
+    encoder = QuestEncoder(width, height, 60, 45)
+    producer = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(producer):
+        rng = torch.Generator(device=device).manual_seed(823)
+        frame = torch.rand((3, height, width), device=device, generator=rng)
+        frame[:, :32] = (torch.arange(width, device=device) % 219 + 0.5) / 219
+    producer.synchronize()
+    first_packets = encoder.encode(frame, 0, force_idr=True)
+    assert encoder.encoder.pix_fmt == "cuda"
+    prepare = encoder.cuda_preparer()
+    assert prepare is not None
+    with torch.cuda.stream(producer):
+        old_y, old_uv, old_fmt = encoder.transform.prepare_yuv_planes(frame)
+    producer.synchronize()
+
+    def slow_path(*args, **kwargs):
+        pytest.fail("eligible 4K frame fell back to the old color conversion")
+
+    monkeypatch.setattr(encoder.transform, "prepare_yuv_planes", slow_path)
+    with torch.cuda.stream(producer):
+        prepared = prepare(frame)
+    assert prepared is not None
+    packets = encoder.encode(frame, 16667, force_idr=True, prepared=prepared)
+    y, uv, fmt = prepared.planes
+    assert old_fmt == fmt == "nv12" and torch.equal(old_y, y) and torch.equal(old_uv, uv)
+    assert y.untyped_storage().data_ptr() == uv.untyped_storage().data_ptr()
+    assert uv.data_ptr() - y.data_ptr() == height * width
+    assert [(p.pts, p.is_keyframe) for p in packets] == [(16667, True)]
+    assert [(f.width, f.height) for f in decode_all(first_packets + packets)] == [(width, height)] * 2

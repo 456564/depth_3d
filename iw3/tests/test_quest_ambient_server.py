@@ -146,6 +146,127 @@ def test_video_escapes_blocked_ambient_and_only_current_source_publishes_texture
             publisher.join(2)
 
 
+@pytest.mark.parametrize("source_changed", [False, True])
+def test_slow_texture_render_does_not_wait_in_video_producer(
+    server: Any, monkeypatch: pytest.MonkeyPatch, source_changed: bool
+) -> None:
+    entered, release, submitted, stale = (threading.Event() for _ in range(4))
+    original = quest_server.AmbientBackground._render
+
+    def slow(background: Any, *args: Any) -> bytes:
+        entered.set()
+        assert release.wait(3)
+        return original(background, *args)
+
+    def produce() -> None:
+        mono = torch.ones(3, 64, 64)
+        sbs = mono.repeat(1, 1, 2)
+        server.set_frame_data((sbs, 1.0))
+        server.set_ambient_frame(mono, sbs=sbs, wake=True, still_current=lambda: not stale.is_set())
+        server.set_frame_data((sbs, 2.0))
+        submitted.set()
+
+    monkeypatch.setattr(quest_server.AmbientBackground, "_render", slow)
+    producer = threading.Thread(target=produce)
+    try:
+        with connect(server) as client:
+            initial_messages(client)
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._connection is not None, timeout=1)
+            producer.start()
+            assert entered.wait(2)
+            assert submitted.wait(1), "texture rendering held up the next video frame"
+            kind, packet = read_message(client)
+            assert kind == 0x02
+            if int.from_bytes(packet[:8], "big") == 1_000_000:
+                kind, packet = read_message(client)
+            assert kind == 0x02 and int.from_bytes(packet[:8], "big") == 2_000_000
+            if source_changed:
+                stale.set()
+            release.set()
+            if source_changed:
+                client.settimeout(0.1)
+                with pytest.raises(socket.timeout):
+                    read_message(client)
+            else:
+                assert read_message(client)[0] == 0x10
+                assert read_layers(client)[-1]["tex"] == "iw3_ambient"
+            server.check_error()
+    finally:
+        release.set()
+        if producer.ident is not None:
+            producer.join(2)
+
+
+def test_pending_web_texture_is_rechecked_at_send(server: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    entered, release, stale = (threading.Event() for _ in range(3))
+
+    class SlowEncoder(EncoderDouble):
+        def encode(self, frame: torch.Tensor, pts: int, force_idr: bool = False) -> Any:
+            entered.set()
+            assert release.wait(3)
+            return super().encode(frame, pts, force_idr)
+
+    monkeypatch.setattr(quest_server, "QuestEncoder", SlowEncoder)
+    try:
+        with connect(server) as client:
+            initial_messages(client)
+            server.set_frame_data((torch.ones(3, 64, 128), 1.0))
+            assert entered.wait(2)
+            server.set_ambient_frame(torch.ones(3, 64, 64), wake=True, still_current=lambda: not stale.is_set())
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._ambient_pending is not None, timeout=2)
+            stale.set()
+            release.set()
+            assert read_message(client)[0] == 0x02
+            client.settimeout(0.1)
+            with pytest.raises(socket.timeout):
+                read_message(client)
+            server.check_error()
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("retire_first", [False, True])
+def test_failed_texture_render_keeps_video_and_next_texture_alive(
+    server: Any, monkeypatch: pytest.MonkeyPatch, retire_first: bool
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    original = quest_server.AmbientBackground._render
+
+    def fail_once(background: Any, *args: Any) -> bytes:
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(3)
+            raise RuntimeError("ambient test render failed")
+        return original(background, *args)
+
+    monkeypatch.setattr(quest_server.AmbientBackground, "_render", fail_once)
+    try:
+        with connect(server) as client:
+            initial_messages(client)
+            with server._condition:
+                assert server._condition.wait_for(lambda: server._connection is not None, timeout=1)
+            mono = torch.ones(3, 64, 64)
+            sbs = mono.repeat(1, 1, 2)
+            server.set_ambient_frame(mono, sbs=sbs, wake=True)
+            assert entered.wait(2)
+            if retire_first:
+                server.configure_ambient(True, 0.5, 2)
+                read_layers(client)
+            else:
+                server._ambient_background.reset()
+            server.set_ambient_frame(mono, sbs=sbs, wake=True)
+            release.set()
+            assert read_message(client)[0] == 0x10
+            assert read_layers(client)[-1]["tex"] == "iw3_ambient"
+            server.set_frame_data((sbs, 1.0))
+            assert read_message(client)[0] == 0x02
+            server.check_error()
+    finally:
+        release.set()
+
+
 def test_same_texture_id_updates_without_resending_layers(server: Any) -> None:
     with connect(server) as client:
         initial_messages(client)
